@@ -2036,6 +2036,16 @@ def _scrub_ignored_paths(
     root: Path,
     relatives: Sequence[str],
 ) -> None:
+    def handle_remove_error(
+        _function: Any,
+        _path: str,
+        error_info: tuple[type[BaseException], BaseException, Any],
+    ) -> None:
+        error = error_info[1]
+        if isinstance(error, FileNotFoundError):
+            return
+        raise error
+
     for relative in relatives:
         target = _validated_runtime_target(root, relative)
         if not target.exists():
@@ -2045,11 +2055,17 @@ def _scrub_ignored_paths(
                 f"runtime scrub target is not a directory: {relative}"
             )
         try:
-            shutil.rmtree(target)
+            shutil.rmtree(target, onerror=handle_remove_error)
+        except FileNotFoundError:
+            pass
         except OSError as error:
             raise CapturableDatasetError(
                 f"could not scrub ignored runtime path {relative}"
             ) from error
+        if os.path.lexists(target):
+            raise CapturableDatasetError(
+                f"could not scrub ignored runtime path {relative}"
+            )
 
 
 def _hash_dist_tree(

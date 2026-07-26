@@ -4,7 +4,9 @@ from copy import deepcopy
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -51,6 +53,7 @@ from drawback_ml.capturable_fixed_corpus import (
     _reproduce_trace,
     _resolve_toolchain,
     _sanitized_environment,
+    _scrub_ignored_paths,
     _tracked_blob_sha256,
     _trusted_package_shell,
     _validate_receipt,
@@ -659,6 +662,80 @@ class CapturableFixedCorpusTests(unittest.TestCase):
                     "../pnpm-lock.yaml",
                     "fixture lockfile",
                 )
+
+    def test_runtime_scrub_tolerates_only_already_missing_entries(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(
+                ["git", "init", "--quiet"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            (root / ".gitignore").write_text(
+                "node_modules/\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            target = root / "node_modules"
+            target.mkdir()
+            (target / "package.js").write_text(
+                "fixture\n",
+                encoding="utf-8",
+            )
+            real_rmtree = shutil.rmtree
+
+            def missing_during_walk(path, *, onerror):
+                real_rmtree(path)
+                try:
+                    raise FileNotFoundError("entry already removed")
+                except FileNotFoundError:
+                    onerror(os.unlink, str(path / "package.js"), sys.exc_info())
+
+            with patch(
+                "drawback_ml.capturable_fixed_corpus.shutil.rmtree",
+                side_effect=missing_during_walk,
+            ):
+                _scrub_ignored_paths(root, ("node_modules",))
+
+            target.mkdir()
+            with patch(
+                "drawback_ml.capturable_fixed_corpus.shutil.rmtree",
+                side_effect=lambda _path, *, onerror: onerror(
+                    os.unlink,
+                    str(target / "missing.js"),
+                    (
+                        FileNotFoundError,
+                        FileNotFoundError("entry already removed"),
+                        None,
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    CapturableDatasetError,
+                    "could not scrub ignored runtime path",
+                ):
+                    _scrub_ignored_paths(root, ("node_modules",))
+
+            with patch(
+                "drawback_ml.capturable_fixed_corpus.shutil.rmtree",
+                side_effect=lambda _path, *, onerror: onerror(
+                    os.unlink,
+                    str(target / "protected.js"),
+                    (
+                        PermissionError,
+                        PermissionError("permission denied"),
+                        None,
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    CapturableDatasetError,
+                    "could not scrub ignored runtime path",
+                ):
+                    _scrub_ignored_paths(root, ("node_modules",))
 
     def test_private_root_rejects_both_public_repositories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
