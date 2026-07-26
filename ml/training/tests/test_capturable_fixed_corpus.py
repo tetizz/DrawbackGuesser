@@ -737,6 +737,28 @@ class CapturableFixedCorpusTests(unittest.TestCase):
                 ):
                     _scrub_ignored_paths(root, ("node_modules",))
 
+            real_rmtree(target)
+            nested = (
+                target
+                / ("a" * 90)
+                / ("b" * 90)
+                / ("c" * 90)
+            )
+            long_file = nested / "package.d.ts"
+            if os.name == "nt":
+                self.assertGreater(len(str(long_file)), 260)
+                creation_nested = Path(f"\\\\?\\{nested.absolute()}")
+            else:
+                creation_nested = nested
+            creation_nested.mkdir(parents=True)
+            (creation_nested / "package.d.ts").write_text(
+                "fixture\n",
+                encoding="utf-8",
+            )
+
+            _scrub_ignored_paths(root, ("node_modules",))
+            self.assertFalse(os.path.lexists(target))
+
     def test_private_root_rejects_both_public_repositories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)

@@ -2054,8 +2054,18 @@ def _scrub_ignored_paths(
             raise CapturableDatasetError(
                 f"runtime scrub target is not a directory: {relative}"
             )
+        removal_target = target
+        if os.name == "nt":
+            resolved = str(target.resolve(strict=True))
+            removal_target = Path(
+                (
+                    f"\\\\?\\UNC\\{resolved[2:]}"
+                    if resolved.startswith("\\\\")
+                    else f"\\\\?\\{resolved}"
+                )
+            )
         try:
-            shutil.rmtree(target, onerror=handle_remove_error)
+            shutil.rmtree(removal_target, onerror=handle_remove_error)
         except FileNotFoundError:
             pass
         except OSError as error:
