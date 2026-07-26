@@ -95,7 +95,9 @@ retain their actual result. The trace and converted schema-8 corpus must pass:
   test corpus recorded in the pre-generation audited corpus registry;
 - byte hashing before and after loading.
 
-The trace, dataset, checkpoints, and evaluation report remain outside Git.
+The trace, dataset, checkpoints, and evaluation report remain outside both
+public repositories. The designated private `DrawbackTrainingData` directory
+must be preserved as the single experiment root.
 
 ## Corpus preparation receipt
 
@@ -106,33 +108,57 @@ command must:
 1. authenticate a clean DrawbackGuesser revision containing the audit tool;
 2. authenticate the detached generator worktree at Engine revision
    `74eb6fc95571994bd96b7a351278f3f74f0972e3` and the frozen Engine lockfile;
-3. independently reconstruct every scheduled assignment, including game,
+3. require Node `v24.15.0`, Corepack `0.34.6`, pnpm `11.9.0`, the exact
+   451-file pnpm runtime tree with SHA-256
+   `07a0dd6cd5047b0fba062374b548723df3e969494a1d633c203c9ddf2b8e937f`,
+   and the exact OS-resolved command shell; use an isolated home, config,
+   cache, temporary directory, command shim, and PATH; disable user/global
+   package-manager configuration and network access; remove the explicit
+   ignored dependency and build-output directories from the frozen Engine
+   workspace; perform a frozen offline install with dependency lifecycle
+   scripts disabled; rebuild every Engine workspace package; and bind the
+   rebuilt output-tree hash;
+4. independently reconstruct every scheduled assignment, including game,
    parameter, and label seeds;
-4. strictly parse and semantically replay all 625 schema-v2 trace records;
-5. require the standard initial position, exact unrestricted-baseline
+5. strictly parse and semantically replay all 625 schema-v2 trace records;
+6. require the standard initial position, exact unrestricted-baseline
    opponent hypotheses, exact worst-case material search policy, exact
    censoring semantics, and game indexes `0` through `624`;
-6. rerun the fixed player-private generation command in the authenticated
-   Engine worktree and require byte-for-byte identity with the submitted
+7. execute the freshly rebuilt
+   `apps/engine-cli/dist/player-private-batch-cli.js` entrypoint directly with
+   the authenticated Node executable, rerun the fixed player-private
+   generation command, and require byte-for-byte identity with the submitted
    trace, proving the recorded moves were selected by the frozen search and
    temperature policy rather than merely being legal moves carrying matching
    metadata;
-7. regenerate every schema-8 row from the trace and require byte-for-byte
+8. remove the explicit ignored dependency and build-output directories from
+   the DrawbackGuesser conversion workspace; perform a frozen offline install;
+   rebuild the converter dependency closure; and bind its output-tree hash;
+9. regenerate every schema-8 row from the trace and require byte-for-byte
    identity with the converted dataset;
-8. authenticate the frozen prior-corpus registry and prove zero game-ID
+10. authenticate the frozen prior-corpus registry and prove zero game-ID
    overlap; and
-9. hash the trace and dataset both before and after verification, failing if
-   either changes.
+11. reject reparse points, hard-linked private inputs, non-default Git index
+    flags, unauthenticated ignored source/configuration, and tracked bytes that
+    do not filter to the committed Git objects; authenticate the source
+    revisions and the exact active Node/Corepack/pnpm/shell paths, bytes,
+    isolated environment, and pnpm shim immediately before and after every
+    child install, build, generation, and conversion process; then hash the
+    trace and dataset both before and after verification, failing if any
+    source, toolchain, trace, or dataset identity changes.
 
 The command publishes one create-only canonical UTF-8/LF JSON receipt. The
 receipt uses closed format
 `drawbackguesser-capturable-fixed-confirmation-corpus-receipt` version 1. It
 contains only protocol and clean audit-revision identity; generator commit,
-lockfile hash, and complete frozen schedule; trace filename, byte hash, byte
-count, game/ply/result counts, schema/authority/random-policy identity, replay
+lockfile hash, rebuilt-output hash, and complete frozen schedule; exact
+Node/Corepack/pnpm versions, Node/Corepack executable hashes, the pnpm
+runtime-tree file count and hash above, and the authenticated command-shell
+hash; trace filename, byte hash, byte count, game/ply counts, a closed count
+for every allowed result kind, schema/authority/random-policy identity, replay
 status, deterministic policy-regeneration identity, pair/marginal counts, and
-index bounds; converter and Engine-submodule identity; dataset filename, byte
-hash, byte count, row/game/schema/authority counts and
+index bounds; converter, rebuilt-output, and Engine-submodule identity;
+dataset filename, byte hash, byte count, row/game/schema/authority counts and
 true-hypothesis-survival status; and prior-registry
 filename/hash/count/overlap status. It contains no moves, positions, hidden
 parameters, private states, or per-game labels.
@@ -162,9 +188,13 @@ the fresh dataset. It must:
    game-ID overlap before inference;
 7. run each component once over the same ordered test rows;
 8. evaluate only control and fixed weight `0.1`;
-9. write one canonical, content-addressed, no-clobber report on successful
-   completion and bind the consumption marker, receipt, trace, and dataset
-   SHA-256 values.
+9. immediately before report publication, reopen the canonical marker and
+   receipt, require their original bytes and hashes, rehash the trace and
+   dataset, and reauthenticate the clean source, generator, converter,
+   toolchain, and rebuilt-output identities; and
+10. write one canonical, content-addressed, no-clobber report on successful
+    completion, bind the consumption marker, receipt, trace, and dataset
+    SHA-256 values, then reauthenticate the execution environment once more.
 
 The evaluator accepts no weight argument and cannot enumerate alternatives.
 
@@ -174,13 +204,15 @@ JSON with the closed format
 `drawbackguesser-capturable-fixed-blend-consumption` version 1 and contains
 only: state `consumed`; protocol file/commit/hash; clean execution revision;
 the frozen weight; the grid, selection, checkpoint, and registry bindings;
-the fixed test basename; and the complete generation schedule above. It does
-not contain or require the trace or test hash because it must be durably
-created before either file is opened. It additionally contains only the
-fixed receipt basename and receipt SHA-256. The marker's same-directory
-temporary file is flushed and fsynced before a no-replace link is created,
-then the containing directory or equivalent platform metadata barrier is
-flushed before evaluation continues. Failure to establish that durability
+the fixed trace and test basenames; the fixed receipt basename and receipt
+SHA-256; and the complete generation schedule above. It does not contain or
+require the trace or test hash because it must be durably created before
+either file is opened. The marker's same-directory
+temporary file is flushed and fsynced first. POSIX then creates a no-replace
+hard link and fsyncs the containing directory. Windows instead performs a
+same-volume no-replace `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, whose
+documented write-through completion is the platform metadata barrier, then
+reopens and byte-verifies the destination. Failure to establish the applicable
 barrier fails closed before trace or test access. The marker is never removed
 after a later exception.
 
@@ -203,6 +235,8 @@ for game-normalized Top-1:
   observed rows;
 - within-game value: mean of the White and Black player-game values;
 - paired observation: fixed-blend within-game value minus control;
+- vector order: ascending lexicographic canonical game ID, exactly matching
+  the `gameIds` array stored in the report;
 - bootstrap replicates: 20,000;
 - each replicate draws exactly 625 physical game IDs with replacement;
 - bootstrap seed: 633454611;
@@ -262,3 +296,18 @@ Passing would confirm a synthetic 25-label capturable self-play improvement
 on one fresh balanced corpus. It would not establish full-catalog, human-game,
 or external live-game reliability. The product remains an offline
 completed-game research and training tool.
+
+This is a local trusted-operator protocol, not a hostile-host attestation
+system. It rejects configured environment injection, linked private inputs,
+dirty or index-hidden tracked source, stale ignored dependency/build trees,
+runtime drift, and persistent before/after mutation. The one-pass claim is a
+trusted-operator procedure scoped to the preserved private experiment root:
+there is no external append-only authority preventing that root from being
+copied or its marker from being deleted. The content-addressed report loader
+authenticates its closed structure, bindings, release arithmetic, and recorded
+source ancestry; it is not a signature service or an independent
+recomputation from separately published raw predictions. The protocol does not
+claim protection from a malicious operating-system administrator, a
+compromised exact-version runtime, mutable imported Python callables in a
+hostile process, or an attacker who can swap and restore the same path between
+every individual handle check.
