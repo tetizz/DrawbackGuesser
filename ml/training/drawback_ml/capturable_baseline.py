@@ -24,7 +24,6 @@ from .capturable_records import (
     CAPTURABLE_FEATURE_DIMENSION,
     CAPTURABLE_RULE_IDS,
     CAPTURABLE_RULE_INDEX,
-    CapturableDatasetError,
     CapturableDatasetRow,
     active_symbolic,
     assert_disjoint_games,
@@ -701,7 +700,7 @@ def _hard_mask_fusion(
 def train_capturable_baseline(
     train_rows: Sequence[CapturableDatasetRow],
     validation_rows: Sequence[CapturableDatasetRow],
-    test_rows: Sequence[CapturableDatasetRow],
+    test_rows: Sequence[CapturableDatasetRow] | None,
     config: CapturableTrainingConfig,
 ) -> tuple[Any, Mapping[str, Any]]:
     """Train from random initialization and select epochs on validation only."""
@@ -712,9 +711,14 @@ def train_capturable_baseline(
         raise RuntimeError(
             "PyTorch is required; install ml/requirements.txt"
         ) from error
-    if not train_rows or not validation_rows or not test_rows:
-        raise ValueError("train, validation, and test rows must be non-empty")
-    assert_disjoint_games(train_rows, validation_rows, test_rows)
+    if not train_rows or not validation_rows:
+        raise ValueError("train and validation rows must be non-empty")
+    if test_rows is None:
+        assert_disjoint_games(train_rows, validation_rows)
+    else:
+        if not test_rows:
+            raise ValueError("test rows must be non-empty when supplied")
+        assert_disjoint_games(train_rows, validation_rows, test_rows)
     random.seed(config.seed)
     torch.manual_seed(config.seed)
     torch.set_num_threads(config.torch_threads)
@@ -725,7 +729,7 @@ def train_capturable_baseline(
         config.trigger_row_multiplier,
     )
     validation_tensors = tensorize(validation_rows)
-    test_tensors = tensorize(test_rows)
+    test_tensors = None if test_rows is None else tensorize(test_rows)
     model = create_capturable_model(config.hidden_dimension)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -829,7 +833,7 @@ def train_capturable_baseline(
     if best_state is None:
         raise RuntimeError("training did not produce a selected epoch")
     model.load_state_dict(best_state)
-    report = {
+    report: dict[str, Any] = {
         "format": CAPTURABLE_BASELINE_FORMAT,
         "version": CAPTURABLE_BASELINE_VERSION,
         "freshStart": True,
@@ -853,15 +857,16 @@ def train_capturable_baseline(
             best_fusion_alpha,
             best_prior_smoothing,
         ),
-        "test": evaluate_capturable(
+    }
+    if test_rows is not None and test_tensors is not None:
+        report["test"] = evaluate_capturable(
             model,
             test_rows,
             test_tensors,
             config,
             best_fusion_alpha,
             best_prior_smoothing,
-        ),
-    }
+        )
     return model, report
 
 
@@ -919,7 +924,14 @@ def _publish_bytes(path: Path, payload: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _publish_checkpoint(path: Path, model: Any, metadata: Mapping[str, Any]) -> str:
+def _publish_checkpoint(
+    path: Path,
+    model: Any,
+    metadata: Mapping[str, Any],
+    *,
+    artifact_format: str = CAPTURABLE_BASELINE_FORMAT,
+    artifact_version: int = CAPTURABLE_BASELINE_VERSION,
+) -> str:
     import torch
 
     temporary = path.with_name(
@@ -930,8 +942,8 @@ def _publish_checkpoint(path: Path, model: Any, metadata: Mapping[str, Any]) -> 
             os.chmod(temporary, 0o600)
             torch.save(
                 {
-                    "format": CAPTURABLE_BASELINE_FORMAT,
-                    "version": CAPTURABLE_BASELINE_VERSION,
+                    "format": artifact_format,
+                    "version": artifact_version,
                     "metadata": _jsonable(metadata),
                     "stateDict": model.state_dict(),
                 },

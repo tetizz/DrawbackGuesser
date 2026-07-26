@@ -128,6 +128,13 @@ Historical 10-label schema-7 corpora and checkpoints remain research
 artifacts; they are deliberately incompatible with schema 8 and cannot be
 silently loaded as 25-label data.
 
+The first 25-label experiment uses a two-stage selection/sealed-test boundary
+defined in
+[`docs/research/capturable-25-baseline-protocol.md`](docs/research/capturable-25-baseline-protocol.md).
+Training and validation publish a frozen checkpoint without accepting a test
+path; the separate sealed evaluator rejects overlapping games and writes one
+authenticated, no-clobber report.
+
 The input and output contain hidden labels and must remain private. The
 example deliberately writes outside the repository; do not place private
 NDJSON under the Guesser worktree. The converter derives every model feature

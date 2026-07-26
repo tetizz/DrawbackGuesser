@@ -2,20 +2,47 @@
 
 ## Capturable-king research baseline
 
-Schema-8 capturable datasets have a separate, non-release baseline. It accepts
-three already-converted, game-disjoint files and trains from a deterministic
-random initialization:
+Schema-8 capturable datasets have a separate, non-release baseline. Selection
+accepts already-converted, game-disjoint train and validation files and trains
+from a deterministic random initialization:
 
 ```powershell
-py -m ml.training.drawback_ml.capturable_baseline `
+py -m ml.training.drawback_ml.capturable_experiment select `
   --train ..\DrawbackTrainingData\capturable-train.ndjson `
   --train ..\DrawbackTrainingData\capturable-train-extra.ndjson `
   --validation ..\DrawbackTrainingData\capturable-validation.ndjson `
-  --test ..\DrawbackTrainingData\capturable-test.ndjson `
-  --output ..\DrawbackTrainingData\capturable-baseline-run `
+  --output ..\DrawbackTrainingData\capturable-selection-run `
   --seed 3235776257 --epochs 8 --batch-size 256 `
   --hidden-dimension 128 --torch-threads 14
 ```
+
+The selection command has no test-path argument and publishes
+`sealedTestStatus: "unopened"`. After the model seed, architecture, selected
+epoch, fusion alpha, and prior smoothing are frozen, compare multiple
+predeclared candidates using validation only:
+
+```powershell
+py -m ml.training.drawback_ml.capturable_experiment choose `
+  --candidate ..\DrawbackTrainingData\candidate-a\selection.json `
+  --candidate ..\DrawbackTrainingData\candidate-b\selection.json `
+  --output ..\DrawbackTrainingData\candidate-selection.json
+```
+
+The chooser requires byte-canonical reports, identical train/validation
+inputs, unique candidate identities, and matching checkpoint hashes. It
+preserves `sealedTestStatus: "unopened"`. Evaluate only the selected checkpoint:
+
+```powershell
+py -m ml.training.drawback_ml.capturable_experiment evaluate `
+  --checkpoint ..\DrawbackTrainingData\capturable-selection-run\model.pt `
+  --test ..\DrawbackTrainingData\capturable-test.ndjson `
+  --output ..\DrawbackTrainingData\capturable-sealed-evaluation.json
+```
+
+The checkpoint records every train/validation game ID. Sealed evaluation
+rejects any overlapping test game, authenticates the checkpoint and test
+bytes, loads tensors with PyTorch's restricted weights-only loader, and
+refuses to overwrite an existing report.
 
 `--train` may be repeated for independently generated training corpora. The
 loader requires canonical UTF-8/LF records, exact schema keys, complete
@@ -36,13 +63,14 @@ weight or using the trigger label at inference time. Public behavior features
 cover current mover/capture/castling facts, authority-move composition, per-side
 piece and tactical history, recent piece types, and repeated-piece streaks.
 
-The output directory must not already contain `model.pt` or
-`evaluation.json`. Both files bind the input hashes and record
-`freshStart: true`; they belong outside the repository. The training code now
-targets the Engine's 25-rule capturable catalog. No 25-label accuracy is
-claimed until a fresh, disjoint schema-8 experiment is complete. Published
-schema-7 results remain a historical 10-label baseline, not a promoted browser
-model or a claim about the full catalog.
+The selection output directory must not already contain `model.pt` or
+`selection.json`. Both files bind the input hashes and record
+`freshStart: true`; all selection and sealed-test artifacts belong outside the
+repository. The training code now targets the Engine's 25-rule capturable
+catalog. No 25-label accuracy is claimed until a fresh, disjoint schema-8
+experiment is complete. Published schema-7 results remain a historical
+10-label baseline, not a promoted browser model or a claim about the full
+catalog.
 
 ## Manifest-bound current-catalog training
 
