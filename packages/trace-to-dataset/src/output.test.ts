@@ -7,6 +7,9 @@ import {
   writeTrainingDatasetNdjsonFileAtomic,
 } from "./output.js";
 import { traceFixture } from "./test-fixture.js";
+import {
+  playerPrivateTraceFixture,
+} from "./player-private-test-fixture.js";
 
 const cleanupPaths: string[] = [];
 
@@ -51,6 +54,7 @@ describe("private training dataset output", () => {
       evaluatorCoverage: "none",
       evaluatorPolicyId: null,
       evaluatorEngineFingerprint: null,
+      authorityId: "standard-chess/v1",
     });
     await expect(
       writeTrainingDatasetNdjsonFileAtomic(path, traces),
@@ -130,5 +134,41 @@ describe("private training dataset output", () => {
         }),
       ]),
     ).rejects.toThrow("evaluator identity differs");
+  });
+
+  it("streams capturable traces and rejects mixed authorities", async () => {
+    const path = temporaryDataset("capturable");
+    const trace = playerPrivateTraceFixture();
+    const written = await writeTrainingDatasetNdjsonFileAtomic(
+      path,
+      [trace],
+      {
+        expectedAuthorityId: "capturable-king/v1",
+        expectedEvaluatorCoverage: "none",
+      },
+    );
+    const rows = (await readFile(path, "utf8")).trimEnd().split("\n");
+
+    expect(written).toMatchObject({
+      authorityId: "capturable-king/v1",
+      evaluatorCoverage: "none",
+      games: 1,
+      rows: 2,
+    });
+    expect(JSON.parse(rows[0] ?? "{}")).toMatchObject({
+      authorityId: "capturable-king/v1",
+      trueDrawback: "vegan",
+    });
+
+    const mixedPath = temporaryDataset("mixed-authority");
+    await expect(
+      writeTrainingDatasetNdjsonFileAtomic(mixedPath, [
+        traceFixture(),
+        trace,
+      ]),
+    ).rejects.toThrow("evaluator identity differs");
+    await expect(readFile(mixedPath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 });

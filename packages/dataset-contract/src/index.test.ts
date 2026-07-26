@@ -10,6 +10,12 @@ const schema = {
   symbolicRuleCount: 2,
 } as const;
 
+const capturableSchema = {
+  symbolicFeatureVersion: 7,
+  symbolicRuleCount: 2,
+  authorityId: "capturable-king/v1",
+} as const;
+
 function publicFeatures(): Record<string, unknown> {
   return {
     fenBefore: "8/8/8/8/8/8/4K3/7k w - - 0 1",
@@ -45,6 +51,27 @@ function datasetRow(): Record<string, unknown> {
     ruleTriggered: true,
     forced: true,
     result: { kind: "active" },
+  };
+}
+
+function capturablePublicFeatures(): Record<string, unknown> {
+  return {
+    ...publicFeatures(),
+    symbolicFeatureVersion: 7,
+    authorityId: "capturable-king/v1",
+    publicAuthorityPositionBefore: {
+      format: "drawbacktrainer-public-position",
+      version: 1,
+      authorityId: "capturable-king/v1",
+      fen: publicFeatures()["fenBefore"],
+      orthodoxCompatible: true,
+      kingPassant: {
+        victim: "white",
+        kingSquare: "g1",
+        targets: ["f1"],
+      },
+      terminal: null,
+    },
   };
 }
 
@@ -93,6 +120,34 @@ describe("public feature boundary", () => {
         schema,
       )
     ).toThrow(/sum to one or zero/u);
+  });
+
+  it("accepts only the complete public capturable authority snapshot", () => {
+    const parsed = parsePublicFeatureRecord(
+      capturablePublicFeatures(),
+      capturableSchema,
+    );
+    expect(parsed.authorityId).toBe("capturable-king/v1");
+    expect(parsed.publicAuthorityPositionBefore?.kingPassant).toEqual({
+      victim: "white",
+      kingSquare: "g1",
+      targets: ["f1"],
+    });
+
+    const poisoned = capturablePublicFeatures();
+    poisoned["publicAuthorityPositionBefore"] = {
+      ...(poisoned["publicAuthorityPositionBefore"] as object),
+      hiddenParameters: { square: "e4" },
+    };
+    expect(() =>
+      parsePublicFeatureRecord(poisoned, capturableSchema)
+    ).toThrow(/unknown hiddenParameters/u);
+  });
+
+  it("does not permit capturable authority state in the orthodox schema", () => {
+    expect(() =>
+      parsePublicFeatureRecord(capturablePublicFeatures(), schema)
+    ).toThrow(/unknown authorityId/u);
   });
 });
 

@@ -109,6 +109,21 @@ pnpm --filter @drawbackguesser/dataset-cli start -- \
   --require-evaluator uniform
 ```
 
+Convert the replay-verified player-private capturable-king corpus with:
+
+```bash
+pnpm --filter @drawbackguesser/dataset-cli start -- \
+  --input ../DrawbackEngine-private/player-private-train.ndjson \
+  --output ../DrawbackGuesser-private/capturable-train.ndjson \
+  --require-authority capturable-king/v1 \
+  --require-evaluator none
+```
+
+Capturable rows use symbolic feature schema 7 and the Engine's 10-rule audited
+authority catalog. They include the complete public position snapshot needed
+for one-reply king-passant, but secret IDs, parameters, rule state, legal
+masks, trigger flags, and results remain label-only fields.
+
 The input and output contain hidden labels and must remain private. The
 example deliberately writes outside the repository; do not place private
 NDJSON under the Guesser worktree. The converter derives every model feature

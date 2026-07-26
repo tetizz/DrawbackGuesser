@@ -1,4 +1,21 @@
 export type PlayerColor = "white" | "black";
+export type DatasetAuthorityId =
+  | "standard-chess/v1"
+  | "capturable-king/v1";
+
+export interface CapturablePublicPositionSnapshot {
+  readonly format: "drawbacktrainer-public-position";
+  readonly version: 1;
+  readonly authorityId: "capturable-king/v1";
+  readonly fen: string;
+  readonly orthodoxCompatible: boolean;
+  readonly kingPassant: {
+    readonly victim: PlayerColor;
+    readonly kingSquare: string;
+    readonly targets: readonly string[];
+  } | null;
+  readonly terminal: null;
+}
 
 export interface PublicEvaluatorConstraint {
   readonly provider: "uci-best-move";
@@ -10,6 +27,14 @@ export interface PublicEvaluatorConstraint {
 }
 
 export interface PublicFeatureRecord {
+  /**
+   * Present only for the additive capturable-king dataset schema.
+   *
+   * The full public authority snapshot is required because FEN cannot encode
+   * the one-reply king-passant right.
+   */
+  readonly authorityId?: "capturable-king/v1";
+  readonly publicAuthorityPositionBefore?: CapturablePublicPositionSnapshot;
   readonly fenBefore: string;
   readonly move: string;
   readonly moveNumber: number;
@@ -55,6 +80,7 @@ export interface ParsedDatasetRow {
 export interface DatasetSchema {
   readonly symbolicFeatureVersion: number;
   readonly symbolicRuleCount: number;
+  readonly authorityId?: DatasetAuthorityId;
 }
 
 export const PUBLIC_FEATURE_KEYS = Object.freeze([
@@ -72,6 +98,12 @@ export const PUBLIC_FEATURE_KEYS = Object.freeze([
   "symbolicWhiteEliminated",
   "symbolicBlackEliminated",
   "publicEvaluatorConstraint",
+] as const);
+
+export const CAPTURABLE_PUBLIC_FEATURE_KEYS = Object.freeze([
+  ...PUBLIC_FEATURE_KEYS,
+  "authorityId",
+  "publicAuthorityPositionBefore",
 ] as const);
 
 export const FORBIDDEN_FEATURE_KEYS = Object.freeze([
@@ -93,14 +125,9 @@ export const EVALUATION_ONLY_KEYS = Object.freeze([
   "botStrength",
 ] as const);
 
-const DATASET_ROW_KEYS = Object.freeze([
-  ...PUBLIC_FEATURE_KEYS,
-  ...FORBIDDEN_FEATURE_KEYS,
-  ...EVALUATION_ONLY_KEYS,
-] as const);
-
 const UCI_MOVE = /^[a-h][1-8][a-h][1-8][nbrq]?$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
+const BOARD_SQUARE = /^[a-h][1-8]$/u;
 
 export class DatasetContractError extends TypeError {
   public constructor(message: string) {
@@ -291,7 +318,18 @@ function checkedSchema(schema: DatasetSchema): DatasetSchema {
       "symbolic feature version and rule count must be positive safe integers",
     );
   }
-  return schema;
+  const authorityId: unknown =
+    schema.authorityId ?? "standard-chess/v1";
+  if (
+    authorityId !== "standard-chess/v1"
+    && authorityId !== "capturable-king/v1"
+  ) {
+    throw new DatasetContractError("dataset authorityId is unsupported");
+  }
+  return Object.freeze({
+    ...schema,
+    authorityId,
+  });
 }
 
 function hiddenParameters(value: unknown): unknown {
@@ -299,6 +337,93 @@ function hiddenParameters(value: unknown): unknown {
     return null;
   }
   return structuredClone(record(value, "hiddenParameters"));
+}
+
+function capturableAuthorityPosition(
+  authorityId: unknown,
+  input: unknown,
+  fenBefore: string,
+): CapturablePublicPositionSnapshot {
+  if (authorityId !== "capturable-king/v1") {
+    throw new DatasetContractError(
+      "authorityId must be capturable-king/v1 for this dataset schema",
+    );
+  }
+  const value = record(
+    input,
+    "publicAuthorityPositionBefore",
+  );
+  assertExactKeys(
+    value,
+    [
+      "format",
+      "version",
+      "authorityId",
+      "fen",
+      "orthodoxCompatible",
+      "kingPassant",
+      "terminal",
+    ],
+    "publicAuthorityPositionBefore",
+  );
+  if (
+    value["format"] !== "drawbacktrainer-public-position"
+    || value["version"] !== 1
+    || value["authorityId"] !== "capturable-king/v1"
+    || value["fen"] !== fenBefore
+    || typeof value["orthodoxCompatible"] !== "boolean"
+    || value["terminal"] !== null
+  ) {
+    throw new DatasetContractError(
+      "publicAuthorityPositionBefore is not a matching non-terminal capturable-king snapshot",
+    );
+  }
+  const kingPassant = value["kingPassant"] === null
+    ? null
+    : capturableKingPassant(value["kingPassant"]);
+  return Object.freeze({
+    format: "drawbacktrainer-public-position",
+    version: 1,
+    authorityId: "capturable-king/v1",
+    fen: fenBefore,
+    orthodoxCompatible: value["orthodoxCompatible"],
+    kingPassant,
+    terminal: null,
+  });
+}
+
+function capturableKingPassant(
+  input: unknown,
+): NonNullable<CapturablePublicPositionSnapshot["kingPassant"]> {
+  const value = record(input, "publicAuthorityPositionBefore.kingPassant");
+  assertExactKeys(
+    value,
+    ["victim", "kingSquare", "targets"],
+    "publicAuthorityPositionBefore.kingPassant",
+  );
+  const victim = value["victim"];
+  const kingSquare = value["kingSquare"];
+  const targets = stringArray(
+    value["targets"],
+    "publicAuthorityPositionBefore.kingPassant.targets",
+  );
+  if (
+    (victim !== "white" && victim !== "black")
+    || typeof kingSquare !== "string"
+    || !BOARD_SQUARE.test(kingSquare)
+    || targets.length === 0
+    || targets.some((target) => !BOARD_SQUARE.test(target))
+    || new Set(targets).size !== targets.length
+  ) {
+    throw new DatasetContractError(
+      "publicAuthorityPositionBefore.kingPassant is invalid",
+    );
+  }
+  return Object.freeze({
+    victim,
+    kingSquare,
+    targets,
+  });
 }
 
 export function parsePublicFeatureRecord(
@@ -321,7 +446,11 @@ export function parsePublicFeatureRecord(
       ].join(", ")}`,
     );
   }
-  assertExactKeys(value, PUBLIC_FEATURE_KEYS, "public feature record");
+  const featureKeys =
+    schema.authorityId === "capturable-king/v1"
+      ? CAPTURABLE_PUBLIC_FEATURE_KEYS
+      : PUBLIC_FEATURE_KEYS;
+  assertExactKeys(value, featureKeys, "public feature record");
 
   const playerColor = value["playerColor"];
   if (playerColor !== "white" && playerColor !== "black") {
@@ -349,8 +478,23 @@ export function parsePublicFeatureRecord(
     ? null
     : nonNegativeInteger(rawClock, "clockMs");
 
+  const fenBefore = requiredString(value, "fenBefore");
+  const authority =
+    schema.authorityId === "capturable-king/v1"
+      ? capturableAuthorityPosition(
+          value["authorityId"],
+          value["publicAuthorityPositionBefore"],
+          fenBefore,
+        )
+      : null;
   return Object.freeze({
-    fenBefore: requiredString(value, "fenBefore"),
+    ...(authority === null
+      ? {}
+      : {
+          authorityId: "capturable-king/v1" as const,
+          publicAuthorityPositionBefore: authority,
+        }),
+    fenBefore,
     move,
     moveNumber,
     ply: nonNegativeInteger(value["ply"], "ply"),
@@ -392,12 +536,25 @@ export function parseDatasetRow(
   input: unknown,
   schema: DatasetSchema,
 ): ParsedDatasetRow {
+  const checked = checkedSchema(schema);
   const row = record(input, "dataset row");
-  assertExactKeys(row, DATASET_ROW_KEYS, "dataset row");
-  const featureInput = Object.fromEntries(
-    PUBLIC_FEATURE_KEYS.map((key) => [key, row[key]]),
+  const featureKeys =
+    checked.authorityId === "capturable-king/v1"
+      ? CAPTURABLE_PUBLIC_FEATURE_KEYS
+      : PUBLIC_FEATURE_KEYS;
+  assertExactKeys(
+    row,
+    [
+      ...featureKeys,
+      ...FORBIDDEN_FEATURE_KEYS,
+      ...EVALUATION_ONLY_KEYS,
+    ],
+    "dataset row",
   );
-  const features = parsePublicFeatureRecord(featureInput, schema);
+  const featureInput = Object.fromEntries(
+    featureKeys.map((key) => [key, row[key]]),
+  );
+  const features = parsePublicFeatureRecord(featureInput, checked);
   const trueDrawback = requiredString(row, "trueDrawback");
   const ruleTriggered = row["ruleTriggered"];
   const forced = row["forced"];

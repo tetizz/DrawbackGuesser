@@ -1,9 +1,9 @@
 import { createReadStream } from "node:fs";
 import { TextDecoder } from "node:util";
 import {
-  parsePrivateSimulationTraceLine,
-  type PrivateSimulationTraceRecord,
-} from "@drawbackengine/simulation-trace";
+  parseTrustedSimulationTraceLine,
+  type TrustedSimulationTraceRecord,
+} from "@drawbackguesser/trace-to-dataset";
 
 export const DEFAULT_MAX_TRACE_LINE_BYTES = 64 * 1024 * 1024;
 
@@ -25,7 +25,7 @@ function parseLine(
   bytes: Buffer,
   lineNumber: number,
   maximum: number,
-): PrivateSimulationTraceRecord {
+): TrustedSimulationTraceRecord {
   if (bytes.byteLength > maximum) {
     throw new RangeError(
       `Private trace line ${String(lineNumber)} exceeds ${String(maximum)} bytes.`,
@@ -46,7 +46,7 @@ function parseLine(
     );
   }
   try {
-    return parsePrivateSimulationTraceLine(line);
+    return parseTrustedSimulationTraceLine(line);
   } catch (error: unknown) {
     throw new SyntaxError(
       `Private trace line ${String(lineNumber)} is invalid: ${
@@ -60,7 +60,7 @@ function parseLine(
 export async function* readPrivateTraceNdjson(
   path: string,
   options: TraceInputOptions = {},
-): AsyncIterableIterator<PrivateSimulationTraceRecord> {
+): AsyncIterableIterator<TrustedSimulationTraceRecord> {
   const maximum = checkedMaximum(options.maxLineBytes);
   const stream = createReadStream(path);
   let fragments: Buffer[] = [];

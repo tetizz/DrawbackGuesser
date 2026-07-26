@@ -6,16 +6,13 @@ This document specifies the engine boundary required for **Death Wish** and
 drawbacks whose observed text literally refers to capturing a king. It does
 not normalize king capture to checkmate.
 
-An initial executable `capturable-king/v1` milestone now lives in
-`packages/chess-core/src/capturable-king-position.ts`,
-`packages/chess-core/src/drawback-game-session.ts`, and
-`packages/drawback-search`. It implements the public site's global geometric
-move model, direct king capture, castling-en-passant king capture, exact session
-forks, and an omniscient offline drawback-aware tree search. The authority
-snapshot, predictor, browser, asynchronous-rule, and dataset migrations
-described below remain open; see `docs/architecture/drawback-search.md`.
-Therefore this document is still partly a migration contract, not a claim that
-every consumer has moved.
+The executable `capturable-king/v1` milestone lives in the pinned Engine's
+chess core, DrawbackGameSession, drawback search, player-private simulation,
+and replay-verified trace packages. The Guesser predictor and dataset bridge
+consume its complete public authority snapshots, including direct king
+capture and castling-en-passant king capture. Browser gameplay, general probe
+search, and unaudited rules have not all migrated, so the remainder of this
+document is still partly a migration contract.
 
 The current engine cannot implement those rules faithfully:
 

@@ -3,8 +3,14 @@ import { readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { encodePrivateSimulationTraceRecord } from "@drawbackengine/simulation-trace";
+import {
+  encodePlayerPrivateSimulationTraceRecord,
+  encodePrivateSimulationTraceRecord,
+} from "@drawbackengine/simulation-trace";
 import { traceFixture } from "../../../packages/trace-to-dataset/src/test-fixture.js";
+import {
+  playerPrivateTraceFixture,
+} from "../../../packages/trace-to-dataset/src/player-private-test-fixture.js";
 import {
   parseDatasetCliArguments,
   runDatasetCli,
@@ -46,6 +52,16 @@ describe("dataset CLI", () => {
         "sometimes",
       ])
     ).toThrow("none or uniform");
+    expect(() =>
+      parseDatasetCliArguments([
+        "--input",
+        "input.ndjson",
+        "--output",
+        "output.ndjson",
+        "--require-authority",
+        "unknown/v1",
+      ])
+    ).toThrow("standard-chess/v1 or capturable-king/v1");
     expect(() =>
       parseDatasetCliArguments([
         "--input",
@@ -107,5 +123,38 @@ describe("dataset CLI", () => {
     await expect(invalidUtf8.next()).rejects.toThrow(
       "Private trace line 1 is not valid UTF-8",
     );
+  });
+
+  it("converts replay-verified capturable traces through the CLI", async () => {
+    const inputPath = temporaryPath("player-private-trace");
+    const outputPath = temporaryPath("capturable-dataset");
+    const trace = playerPrivateTraceFixture({
+      whiteRuleId: "triple-play",
+    });
+    await writeFile(
+      inputPath,
+      encodePlayerPrivateSimulationTraceRecord(trace),
+      {
+        encoding: "utf8",
+        mode: 0o600,
+      },
+    );
+
+    await runDatasetCli({
+      inputPath,
+      outputPath,
+      expectedEvaluatorCoverage: "none",
+      expectedAuthorityId: "capturable-king/v1",
+    });
+
+    const rows = (await readFile(outputPath, "utf8")).trimEnd().split("\n");
+    expect(rows).toHaveLength(2);
+    expect(JSON.parse(rows[0] ?? "{}")).toMatchObject({
+      authorityId: "capturable-king/v1",
+      trueDrawback: "triple-play",
+      publicAuthorityPositionBefore: {
+        authorityId: "capturable-king/v1",
+      },
+    });
   });
 });

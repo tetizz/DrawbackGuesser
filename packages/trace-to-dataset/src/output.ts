@@ -4,13 +4,16 @@ import { createWriteStream } from "node:fs";
 import { link, rm } from "node:fs/promises";
 import { finished } from "node:stream/promises";
 import {
-  parsePrivateSimulationTraceRecord,
-  type PrivateSimulationTraceRecord,
-} from "@drawbackengine/simulation-trace";
-import {
   convertTraceToDatasetRows,
   type TrainingDatasetRow,
 } from "./converter.js";
+import {
+  convertPlayerPrivateTraceToDatasetRows,
+} from "./player-private-converter.js";
+import {
+  parseTrustedSimulationTraceRecord,
+  type TrustedSimulationTraceRecord,
+} from "./trusted-trace.js";
 
 export interface DatasetOutputPolicy {
   /**
@@ -18,6 +21,9 @@ export interface DatasetOutputPolicy {
    * Release corpora should require `uniform`; research corpora may use `none`.
    */
   readonly expectedEvaluatorCoverage?: "none" | "uniform";
+  readonly expectedAuthorityId?:
+    | "standard-chess/v1"
+    | "capturable-king/v1";
 }
 
 export interface WrittenTrainingDataset {
@@ -28,19 +34,35 @@ export interface WrittenTrainingDataset {
   readonly evaluatorCoverage: "none" | "uniform" | null;
   readonly evaluatorPolicyId: string | null;
   readonly evaluatorEngineFingerprint: string | null;
+  readonly authorityId:
+    | "standard-chess/v1"
+    | "capturable-king/v1"
+    | null;
 }
 
 interface EvaluatorIdentity {
+  readonly authorityId:
+    | "standard-chess/v1"
+    | "capturable-king/v1";
   readonly coverage: "none" | "uniform";
   readonly policyId: string | null;
   readonly engineFingerprint: string | null;
 }
 
 function evaluatorIdentity(
-  trace: PrivateSimulationTraceRecord,
+  trace: TrustedSimulationTraceRecord,
 ): EvaluatorIdentity {
+  if (trace.authorityId === "capturable-king/v1") {
+    return {
+      authorityId: "capturable-king/v1",
+      coverage: "none",
+      policyId: null,
+      engineFingerprint: null,
+    };
+  }
   if (trace.evaluatorCoverage === "none") {
     return {
+      authorityId: "standard-chess/v1",
       coverage: "none",
       policyId: null,
       engineFingerprint: null,
@@ -53,6 +75,7 @@ function evaluatorIdentity(
     );
   }
   return {
+    authorityId: "standard-chess/v1",
     coverage: "uniform",
     policyId: firstConstraint.policyId,
     engineFingerprint: firstConstraint.engineFingerprint,
@@ -62,9 +85,18 @@ function evaluatorIdentity(
 function assertEvaluatorConsistency(
   established: EvaluatorIdentity | null,
   current: EvaluatorIdentity,
-  trace: PrivateSimulationTraceRecord,
+  trace: TrustedSimulationTraceRecord,
   policy: DatasetOutputPolicy,
 ): EvaluatorIdentity {
+  if (
+    policy.expectedAuthorityId !== undefined
+    && current.authorityId !== policy.expectedAuthorityId
+  ) {
+    throw new TypeError(
+      `Trace ${trace.gameId} authority ${current.authorityId}`
+      + ` does not match required ${policy.expectedAuthorityId}.`,
+    );
+  }
   if (
     policy.expectedEvaluatorCoverage !== undefined
     && current.coverage !== policy.expectedEvaluatorCoverage
@@ -78,7 +110,8 @@ function assertEvaluatorConsistency(
     return current;
   }
   if (
-    established.coverage !== current.coverage
+    established.authorityId !== current.authorityId
+    || established.coverage !== current.coverage
     || established.policyId !== current.policyId
     || established.engineFingerprint !== current.engineFingerprint
   ) {
@@ -87,6 +120,14 @@ function assertEvaluatorConsistency(
     );
   }
   return established;
+}
+
+function convertTrustedTrace(
+  trace: TrustedSimulationTraceRecord,
+): readonly TrainingDatasetRow[] {
+  return trace.authorityId === "capturable-king/v1"
+    ? convertPlayerPrivateTraceToDatasetRows(trace)
+    : convertTraceToDatasetRows(trace);
 }
 
 function encodeDatasetRow(row: TrainingDatasetRow): string {
@@ -156,7 +197,7 @@ export async function writeTrainingDatasetNdjsonFileAtomic(
 
   try {
     for await (const traceInput of traces) {
-      const trace = parsePrivateSimulationTraceRecord(traceInput);
+      const trace = parseTrustedSimulationTraceRecord(traceInput);
       if (gameIds.has(trace.gameId)) {
         throw new TypeError(`Duplicate trace gameId ${trace.gameId}.`);
       }
@@ -167,7 +208,7 @@ export async function writeTrainingDatasetNdjsonFileAtomic(
         trace,
         policy,
       );
-      const converted = convertTraceToDatasetRows(trace);
+      const converted = convertTrustedTrace(trace);
       for (const row of converted) {
         const chunk = encodeDatasetRow(row);
         hash.update(chunk, "utf8");
@@ -193,6 +234,7 @@ export async function writeTrainingDatasetNdjsonFileAtomic(
       evaluatorCoverage: identity?.coverage ?? null,
       evaluatorPolicyId: identity?.policyId ?? null,
       evaluatorEngineFingerprint: identity?.engineFingerprint ?? null,
+      authorityId: identity?.authorityId ?? null,
     };
   } catch (error: unknown) {
     stream.destroy();

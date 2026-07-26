@@ -42,6 +42,8 @@ export {
   scoreMoveLogLikelihood,
 } from "./likelihood.js";
 export {
+  CAPTURABLE_HYPOTHESIS_RULE_IDS,
+  createCapturableHypothesisSeeds,
   createDefaultHypothesisSeeds,
   DEFAULT_HYPOTHESIS_RULE_IDS,
   GAMBLER_OUTCOME_COUNT,

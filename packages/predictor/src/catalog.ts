@@ -1,4 +1,5 @@
 import {
+  AUDITED_CAPTURABLE_KING_RULE_IDS,
   activeVolcanoRule,
   barbarianRageRule,
   battleFatigueRule,
@@ -70,6 +71,12 @@ import {
   oohShinyRule,
   ichtyophobeRule,
   windsOfFateRule,
+  capturableKingIrresistibleRule,
+  femmeFataleRule,
+  nurturerRule,
+  OBSERVED_TRIPLE_PLAY_TYPES,
+  triplePlayRule,
+  youBestNotMissRule,
 } from "@drawbackengine/drawback-engine";
 import type {
   ChessMove,
@@ -273,6 +280,9 @@ export const DEFAULT_HYPOTHESIS_RULE_IDS = [
   "hand-and-gigabrain",
   "ichtyophobe",
 ] as const;
+
+export const CAPTURABLE_HYPOTHESIS_RULE_IDS =
+  AUDITED_CAPTURABLE_KING_RULE_IDS;
 
 if (
   preparedExecutableRules.length !== DEFAULT_HYPOTHESIS_RULE_IDS.length ||
@@ -584,4 +594,46 @@ export function createDefaultHypothesisSeeds(): readonly PredictionSeed[] {
     asExternalConstraintHypothesisSeed(handAndGigabrainRule, {}, 1),
     asExternalConstraintHypothesisSeed(ichtyophobeRule, {}, 1),
   ]);
+}
+
+/**
+ * Exact hypothesis particles for the audited capturable-king authority.
+ *
+ * Triple Play has two observed hidden parameter values, while the other nine
+ * rules are parameterless. The public rule order is owned by DrawbackEngine's
+ * audited authority allowlist so labels cannot drift from executable support.
+ */
+export function createCapturableHypothesisSeeds():
+  readonly PredictionSeed[] {
+  const parameterless = [
+    asHypothesisSeed(veganRule, {}, 1),
+    asHypothesisSeed(lameDuckRule, {}, 1),
+    asHypothesisSeed(checkersRule, {}, 1),
+    asHypothesisSeed(truantRule, {}, 1),
+    asHypothesisSeed(spiceOfLifeRule, {}, 1),
+    asHypothesisSeed(femmeFataleRule, {}, 1),
+    asHypothesisSeed(nurturerRule, {}, 1),
+    asHypothesisSeed(youBestNotMissRule, {}, 1),
+    asHypothesisSeed(capturableKingIrresistibleRule, {}, 1),
+  ];
+  const seeds = Object.freeze([
+    ...parameterless,
+    ...expandHypothesisSeeds(
+      triplePlayRule,
+      OBSERVED_TRIPLE_PLAY_TYPES.map((requiredType) => ({
+        parameters: { requiredType },
+      })),
+      1,
+    ),
+  ]);
+  const represented = new Set(seeds.map((seed) => seed.rule.id));
+  if (
+    represented.size !== CAPTURABLE_HYPOTHESIS_RULE_IDS.length
+    || CAPTURABLE_HYPOTHESIS_RULE_IDS.some((id) => !represented.has(id))
+  ) {
+    throw new Error(
+      "Capturable hypothesis seeds are out of sync with the audited Engine catalog.",
+    );
+  }
+  return seeds;
 }

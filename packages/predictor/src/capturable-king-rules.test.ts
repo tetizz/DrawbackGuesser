@@ -14,7 +14,9 @@ import {
   type MoveCommand,
 } from "@drawbackengine/chess-core";
 import {
+  CAPTURABLE_HYPOTHESIS_RULE_IDS,
   asHypothesisSeed,
+  createCapturableHypothesisSeeds,
   createPublicMoveObservation,
   SymbolicPredictor,
   type PredictionSeed,
@@ -85,7 +87,29 @@ function byId(
   );
 }
 
+function seedId(seed: PredictionSeed): string {
+  return seed.kind === "rerandomized"
+    ? seed.drawbackId
+    : seed.rule.id;
+}
+
 describe("capturable-king rule prediction", () => {
+  it("covers every audited authority rule with exact parameter particles", () => {
+    const seeds = createCapturableHypothesisSeeds();
+    expect(new Set(seeds.map(seedId))).toEqual(
+      new Set(CAPTURABLE_HYPOTHESIS_RULE_IDS),
+    );
+    expect(
+      seeds.flatMap((seed) =>
+        seed.kind !== "rerandomized" && seed.rule.id === "triple-play"
+          ? [seed.parameters]
+          : []),
+    ).toEqual([
+      { requiredType: "bishop" },
+      { requiredType: "knight" },
+    ]);
+  });
+
   it("hard-eliminates Irresistible after a quiet move declines adjacency", () => {
     const position = CapturableKingPosition.fromFen(
       "4k3/8/8/2N5/8/8/P7/4K3 w - - 0 1",

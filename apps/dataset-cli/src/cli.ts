@@ -11,6 +11,9 @@ export interface DatasetCliOptions {
   readonly inputPath: string;
   readonly outputPath: string;
   readonly expectedEvaluatorCoverage?: "none" | "uniform";
+  readonly expectedAuthorityId?:
+    | "standard-chess/v1"
+    | "capturable-king/v1";
 }
 
 export interface DatasetCliIo {
@@ -38,6 +41,7 @@ export function parseDatasetCliArguments(
     "--input",
     "--output",
     "--require-evaluator",
+    "--require-authority",
   ]);
   const seen = new Set<string>();
   for (let index = 0; index < arguments_.length; index += 2) {
@@ -77,12 +81,27 @@ export function parseDatasetCliArguments(
       "--require-evaluator must be either none or uniform.",
     );
   }
+  const authority = arguments_.includes("--require-authority")
+    ? valueAfter(arguments_, "--require-authority")
+    : undefined;
+  if (
+    authority !== undefined
+    && authority !== "standard-chess/v1"
+    && authority !== "capturable-king/v1"
+  ) {
+    throw new TypeError(
+      "--require-authority must be standard-chess/v1 or capturable-king/v1.",
+    );
+  }
   return {
     inputPath,
     outputPath,
     ...(evaluator === undefined
       ? {}
       : { expectedEvaluatorCoverage: evaluator }),
+    ...(authority === undefined
+      ? {}
+      : { expectedAuthorityId: authority }),
   };
 }
 
@@ -94,12 +113,16 @@ export async function runDatasetCli(
   },
 ): Promise<void> {
   await mkdir(dirname(options.outputPath), { recursive: true });
-  const policy: DatasetOutputPolicy =
-    options.expectedEvaluatorCoverage === undefined
+  const policy: DatasetOutputPolicy = {
+    ...(options.expectedEvaluatorCoverage === undefined
       ? {}
       : {
           expectedEvaluatorCoverage: options.expectedEvaluatorCoverage,
-        };
+        }),
+    ...(options.expectedAuthorityId === undefined
+      ? {}
+      : { expectedAuthorityId: options.expectedAuthorityId }),
+  };
   const written = await writeTrainingDatasetNdjsonFileAtomic(
     options.outputPath,
     readPrivateTraceNdjson(options.inputPath),
