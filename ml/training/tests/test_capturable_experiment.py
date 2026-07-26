@@ -13,8 +13,10 @@ from drawback_ml.capturable_baseline import (
 )
 from drawback_ml.capturable_experiment import (
     run_candidate_selection,
+    run_paired_sealed_evaluation,
     run_sealed_evaluation,
     run_selection,
+    run_treatment_comparison,
 )
 from drawback_ml.capturable_records import CapturableDatasetError
 
@@ -147,6 +149,102 @@ class CapturableExperimentTests(unittest.TestCase):
                     overlap_output,
                 )
             self.assertFalse(overlap_output.exists())
+
+    def test_treatment_comparison_allows_train_only_intervention(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            control_train = self._write_split(root, "control-train")
+            treatment_train = self._write_split(root, "treatment-train")
+            validation = self._write_split(root, "shared-validation")
+            other_validation = self._write_split(root, "other-validation")
+            paired_test = self._write_split(root, "paired-test")
+            config = CapturableTrainingConfig(
+                seed=20260726,
+                epochs=1,
+                batch_size=2,
+                hidden_dimension=8,
+                torch_threads=1,
+            )
+            control = root / "control"
+            treatment = root / "treatment"
+            wrong_validation = root / "wrong-validation"
+            run_selection((control_train,), validation, control, config)
+            run_selection(
+                (treatment_train,),
+                validation,
+                treatment,
+                config,
+            )
+            run_selection(
+                (treatment_train,),
+                other_validation,
+                wrong_validation,
+                config,
+            )
+
+            output = root / "treatment-comparison.json"
+            result = run_treatment_comparison(
+                control / "selection.json",
+                (treatment / "selection.json",),
+                output,
+            )
+            report = json.loads(output.read_text("utf-8"))
+            self.assertIn(
+                result["decision"],
+                {"promote-treatment", "retain-control"},
+            )
+            self.assertEqual(report["sealedTestStatus"], "unopened")
+            self.assertEqual(
+                report["validationInput"]["sha256"],
+                json.loads(
+                    (control / "selection.json").read_text("utf-8")
+                )["inputs"]["validation"]["sha256"],
+            )
+            self.assertNotEqual(
+                report["control"]["trainInput"],
+                report["treatments"][0]["trainInput"],
+            )
+            paired_output = root / "paired-evaluation.json"
+            paired = run_paired_sealed_evaluation(
+                output,
+                paired_test,
+                paired_output,
+            )
+            paired_report = json.loads(
+                paired_output.read_text("utf-8")
+            )
+            self.assertIn(
+                paired["decision"],
+                {"confirm-treatment", "reject-treatment"},
+            )
+            self.assertEqual(
+                paired_report["test"]["input"]["games"],
+                2,
+            )
+            self.assertEqual(
+                paired_report["sealedTestStatus"],
+                "consumed",
+            )
+            with self.assertRaisesRegex(
+                CapturableDatasetError,
+                "overlaps selection games",
+            ):
+                run_paired_sealed_evaluation(
+                    output,
+                    control_train,
+                    root / "overlap-paired-evaluation.json",
+                )
+
+            with self.assertRaisesRegex(
+                CapturableDatasetError,
+                "different validation inputs",
+            ):
+                run_treatment_comparison(
+                    control / "selection.json",
+                    (wrong_validation / "selection.json",),
+                    root / "wrong-comparison.json",
+                )
+            self.assertFalse((root / "wrong-comparison.json").exists())
 
     @staticmethod
     def _write_split(root: Path, split: str) -> Path:

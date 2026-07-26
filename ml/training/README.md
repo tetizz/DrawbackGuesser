@@ -32,6 +32,39 @@ The chooser requires byte-canonical reports, identical train/validation
 inputs, unique candidate identities, and matching checkpoint hashes. It
 preserves `sealedTestStatus: "unopened"`. Evaluate only the selected checkpoint:
 
+When an intervention deliberately adds a train-only corpus, compare its frozen
+selection reports against the frozen control with the unchanged validation
+identity:
+
+```powershell
+py -m ml.training.drawback_ml.capturable_experiment compare-treatment `
+  --control ..\DrawbackTrainingData\control\selection.json `
+  --treatment ..\DrawbackTrainingData\treatment-a\selection.json `
+  --treatment ..\DrawbackTrainingData\treatment-b\selection.json `
+  --output ..\DrawbackTrainingData\treatment-comparison.json
+```
+
+This command permits different training inputs, but requires an exact
+validation identity and identical model/training configuration apart from the
+random seed and trigger-row multiplier. It authenticates every checkpoint,
+uses validation metrics only, and leaves the sealed test unopened. Parameter
+tie-breaks may select between treatments, but cannot promote a treatment whose
+Top-1, Top-3, and NLL tuple merely ties the control.
+
+After a treatment wins validation and a new test split has been preregistered,
+evaluate the authenticated control and treatment together:
+
+```powershell
+py -m ml.training.drawback_ml.capturable_experiment evaluate-treatment `
+  --comparison ..\DrawbackTrainingData\treatment-comparison.json `
+  --test ..\DrawbackTrainingData\fresh-test.ndjson `
+  --output ..\DrawbackTrainingData\paired-sealed-evaluation.json
+```
+
+The paired evaluator rejects altered comparison/checkpoint identities and
+train/validation overlap, loads the fresh test once, evaluates both frozen
+models without an intervening decision, and publishes one no-clobber report.
+
 ```powershell
 py -m ml.training.drawback_ml.capturable_experiment evaluate `
   --checkpoint ..\DrawbackTrainingData\capturable-selection-run\model.pt `

@@ -400,6 +400,166 @@ def run_sealed_evaluation(
     }
 
 
+def _evaluate_selection_on_test(
+    checkpoint_path: Path,
+    test_rows: Sequence[CapturableDatasetRow],
+    test_tensors: Any,
+) -> Mapping[str, Any]:
+    model, metadata, checkpoint_sha256 = _load_selection_checkpoint(
+        checkpoint_path.resolve()
+    )
+    source_game_ids = set(metadata["sourceGameIds"])
+    overlap = sorted(
+        {
+            row.evaluation.game_id
+            for row in test_rows
+            if row.evaluation.game_id in source_game_ids
+        }
+    )
+    if overlap:
+        raise CapturableDatasetError(
+            "sealed test overlaps selection games: "
+            + ", ".join(overlap[:5])
+        )
+    config = _training_config_from_json(metadata["config"])
+    selected_alpha = float(metadata["selectedFusionAlpha"])
+    selected_smoothing = float(metadata["selectedPriorSmoothing"])
+    return {
+        "checkpoint": {
+            "file": checkpoint_path.resolve().name,
+            "sha256": checkpoint_sha256,
+        },
+        "selection": {
+            "selectedEpoch": metadata["selectedEpoch"],
+            "selectedFusionAlpha": selected_alpha,
+            "selectedPriorSmoothing": selected_smoothing,
+            "config": metadata["config"],
+            "inputs": metadata["inputs"],
+        },
+        "metrics": evaluate_capturable(
+            model,
+            test_rows,
+            test_tensors,
+            config,
+            selected_alpha,
+            selected_smoothing,
+        ),
+    }
+
+
+def _test_performance_order(result: Mapping[str, Any]) -> tuple[float, ...]:
+    metrics = result["metrics"]["hybrid"]
+    return (
+        float(metrics["game_normalized_top_1_accuracy"]),
+        float(metrics["game_normalized_top_3_accuracy"]),
+        -float(metrics["game_normalized_negative_log_likelihood"]),
+    )
+
+
+def run_paired_sealed_evaluation(
+    comparison_path: Path,
+    test_path: Path,
+    output_path: Path,
+) -> Mapping[str, Any]:
+    """Evaluate one frozen control/treatment pair in a single sealed pass."""
+
+    if output_path.exists():
+        raise FileExistsError(
+            "paired sealed evaluation output already exists"
+        )
+    from .capturable_candidate_selection import (
+        load_treatment_comparison,
+    )
+
+    comparison, comparison_sha256 = load_treatment_comparison(
+        comparison_path
+    )
+    test_rows, test_sha256 = _load_stable_capturable_dataset(test_path)
+    test_tensors = tensorize(test_rows)
+    root = comparison_path.resolve().parent
+
+    def checkpoint_path(candidate: Mapping[str, Any]) -> Path:
+        return (
+            root
+            / str(candidate["selectionDirectory"])
+            / str(candidate["checkpointFile"])
+        )
+
+    control = _evaluate_selection_on_test(
+        checkpoint_path(comparison["control"]),
+        test_rows,
+        test_tensors,
+    )
+    treatment = _evaluate_selection_on_test(
+        checkpoint_path(comparison["bestTreatment"]),
+        test_rows,
+        test_tensors,
+    )
+    control_order = _test_performance_order(control)
+    treatment_order = _test_performance_order(treatment)
+    confirmed = treatment_order > control_order
+    control_hybrid = control["metrics"]["hybrid"]
+    treatment_hybrid = treatment["metrics"]["hybrid"]
+    report = {
+        "format": (
+            "drawbackguesser-capturable-paired-sealed-evaluation"
+        ),
+        "version": 1,
+        "comparison": {
+            "file": comparison_path.resolve().name,
+            "sha256": comparison_sha256,
+            "validationDecision": comparison["decision"],
+        },
+        "test": {
+            "input": {
+                "path": test_path.resolve().name,
+                "sha256": test_sha256,
+                "rows": len(test_rows),
+                "games": len(
+                    {row.evaluation.game_id for row in test_rows}
+                ),
+            },
+            "control": control,
+            "treatment": treatment,
+            "gameNormalizedDeltas": {
+                "top1": (
+                    treatment_hybrid["game_normalized_top_1_accuracy"]
+                    - control_hybrid["game_normalized_top_1_accuracy"]
+                ),
+                "top3": (
+                    treatment_hybrid["game_normalized_top_3_accuracy"]
+                    - control_hybrid["game_normalized_top_3_accuracy"]
+                ),
+                "negativeLogLikelihood": (
+                    treatment_hybrid[
+                        "game_normalized_negative_log_likelihood"
+                    ]
+                    - control_hybrid[
+                        "game_normalized_negative_log_likelihood"
+                    ]
+                ),
+            },
+            "decision": (
+                "confirm-treatment" if confirmed else "reject-treatment"
+            ),
+        },
+        "sealedTestStatus": "consumed",
+    }
+    payload = _canonical_json(report)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _publish_bytes(output_path, payload)
+    return {
+        "reportPath": str(output_path),
+        "reportSha256": hashlib.sha256(payload).hexdigest(),
+        "decision": report["test"]["decision"],
+        "testSha256": test_sha256,
+        "controlGameNormalizedTop1": control_order[0],
+        "treatmentGameNormalizedTop1": treatment_order[0],
+        "controlGameNormalizedTop3": control_order[1],
+        "treatmentGameNormalizedTop3": treatment_order[1],
+    }
+
+
 def run_candidate_selection(
     report_paths: Sequence[Path],
     output_path: Path,
@@ -411,6 +571,24 @@ def run_candidate_selection(
     )
 
     return choose_candidate(report_paths, output_path)
+
+
+def run_treatment_comparison(
+    control_report_path: Path,
+    treatment_report_paths: Sequence[Path],
+    output_path: Path,
+) -> Mapping[str, Any]:
+    """Compare a frozen control with train-only interventions."""
+
+    from .capturable_candidate_selection import (
+        run_treatment_comparison as compare_treatment,
+    )
+
+    return compare_treatment(
+        control_report_path,
+        treatment_report_paths,
+        output_path,
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -466,6 +644,32 @@ def _parser() -> argparse.ArgumentParser:
         help="Repeat for each selection.json candidate.",
     )
     choose.add_argument("--output", type=Path, required=True)
+    compare = commands.add_parser(
+        "compare-treatment",
+        help=(
+            "Compare train-only interventions against a frozen control "
+            "using the exact same validation corpus."
+        ),
+    )
+    compare.add_argument("--control", type=Path, required=True)
+    compare.add_argument(
+        "--treatment",
+        type=Path,
+        action="append",
+        required=True,
+        help="Repeat for each treatment selection.json.",
+    )
+    compare.add_argument("--output", type=Path, required=True)
+    paired = commands.add_parser(
+        "evaluate-treatment",
+        help=(
+            "Evaluate one authenticated control/treatment comparison "
+            "against a fresh sealed test in one pass."
+        ),
+    )
+    paired.add_argument("--comparison", type=Path, required=True)
+    paired.add_argument("--test", type=Path, required=True)
+    paired.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -492,9 +696,21 @@ def main(arguments: Sequence[str] | None = None) -> int:
             options.test,
             options.output,
         )
-    else:
+    elif options.command == "choose":
         result = run_candidate_selection(
             options.candidate,
+            options.output,
+        )
+    elif options.command == "compare-treatment":
+        result = run_treatment_comparison(
+            options.control,
+            options.treatment,
+            options.output,
+        )
+    else:
+        result = run_paired_sealed_evaluation(
+            options.comparison,
+            options.test,
             options.output,
         )
     print(json.dumps(result, allow_nan=False, sort_keys=True))
