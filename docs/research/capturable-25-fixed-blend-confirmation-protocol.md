@@ -112,11 +112,16 @@ command must:
 5. require the standard initial position, exact unrestricted-baseline
    opponent hypotheses, exact worst-case material search policy, exact
    censoring semantics, and game indexes `0` through `624`;
-6. regenerate every schema-8 row from the trace and require byte-for-byte
+6. rerun the fixed player-private generation command in the authenticated
+   Engine worktree and require byte-for-byte identity with the submitted
+   trace, proving the recorded moves were selected by the frozen search and
+   temperature policy rather than merely being legal moves carrying matching
+   metadata;
+7. regenerate every schema-8 row from the trace and require byte-for-byte
    identity with the converted dataset;
-7. authenticate the frozen prior-corpus registry and prove zero game-ID
+8. authenticate the frozen prior-corpus registry and prove zero game-ID
    overlap; and
-8. hash the trace and dataset both before and after verification, failing if
+9. hash the trace and dataset both before and after verification, failing if
    either changes.
 
 The command publishes one create-only canonical UTF-8/LF JSON receipt. The
@@ -125,9 +130,10 @@ receipt uses closed format
 contains only protocol and clean audit-revision identity; generator commit,
 lockfile hash, and complete frozen schedule; trace filename, byte hash, byte
 count, game/ply/result counts, schema/authority/random-policy identity, replay
-status, pair/marginal counts, and index bounds; converter and Engine-submodule
-identity; dataset filename, byte hash, byte count, row/game/schema/authority
-counts and true-hypothesis-survival status; and prior-registry
+status, deterministic policy-regeneration identity, pair/marginal counts, and
+index bounds; converter and Engine-submodule identity; dataset filename, byte
+hash, byte count, row/game/schema/authority counts and
+true-hypothesis-survival status; and prior-registry
 filename/hash/count/overlap status. It contains no moves, positions, hidden
 parameters, private states, or per-game labels.
 
