@@ -11,6 +11,7 @@ def capturable_row(
     color: str = "white",
     drawback: str = "vegan",
     eliminated_rule: str | None = None,
+    triggered: bool = True,
 ) -> dict[str, Any]:
     if color == "white":
         fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
@@ -35,6 +36,10 @@ def capturable_row(
     parameters: dict[str, Any] = (
         {"requiredType": "bishop"} if drawback == "triple-play" else {}
     )
+    ordinary_legal_moves = [
+        move,
+        "g1f3" if color == "white" else "g8f6",
+    ]
     return {
         "authorityId": "capturable-king/v1",
         "publicAuthorityPositionBefore": {
@@ -52,7 +57,7 @@ def capturable_row(
         "ply": ply,
         "playerColor": color,
         "historySan": history,
-        "ordinaryLegalMoves": [move, "g1f3" if color == "white" else "g8f6"],
+        "ordinaryLegalMoves": ordinary_legal_moves,
         "clockMs": None,
         "symbolicFeatureVersion": 7,
         "symbolicWhiteRuleProbabilities": probabilities,
@@ -63,9 +68,11 @@ def capturable_row(
         "trueDrawback": drawback,
         "hiddenParameters": parameters,
         "drawbackInternalState": {"private": "label-only"},
-        "drawbackLegalMoves": [move],
-        "ruleTriggered": True,
-        "forced": True,
+        "drawbackLegalMoves": (
+            [move] if triggered else ordinary_legal_moves
+        ),
+        "ruleTriggered": triggered,
+        "forced": triggered,
         "result": {"kind": "active"},
         "gameId": game_id,
         "seed": 42,

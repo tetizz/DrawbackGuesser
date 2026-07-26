@@ -32,7 +32,7 @@ from .capturable_records import (
     load_capturable_dataset,
 )
 CAPTURABLE_BASELINE_FORMAT = "drawbackguesser-capturable-baseline"
-CAPTURABLE_BASELINE_VERSION = 1
+CAPTURABLE_BASELINE_VERSION = 2
 _PRIOR_FLOOR = 1e-12
 
 
@@ -50,6 +50,7 @@ class CapturableTrainingConfig:
     fusion_alpha_grid: tuple[float, ...] = (0.0, 0.25, 0.5, 1.0, 2.0)
     prior_smoothing_grid: tuple[float, ...] = (0.0, 0.01, 0.05, 0.10, 0.20)
     training_prior_smoothing: float = 0.10
+    trigger_row_multiplier: float = 1.0
     torch_threads: int = 14
 
     def __post_init__(self) -> None:
@@ -126,6 +127,15 @@ class CapturableTrainingConfig:
             raise ValueError(
                 "training_prior_smoothing must be finite from zero to one"
             )
+        if (
+            isinstance(self.trigger_row_multiplier, bool)
+            or not isinstance(self.trigger_row_multiplier, (int, float))
+            or not math.isfinite(float(self.trigger_row_multiplier))
+            or not 1.0 <= float(self.trigger_row_multiplier) <= 100.0
+        ):
+            raise ValueError(
+                "trigger_row_multiplier must be finite from one to 100"
+            )
 
 
 @dataclass(frozen=True)
@@ -181,7 +191,10 @@ def create_capturable_model(hidden_dimension: int) -> Any:
     return CapturableBaseline()
 
 
-def tensorize(rows: Sequence[CapturableDatasetRow]) -> TensorRows:
+def tensorize(
+    rows: Sequence[CapturableDatasetRow],
+    trigger_row_multiplier: float = 1.0,
+) -> TensorRows:
     try:
         import torch
     except ImportError as error:
@@ -190,10 +203,26 @@ def tensorize(rows: Sequence[CapturableDatasetRow]) -> TensorRows:
         ) from error
     if not rows:
         raise ValueError("tensorization requires rows")
-    player_game_counts: dict[tuple[str, str], int] = {}
+    if (
+        isinstance(trigger_row_multiplier, bool)
+        or not isinstance(trigger_row_multiplier, (int, float))
+        or not math.isfinite(float(trigger_row_multiplier))
+        or not 1.0 <= float(trigger_row_multiplier) <= 100.0
+    ):
+        raise ValueError(
+            "trigger_row_multiplier must be finite from one to 100"
+        )
+    player_game_weight_totals: dict[tuple[str, str], float] = {}
     for row in rows:
         key = (row.evaluation.game_id, row.features.player_color)
-        player_game_counts[key] = player_game_counts.get(key, 0) + 1
+        raw_weight = (
+            float(trigger_row_multiplier)
+            if row.labels.rule_triggered
+            else 1.0
+        )
+        player_game_weight_totals[key] = (
+            player_game_weight_totals.get(key, 0.0) + raw_weight
+        )
     parameter_targets = []
     symbolic_priors = []
     symbolic_eliminated = []
@@ -232,8 +261,12 @@ def tensorize(rows: Sequence[CapturableDatasetRow]) -> TensorRows:
         ),
         player_game_weights=torch.tensor(
             [
-                1.0
-                / player_game_counts[
+                (
+                    float(trigger_row_multiplier)
+                    if row.labels.rule_triggered
+                    else 1.0
+                )
+                / player_game_weight_totals[
                     (row.evaluation.game_id, row.features.player_color)
                 ]
                 for row in rows
@@ -687,7 +720,10 @@ def train_capturable_baseline(
     torch.set_num_threads(config.torch_threads)
     torch.use_deterministic_algorithms(True)
 
-    train_tensors = tensorize(train_rows)
+    train_tensors = tensorize(
+        train_rows,
+        config.trigger_row_multiplier,
+    )
     validation_tensors = tensorize(validation_rows)
     test_tensors = tensorize(test_rows)
     model = create_capturable_model(config.hidden_dimension)
@@ -1036,6 +1072,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--hidden-dimension", type=int, default=128)
     parser.add_argument("--torch-threads", type=int, default=14)
+    parser.add_argument(
+        "--trigger-row-multiplier",
+        type=float,
+        default=1.0,
+    )
     return parser
 
 
@@ -1047,6 +1088,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         batch_size=options.batch_size,
         hidden_dimension=options.hidden_dimension,
         torch_threads=options.torch_threads,
+        trigger_row_multiplier=options.trigger_row_multiplier,
     )
     result = run_training(
         options.train,

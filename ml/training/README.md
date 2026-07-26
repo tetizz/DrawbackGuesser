@@ -29,7 +29,10 @@ allowing learned public move patterns to rerank the surviving soft
 hypotheses. Validation also selects bounded prior smoothing so a non-eliminated
 hypothesis with tiny soft mass is not mistaken for a mathematical
 contradiction. Training losses weight every player-game equally, so a long game
-cannot dominate simply by contributing more move rows. Public behavior features
+cannot dominate simply by contributing more move rows. Optional
+`--trigger-row-multiplier` weighting reallocates mass inside a player-game
+toward exact restriction events without changing that player-game's total
+weight or using the trigger label at inference time. Public behavior features
 cover current mover/capture/castling facts, authority-move composition, per-side
 piece and tactical history, recent piece types, and repeated-piece streaks.
 

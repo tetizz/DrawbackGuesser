@@ -104,3 +104,5 @@ a claim of accurate live-game identification.
 The next protocol should target the confused king-capture rules with
 trigger-rich simulations and diagnostic probing, then evaluate once on a new
 sealed seed set. The current final test must not be reused for model selection.
+That follow-up is frozen in
+`capturable-diagnostic-augmentation-protocol.md`.

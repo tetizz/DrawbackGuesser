@@ -53,6 +53,27 @@ class CapturableBaselineTests(unittest.TestCase):
 
         self.assertEqual(weights, [0.5, 0.5, 1.0])
 
+    def test_trigger_weighting_preserves_each_player_game_total(self) -> None:
+        rows = (
+            parse_capturable_dataset_row(
+                capturable_row(game_id="mixed", triggered=True)
+            ),
+            parse_capturable_dataset_row(
+                capturable_row(game_id="mixed", triggered=False)
+            ),
+            parse_capturable_dataset_row(
+                capturable_row(game_id="quiet", triggered=False)
+            ),
+        )
+
+        weights = tensorize(
+            rows,
+            trigger_row_multiplier=3.0,
+        ).player_game_weights.tolist()
+
+        self.assertEqual(weights, [0.75, 0.25, 1.0])
+        self.assertEqual(sum(weights[:2]), weights[2])
+
     def test_hybrid_never_restores_a_hard_eliminated_rule(self) -> None:
         rows = (
             parse_capturable_dataset_row(
@@ -169,6 +190,11 @@ class CapturableBaselineTests(unittest.TestCase):
 
         self.assertEqual(first_report, second_report)
         self.assertTrue(first_report["freshStart"])
+        self.assertEqual(first_report["version"], 2)
+        self.assertEqual(
+            first_report["config"]["trigger_row_multiplier"],
+            1.0,
+        )
         self.assertEqual(
             first_report["selectionMetric"],
             "validation game_normalized_top_1_accuracy, then "
@@ -191,6 +217,8 @@ class CapturableBaselineTests(unittest.TestCase):
             {"prior_smoothing_grid": (0.1,)},
             {"prior_smoothing_grid": (0.0, 0.2, 0.1)},
             {"training_prior_smoothing": 1.0},
+            {"trigger_row_multiplier": 0.99},
+            {"trigger_row_multiplier": 101.0},
             {"torch_threads": 0},
         ):
             with self.subTest(arguments=arguments):
