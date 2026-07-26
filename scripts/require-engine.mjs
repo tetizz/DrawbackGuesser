@@ -14,6 +14,10 @@ const expected = Object.freeze([
     "engine/packages/chess-evaluator/package.json",
     "@drawbackengine/chess-evaluator",
   ],
+  [
+    "engine/packages/simulation-trace/package.json",
+    "@drawbackengine/simulation-trace",
+  ],
 ]);
 
 const root = resolve(import.meta.dirname, "..");

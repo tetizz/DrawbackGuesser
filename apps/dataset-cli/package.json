@@ -1,0 +1,23 @@
+{
+  "name": "@drawbackguesser/dataset-cli",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "drawback-guesser-dataset": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "pnpm --filter @drawbackguesser/trace-to-dataset build && tsc -p tsconfig.build.json",
+    "typecheck": "pnpm --filter @drawbackguesser/trace-to-dataset build && tsc -p tsconfig.build.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "prestart": "pnpm --workspace-root engine:build",
+    "start": "pnpm --filter @drawbackguesser/trace-to-dataset build && tsx src/cli.ts"
+  },
+  "dependencies": {
+    "@drawbackengine/simulation-trace": "workspace:*",
+    "@drawbackguesser/trace-to-dataset": "workspace:*"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.3"
+  }
+}

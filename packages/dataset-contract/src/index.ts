@@ -294,6 +294,13 @@ function checkedSchema(schema: DatasetSchema): DatasetSchema {
   return schema;
 }
 
+function hiddenParameters(value: unknown): unknown {
+  if (value === null) {
+    return null;
+  }
+  return structuredClone(record(value, "hiddenParameters"));
+}
+
 export function parsePublicFeatureRecord(
   input: unknown,
   schemaInput: DatasetSchema,
@@ -426,7 +433,7 @@ export function parseDatasetRow(
     labels: Object.freeze({
       playerColor: features.playerColor,
       trueDrawback,
-      hiddenParameters: structuredClone(row["hiddenParameters"]),
+      hiddenParameters: hiddenParameters(row["hiddenParameters"]),
       drawbackInternalState: structuredClone(row["drawbackInternalState"]),
       drawbackLegalMoves: stringArray(
         row["drawbackLegalMoves"],

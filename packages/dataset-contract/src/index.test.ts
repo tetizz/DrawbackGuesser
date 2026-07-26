@@ -110,4 +110,14 @@ describe("combined storage row", () => {
       parseDatasetRow({ ...datasetRow(), futureTarget: "secret" }, schema)
     ).toThrow(/unknown futureTarget/u);
   });
+
+  it("keeps hidden-parameter shape in parity with the Python trainer", () => {
+    expect(() =>
+      parseDatasetRow({ ...datasetRow(), hiddenParameters: 7 }, schema)
+    ).toThrow(/hiddenParameters must be a plain object/u);
+    expect(
+      parseDatasetRow({ ...datasetRow(), hiddenParameters: null }, schema)
+        .labels.hiddenParameters,
+    ).toBeNull();
+  });
 });

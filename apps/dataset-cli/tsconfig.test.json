@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "../..",
+    "noEmit": true
+  },
+  "include": [
+    "src/**/*.test.ts",
+    "../../packages/trace-to-dataset/src/test-fixture.ts"
+  ]
+}

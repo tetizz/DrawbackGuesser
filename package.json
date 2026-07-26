@@ -8,11 +8,11 @@
     "node": ">=22"
   },
   "scripts": {
-    "engine:build": "node scripts/require-engine.mjs && pnpm --filter @drawbackengine/chess-evaluator... build",
-    "build": "pnpm engine:build && pnpm --filter @drawbackguesser/dataset-contract build && pnpm --filter @drawbackguesser/predictor build && pnpm --filter @drawbackguesser/web build",
-    "typecheck": "pnpm engine:build && pnpm --filter @drawbackguesser/dataset-contract typecheck && pnpm --filter @drawbackguesser/predictor typecheck && pnpm --filter @drawbackguesser/web typecheck",
+    "engine:build": "node scripts/require-engine.mjs && pnpm --filter @drawbackengine/chess-evaluator... --filter @drawbackengine/simulation-trace... build",
+    "build": "pnpm engine:build && pnpm --filter @drawbackguesser/dataset-contract build && pnpm --filter @drawbackguesser/predictor build && pnpm --filter @drawbackguesser/trace-to-dataset build && pnpm --filter @drawbackguesser/dataset-cli build && pnpm --filter @drawbackguesser/web build",
+    "typecheck": "pnpm engine:build && pnpm --filter @drawbackguesser/dataset-contract typecheck && pnpm --filter @drawbackguesser/predictor typecheck && pnpm --filter @drawbackguesser/trace-to-dataset typecheck && pnpm --filter @drawbackguesser/dataset-cli typecheck && pnpm --filter @drawbackguesser/web typecheck",
     "lint": "eslint . --max-warnings 0",
-    "test": "pnpm engine:build && vitest run",
+    "test": "pnpm engine:build && pnpm --filter @drawbackguesser/trace-to-dataset build && vitest run",
     "check:boundary": "node scripts/check-staging-boundary.mjs",
     "check:engine": "node scripts/require-engine.mjs",
     "python:compile": "python -m compileall -q ml/training ml/evaluation",
