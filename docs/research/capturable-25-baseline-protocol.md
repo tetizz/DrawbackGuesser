@@ -8,7 +8,7 @@ self-play only. It is not a claim about live human games and it does not
 promote a browser model.
 
 DrawbackEngine revision
-`62f5a3ed3343e6472587b1e7b14893704b0c455f` owns move legality, the balanced
+`436407b51b983ba9c173f93f6c6d08920a36825f` owns move legality, the balanced
 assignment schedule, private search, and trace replay. DrawbackGuesser
 revision is frozen by the eventual selection artifact.
 
@@ -53,7 +53,7 @@ using 60-assignment execution windows reported an opaque worker failure. A
 30-assignment diagnostic rerun localized it to game 684: a non-orthodox
 capturable-king position retained a pseudo-legal en-passant target internally
 but dropped it from the public FEN reconstructed by search. Engine revision
-`62f5a3ed3343e6472587b1e7b14893704b0c455f` preserves the target and includes
+`436407b51b983ba9c173f93f6c6d08920a36825f` preserves the target and includes
 both position-level and exact 39-ply corpus regressions. Production generation
 uses 30-assignment windows so any future failure has a smaller retry and audit
 scope without changing deterministic assignments or game bytes. The balanced
