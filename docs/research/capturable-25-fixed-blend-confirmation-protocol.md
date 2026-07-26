@@ -236,7 +236,7 @@ for game-normalized Top-1:
 - within-game value: mean of the White and Black player-game values;
 - paired observation: fixed-blend within-game value minus control;
 - vector order: ascending lexicographic canonical game ID, exactly matching
-  the `gameIds` array stored in the report;
+  the `gameId` sequence of `pairedTop1.gameDeltas` in the report;
 - bootstrap replicates: 20,000;
 - each replicate draws exactly 625 physical game IDs with replacement;
 - bootstrap seed: 633454611;
