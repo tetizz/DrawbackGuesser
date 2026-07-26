@@ -79,6 +79,91 @@ authorize a fresh test unless ranking, calibration, both colors, auxiliary
 heads, hidden-parameter accuracy, every move horizon, every audited rule, and
 exact hard elimination all pass their preregistered gates.
 
+The fixed run uses the already frozen prior-corpus registry
+`capturable25-prior-corpus-registry-v1.json` with SHA-256
+`af97da7cf0e790fc50747898141d348cf016855e6158e2bc1cd6a835c66aa1a0`.
+Do not rebuild or replace it. Its original one-time creation command was:
+
+```powershell
+py -3.11 -m ml.training.drawback_ml.capturable_prior_registry `
+  --root ..\DrawbackTrainingData `
+  --output ..\DrawbackTrainingData\capturable25-prior-corpus-registry-v1.json
+```
+
+Generate the frozen Engine trace from a detached worktree, convert it once,
+and publish the model-free audit receipt before running inference:
+
+```powershell
+node --version
+corepack --version
+corepack pnpm --version
+corepack pnpm check
+git -C ..\DrawbackEngine worktree add --detach `
+  ..\DrawbackTrainingData\engine-generator-74eb6fc `
+  74eb6fc95571994bd96b7a351278f3f74f0972e3
+corepack pnpm -C ..\DrawbackTrainingData\engine-generator-74eb6fc `
+  install --frozen-lockfile
+corepack pnpm -C ..\DrawbackTrainingData\engine-generator-74eb6fc check
+corepack pnpm -C ..\DrawbackTrainingData\engine-generator-74eb6fc build
+corepack pnpm -C ..\DrawbackTrainingData\engine-generator-74eb6fc `
+  --filter @drawbackengine/cli player-private:batch -- `
+  test 0 0 625 15 633442320 633446417 633450514 `
+  ..\DrawbackTrainingData\capturable25-v4-fixed-blend-confirmation-trace.ndjson `
+  60 30 1 5000 35 standard
+corepack pnpm --filter @drawbackguesser/dataset-cli start -- `
+  --input ..\DrawbackTrainingData\capturable25-v4-fixed-blend-confirmation-trace.ndjson `
+  --output ..\DrawbackTrainingData\capturable25-v4-fixed-blend-confirmation-schema8.ndjson `
+  --require-authority capturable-king/v1 `
+  --require-evaluator none
+$pythonCache = @(
+  "ml", "scripts" | ForEach-Object {
+    Get-ChildItem -LiteralPath $_ -Recurse -Directory `
+      -Filter __pycache__ -Force
+  }
+)
+if ($pythonCache.Count -ne 0) {
+  throw "Remove ignored __pycache__ directories before the sealed run."
+}
+py -3.11 -B -E -s -m ml.training.drawback_ml.capturable_fixed_corpus `
+  --output-directory ..\DrawbackTrainingData
+```
+
+Receipt preparation loads no model. It independently reconstructs all 625
+assignments, reruns the pinned Engine command, requires byte-identical trace
+output, scrubs and rebuilds ignored dependency/build trees from frozen locks,
+semantically replays and reconverts every move, proves prior-corpus
+disjointness, binds the exact Node/Corepack/pnpm runtime, and durably publishes
+a create-only receipt. The required versions are Node `v24.15.0`, Corepack
+`0.34.6`, and pnpm `11.9.0`. The audit also binds the complete 451-file pnpm
+runtime tree and the OS-resolved command shell, disables inherited package
+configuration and lifecycle scripts during installation, authenticates the
+active isolated command shim before and after every child process, and executes
+freshly built JavaScript entrypoints rather than TypeScript source runners.
+The no-bytecode, environment-ignoring Python flags and empty-cache preflight
+are mandatory because ignored bytecode is not trusted as source.
+
+The fixed-blend confirmation command exposes no weight, grid-search,
+bootstrap, or threshold arguments. It authenticates the frozen failed grid,
+its sole post-hoc weight-`0.1` hypothesis, both checkpoints, the prior-corpus
+registry and receipt, the committed protocol, the detached generator, and a
+clean source revision whose `origin/main` equals `HEAD`. It publishes an
+immutable consumption marker before reopening the trace or test and then
+evaluates only control versus the fixed blend:
+
+```powershell
+py -3.11 -B -E -s -m ml.training.drawback_ml.capturable_fixed_blend `
+  --grid ..\DrawbackTrainingData\capturable25-v3-convex-blend-validation.json `
+  --control-selection ..\DrawbackTrainingData\capturable25-v3-control-s3235776259-t2\selection.json `
+  --treatment-selection ..\DrawbackTrainingData\capturable25-v3-balanced-s3235776257-t1\selection.json `
+  --prior-registry ..\DrawbackTrainingData\capturable25-prior-corpus-registry-v1.json `
+  --test ..\DrawbackTrainingData\capturable25-v4-fixed-blend-confirmation-schema8.ndjson `
+  --output-directory ..\DrawbackTrainingData
+```
+
+Promotion additionally requires the frozen 20,000-replicate whole-game paired
+bootstrap and minimum observed Top-1 gain. A failure or exception never
+reopens the consumed test.
+
 After a treatment wins validation and a new test split has been preregistered,
 evaluate the authenticated control and treatment together:
 

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
+import os
 from pathlib import Path
+import stat
 import subprocess
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 from .capturable_baseline import (
     _canonical_json,
@@ -44,6 +47,48 @@ from .capturable_experiment import (
 from .capturable_records import CapturableDatasetError
 
 
+_CANONICAL_REPOSITORY_URL = "https://github.com/tetizz/DrawbackGuesser.git"
+_CANONICAL_COMMIT_IDENTITY = (
+    "tetizz",
+    "104690265+tetizz@users.noreply.github.com",
+    "tetizz",
+    "104690265+tetizz@users.noreply.github.com",
+)
+_WINDOWS_GIT_SHA256 = (
+    "e1e5f04e40a003b28b1e79659fabf3fd04dc4d8fdc7221d3495dfe51f861c75e"
+)
+_LOCAL_CONFIG_REDIRECTION_PATTERN = (
+    r"^(include\.path|includeif\..*\.path|"
+    r"url\..*\.(insteadof|pushinsteadof)|"
+    r"http\..*|credential\..*|filter\..*|"
+    r"core\.(attributesfile|excludesfile|fsmonitor|sshcommand)|"
+    r"remote\..*\.(proxy|proxycommand|receivepack|uploadpack))$"
+)
+
+
+class _GitRunner(Protocol):
+    def __call__(
+        self,
+        *arguments: str,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        ...
+
+
+def _is_link_or_reparse_point(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return path.is_symlink()
+    return path.is_symlink() or (
+        os.name == "nt"
+        and bool(
+            getattr(metadata, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+        )
+    )
+
+
 def _path_identity(
     path: Path,
     *,
@@ -59,65 +104,461 @@ def _path_identity(
     return resolved
 
 
-def _execution_identity() -> Mapping[str, Any]:
-    repository = Path(__file__).resolve().parents[3]
-    protocol_path = repository / "docs" / "research" / PROTOCOL_FILE
-    try:
-        protocol_sha256 = hashlib.sha256(
-            protocol_path.read_bytes()
-        ).hexdigest()
-        status = subprocess.run(
-            ["git", "status", "--porcelain", "--untracked-files=all"],
-            cwd=repository,
-            check=True,
-            capture_output=True,
-            text=True,
+def _is_git_revision(value: str) -> bool:
+    return len(value) == 40 and all(
+        token in "0123456789abcdef" for token in value
+    )
+
+
+def _windows_known_directory(kind: str) -> Path:
+    if os.name != "nt":
+        raise CapturableDatasetError(
+            "Windows known-directory lookup is unavailable"
         )
-        revision = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repository,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        ancestor = subprocess.run(
+    buffer = ctypes.create_unicode_buffer(32_768)
+    if kind == "program-files":
+        result = ctypes.windll.shell32.SHGetFolderPathW(
+            None,
+            0x0026,
+            None,
+            0,
+            buffer,
+        )
+        if result != 0:
+            raise CapturableDatasetError(
+                "trusted Windows Program Files directory is unavailable"
+            )
+    else:
+        function_name = {
+            "system": "GetSystemDirectoryW",
+            "windows": "GetSystemWindowsDirectoryW",
+        }.get(kind)
+        if function_name is None:
+            raise CapturableDatasetError(
+                "Windows known-directory role is invalid"
+            )
+        length = getattr(
+            ctypes.windll.kernel32,
+            function_name,
+        )(buffer, len(buffer))
+        if length <= 0 or length >= len(buffer):
+            raise CapturableDatasetError(
+                f"trusted Windows {kind} directory is unavailable"
+            )
+    try:
+        path = Path(buffer.value).resolve(strict=True)
+    except OSError as error:
+        raise CapturableDatasetError(
+            f"trusted Windows {kind} directory is unavailable"
+        ) from error
+    if not path.is_dir() or _is_link_or_reparse_point(path):
+        raise CapturableDatasetError(
+            f"trusted Windows {kind} directory is invalid"
+        )
+    return path
+
+
+def _trusted_git_executable() -> Path:
+    if os.name == "nt":
+        candidate = (
+            _windows_known_directory("program-files")
+            / "Git"
+            / "cmd"
+            / "git.exe"
+        )
+    else:
+        candidates = {
+            path.resolve(strict=True)
+            for path in (Path("/usr/bin/git"), Path("/bin/git"))
+            if path.is_file()
+        }
+        if len(candidates) != 1:
+            raise CapturableDatasetError(
+                "trusted system Git executable is unavailable"
+            )
+        candidate = candidates.pop()
+    try:
+        executable = candidate.resolve(strict=True)
+        payload = executable.read_bytes()
+    except OSError as error:
+        raise CapturableDatasetError(
+            "trusted system Git executable is unavailable"
+        ) from error
+    if not executable.is_file() or _is_link_or_reparse_point(executable):
+        raise CapturableDatasetError(
+            "trusted system Git executable is invalid"
+        )
+    if (
+        os.name == "nt"
+        and hashlib.sha256(payload).hexdigest() != _WINDOWS_GIT_SHA256
+    ):
+        raise CapturableDatasetError(
+            "trusted Windows Git executable identity changed"
+        )
+    return executable
+
+
+def _authenticated_git_environment(git_executable: Path) -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() in {"TEMP", "TMP"}
+    }
+    if os.name == "nt":
+        windows_directory = _windows_known_directory("windows")
+        system_directory = _windows_known_directory("system")
+        shell = system_directory / "cmd.exe"
+        if not shell.is_file() or _is_link_or_reparse_point(shell):
+            raise CapturableDatasetError(
+                "trusted Windows command shell is unavailable"
+            )
+        environment.update(
+            {
+                "ComSpec": str(shell.resolve(strict=True)),
+                "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+                "PATH": os.pathsep.join(
+                    (
+                        str(git_executable.parent),
+                        str(system_directory),
+                        str(windows_directory),
+                    )
+                ),
+                "SystemRoot": str(windows_directory),
+                "WINDIR": str(windows_directory),
+            }
+        )
+    else:
+        environment["PATH"] = os.pathsep.join(("/usr/bin", "/bin"))
+    environment.update(
+        {
+            "GCM_INTERACTIVE": "Never",
+            "GIT_CONFIG_COUNT": "0",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "cat",
+            "GIT_TERMINAL_PROMPT": "0",
+            "LC_ALL": "C",
+        }
+    )
+    return environment
+
+
+def _authenticated_git_runner(
+    repository: Path,
+) -> _GitRunner:
+    git_executable = _trusted_git_executable()
+    git_environment = _authenticated_git_environment(git_executable)
+
+    def git(
+        *arguments: str,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
             [
-                "git",
-                "merge-base",
-                "--is-ancestor",
-                PROTOCOL_COMMIT,
-                revision,
+                str(git_executable),
+                "--no-replace-objects",
+                "-c",
+                "core.attributesFile=",
+                "-c",
+                "core.autocrlf=true",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.askPass=",
+                "-c",
+                "credential.helper=",
+                "-c",
+                "credential.interactive=false",
+                "-c",
+                "http.sslVerify=true",
+                "-c",
+                "http.proxy=",
+                "-c",
+                "http.https://github.com/.proxy=",
+                "-c",
+                "http.https://github.com/.sslVerify=true",
+                "-c",
+                "protocol.allow=never",
+                "-c",
+                "protocol.https.allow=always",
+                *arguments,
             ],
             cwd=repository,
-            check=False,
+            check=check,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="strict",
+            env=git_environment,
+            stdin=subprocess.DEVNULL,
+            timeout=30,
         )
-    except (OSError, subprocess.CalledProcessError) as error:
+
+    return git
+
+
+def _validated_protocol_identity_inputs(
+    *,
+    protocol_commit: str,
+    protocol_file: str,
+    protocol_sha256: str,
+    operation: str,
+) -> None:
+    if (
+        not _is_git_revision(protocol_commit)
+        or not _is_sha256(protocol_sha256)
+        or not protocol_file
+        or Path(protocol_file).name != protocol_file
+        or "/" in protocol_file
+        or "\\" in protocol_file
+    ):
         raise CapturableDatasetError(
-            "blend execution identity cannot be verified"
+            f"{operation} protocol identity is not canonical"
+        )
+
+
+def _repository_anchor(
+    *,
+    git: _GitRunner,
+    repository: Path,
+) -> tuple[bool, list[str], subprocess.CompletedProcess[str]]:
+    top_level_matches = (
+        Path(git("rev-parse", "--show-toplevel").stdout.strip()).resolve()
+        == repository
+    )
+    origin_urls = git(
+        "config",
+        "--local",
+        "--no-includes",
+        "--get-all",
+        "remote.origin.url",
+    ).stdout.splitlines()
+    local_redirections = git(
+        "config",
+        "--local",
+        "--no-includes",
+        "--name-only",
+        "--get-regexp",
+        _LOCAL_CONFIG_REDIRECTION_PATTERN,
+        check=False,
+    )
+    if local_redirections.returncode not in (0, 1):
+        raise subprocess.CalledProcessError(
+            local_redirections.returncode,
+            local_redirections.args,
+            output=local_redirections.stdout,
+            stderr=local_redirections.stderr,
+        )
+    return top_level_matches, origin_urls, local_redirections
+
+
+def _remote_main_fields(
+    git: _GitRunner,
+) -> list[str]:
+    return git(
+        "ls-remote",
+        _CANONICAL_REPOSITORY_URL,
+        "refs/heads/main",
+    ).stdout.split()
+
+
+def _authenticated_execution_identity(
+    *,
+    protocol_commit: str,
+    protocol_file: str,
+    protocol_sha256: str,
+    operation: str,
+) -> Mapping[str, Any]:
+    repository = Path(__file__).resolve().parents[3]
+    protocol_path = repository / "docs" / "research" / protocol_file
+    _validated_protocol_identity_inputs(
+        protocol_commit=protocol_commit,
+        protocol_file=protocol_file,
+        protocol_sha256=protocol_sha256,
+        operation=operation,
+    )
+    git = _authenticated_git_runner(repository)
+
+    try:
+        measured_protocol_sha256 = hashlib.sha256(
+            protocol_path.read_bytes()
+        ).hexdigest()
+        status = git(
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        )
+        revision = git("rev-parse", "HEAD").stdout.strip()
+        if not _is_git_revision(revision):
+            raise CapturableDatasetError(
+                f"{operation} revision does not contain the protocol"
+            )
+        top_level_matches, origin_urls, local_redirections = _repository_anchor(
+            git=git,
+            repository=repository,
+        )
+        ancestor = git(
+            "merge-base",
+            "--is-ancestor",
+            protocol_commit,
+            revision,
+            check=False,
+        )
+        committed_protocol = git(
+            "show",
+            f"{protocol_commit}:docs/research/{protocol_file}",
+        ).stdout.encode()
+        remote_revision_fields = _remote_main_fields(git)
+        commit_identity = git(
+            "show",
+            "-s",
+            "--format=%an%x00%ae%x00%cn%x00%ce",
+            revision,
+        ).stdout.rstrip("\n").split("\x00")
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        UnicodeError,
+        ValueError,
+    ) as error:
+        raise CapturableDatasetError(
+            f"{operation} execution identity cannot be verified"
         ) from error
-    if protocol_sha256 != PROTOCOL_SHA256:
+    if measured_protocol_sha256 != protocol_sha256:
         raise CapturableDatasetError(
-            "the committed blend protocol bytes have changed"
+            f"the committed {operation} protocol bytes have changed"
         )
     if status.stdout:
         raise CapturableDatasetError(
-            "blend validation requires a clean committed worktree"
+            f"{operation} requires a clean committed worktree"
         )
     if (
-        len(revision) != 40
-        or any(token not in "0123456789abcdef" for token in revision)
-        or ancestor.returncode != 0
+        ancestor.returncode != 0
     ):
         raise CapturableDatasetError(
-            "blend execution revision does not contain the protocol"
+            f"{operation} revision does not contain the protocol"
+        )
+    if (
+        not top_level_matches
+        or hashlib.sha256(committed_protocol).hexdigest()
+        != protocol_sha256
+        or origin_urls != [_CANONICAL_REPOSITORY_URL]
+        or local_redirections.stdout
+        or remote_revision_fields
+        != [revision, "refs/heads/main"]
+        or tuple(commit_identity) != _CANONICAL_COMMIT_IDENTITY
+    ):
+        raise CapturableDatasetError(
+            f"{operation} repository identity is not the pushed release"
         )
     return {
         "cleanWorktree": True,
         "repository": "DrawbackGuesser",
         "revision": revision,
     }
+
+
+def _authenticated_recorded_revision_identity(
+    *,
+    revision: str,
+    protocol_commit: str,
+    protocol_file: str,
+    protocol_sha256: str,
+    operation: str,
+) -> Mapping[str, Any]:
+    """Authenticate a historical revision against the live pushed main tip."""
+
+    repository = Path(__file__).resolve().parents[3]
+    _validated_protocol_identity_inputs(
+        protocol_commit=protocol_commit,
+        protocol_file=protocol_file,
+        protocol_sha256=protocol_sha256,
+        operation=operation,
+    )
+    if not _is_git_revision(revision):
+        raise CapturableDatasetError(
+            f"{operation} recorded revision is not canonical"
+        )
+    git = _authenticated_git_runner(repository)
+
+    try:
+        pushed_main_revision = git("rev-parse", "HEAD").stdout.strip()
+        if not _is_git_revision(pushed_main_revision):
+            raise CapturableDatasetError(
+                f"{operation} pushed main revision is not canonical"
+            )
+        top_level_matches, origin_urls, local_redirections = _repository_anchor(
+            git=git,
+            repository=repository,
+        )
+        remote_revision_fields = _remote_main_fields(git)
+        reachable = git(
+            "merge-base",
+            "--is-ancestor",
+            revision,
+            pushed_main_revision,
+            check=False,
+        )
+        contains_protocol_commit = git(
+            "merge-base",
+            "--is-ancestor",
+            protocol_commit,
+            revision,
+            check=False,
+        )
+        committed_protocol = git(
+            "show",
+            f"{revision}:docs/research/{protocol_file}",
+        ).stdout.encode()
+        commit_identity = git(
+            "show",
+            "-s",
+            "--format=%an%x00%ae%x00%cn%x00%ce",
+            revision,
+        ).stdout.rstrip("\n").split("\x00")
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        UnicodeError,
+        ValueError,
+    ) as error:
+        raise CapturableDatasetError(
+            f"{operation} recorded revision cannot be verified"
+        ) from error
+
+    if (
+        not top_level_matches
+        or origin_urls != [_CANONICAL_REPOSITORY_URL]
+        or local_redirections.stdout
+        or remote_revision_fields
+        != [pushed_main_revision, "refs/heads/main"]
+        or reachable.returncode != 0
+        or contains_protocol_commit.returncode != 0
+        or hashlib.sha256(committed_protocol).hexdigest()
+        != protocol_sha256
+        or tuple(commit_identity) != _CANONICAL_COMMIT_IDENTITY
+    ):
+        raise CapturableDatasetError(
+            f"{operation} recorded revision is not on the pushed release"
+        )
+    return {
+        "repository": "DrawbackGuesser",
+        "revision": revision,
+        "pushedMainRevision": pushed_main_revision,
+    }
+
+
+def _execution_identity() -> Mapping[str, Any]:
+    return _authenticated_execution_identity(
+        protocol_commit=PROTOCOL_COMMIT,
+        protocol_file=PROTOCOL_FILE,
+        protocol_sha256=PROTOCOL_SHA256,
+        operation="blend validation",
+    )
 
 
 def _selection_input(
