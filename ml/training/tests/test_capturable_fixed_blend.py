@@ -17,6 +17,7 @@ from drawback_ml.capturable_blend_contract import (
 )
 from drawback_ml.capturable_fixed_blend import (
     _parser,
+    main,
     run_fixed_blend_confirmation,
 )
 from drawback_ml.capturable_fixed_blend_contract import (
@@ -351,6 +352,26 @@ class CapturableFixedBlendContractTests(unittest.TestCase):
 
 
 class CapturableFixedBlendOrchestrationTests(unittest.TestCase):
+    def test_cli_checks_python_runtime_before_parsing_inputs(self) -> None:
+        with (
+            patch(
+                "drawback_ml.capturable_fixed_blend."
+                "require_isolated_python_runtime",
+                side_effect=CapturableDatasetError("runtime rejected"),
+            ) as require_runtime,
+            patch(
+                "drawback_ml.capturable_fixed_blend._parser",
+            ) as parser,
+        ):
+            with self.assertRaisesRegex(
+                CapturableDatasetError,
+                "runtime rejected",
+            ):
+                main([])
+
+        require_runtime.assert_called_once_with()
+        parser.assert_not_called()
+
     def _layout(self, directory: str):
         root = Path(directory) / "private"
         root.mkdir()

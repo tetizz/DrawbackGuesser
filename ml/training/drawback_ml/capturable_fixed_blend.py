@@ -60,6 +60,7 @@ from .capturable_fixed_corpus import (
     authenticate_corpus_environment,
     load_fixed_corpus_receipt,
     reauthenticate_fixed_corpus_files,
+    require_isolated_python_runtime,
     require_private_regular_file,
     require_private_root,
     verify_fixed_corpus_receipt,
@@ -479,6 +480,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
+    require_isolated_python_runtime()
     options = _parser().parse_args(arguments)
     result = run_fixed_blend_confirmation(
         options.grid,

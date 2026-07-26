@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -50,12 +51,15 @@ from drawback_ml.capturable_fixed_corpus import (
     _reproduce_trace,
     _resolve_toolchain,
     _sanitized_environment,
+    _tracked_blob_sha256,
     _trusted_package_shell,
     _validate_receipt,
     _verify_conversion,
+    main as corpus_main,
     reauthenticate_fixed_corpus_files,
     require_private_regular_file,
     require_private_root,
+    require_isolated_python_runtime,
 )
 from drawback_ml.capturable_fixed_blend_contract import (
     CONFIRMATION_TEST_FILE,
@@ -246,6 +250,95 @@ def _toolchain() -> ResolvedToolchain:
 
 
 class CapturableFixedCorpusTests(unittest.TestCase):
+    def test_fixed_entrypoints_require_isolated_python_311(self) -> None:
+        valid_flags = SimpleNamespace(
+            ignore_environment=1,
+            no_user_site=1,
+        )
+        with (
+            patch(
+                "drawback_ml.capturable_fixed_corpus.sys.version_info",
+                (3, 11, 9),
+            ),
+            patch(
+                "drawback_ml.capturable_fixed_corpus."
+                "sys.dont_write_bytecode",
+                True,
+            ),
+            patch(
+                "drawback_ml.capturable_fixed_corpus.sys.flags",
+                valid_flags,
+            ),
+        ):
+            require_isolated_python_runtime()
+
+        invalid_runtimes = (
+            ((3, 12, 0), True, valid_flags),
+            ((3, 11, 9), False, valid_flags),
+            (
+                (3, 11, 9),
+                True,
+                SimpleNamespace(
+                    ignore_environment=0,
+                    no_user_site=1,
+                ),
+            ),
+            (
+                (3, 11, 9),
+                True,
+                SimpleNamespace(
+                    ignore_environment=1,
+                    no_user_site=0,
+                ),
+            ),
+        )
+        for version, dont_write_bytecode, flags in invalid_runtimes:
+            with self.subTest(
+                version=version,
+                dont_write_bytecode=dont_write_bytecode,
+                flags=flags,
+            ):
+                with (
+                    patch(
+                        "drawback_ml.capturable_fixed_corpus."
+                        "sys.version_info",
+                        version,
+                    ),
+                    patch(
+                        "drawback_ml.capturable_fixed_corpus."
+                        "sys.dont_write_bytecode",
+                        dont_write_bytecode,
+                    ),
+                    patch(
+                        "drawback_ml.capturable_fixed_corpus.sys.flags",
+                        flags,
+                    ),
+                ):
+                    with self.assertRaisesRegex(
+                        CapturableDatasetError,
+                        "Python 3.11 with -B -E -s",
+                    ):
+                        require_isolated_python_runtime()
+
+        with (
+            patch(
+                "drawback_ml.capturable_fixed_corpus."
+                "require_isolated_python_runtime",
+                side_effect=CapturableDatasetError("runtime rejected"),
+            ) as require_runtime,
+            patch(
+                "drawback_ml.capturable_fixed_corpus._parser",
+            ) as parser,
+        ):
+            with self.assertRaisesRegex(
+                CapturableDatasetError,
+                "runtime rejected",
+            ):
+                corpus_main([])
+
+        require_runtime.assert_called_once_with()
+        parser.assert_not_called()
+
     def test_protocol_binding_matches_the_frozen_git_blob(self) -> None:
         repository = Path(__file__).resolve().parents[3]
         payload = subprocess.run(
@@ -498,6 +591,73 @@ class CapturableFixedCorpusTests(unittest.TestCase):
                     cwd=root,
                     check=True,
                     capture_output=True,
+                )
+
+    def test_tracked_blob_hash_ignores_worktree_line_endings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(
+                ["git", "init", "--quiet"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "fixture"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "fixture@example.test"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "config", "core.autocrlf", "true"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            lockfile = root / "pnpm-lock.yaml"
+            committed = b"lockfileVersion: '9.0'\nsettings:\n  autoInstallPeers: true\n"
+            lockfile.write_bytes(committed)
+            subprocess.run(
+                ["git", "add", "pnpm-lock.yaml"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                ["git", "commit", "--quiet", "-m", "fixture"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            lockfile.write_bytes(committed.replace(b"\n", b"\r\n"))
+
+            self.assertNotEqual(
+                hashlib.sha256(lockfile.read_bytes()).hexdigest(),
+                hashlib.sha256(committed).hexdigest(),
+            )
+            self.assertEqual(
+                _tracked_blob_sha256(
+                    root,
+                    "pnpm-lock.yaml",
+                    "fixture lockfile",
+                ),
+                hashlib.sha256(committed).hexdigest(),
+            )
+
+            with self.assertRaisesRegex(
+                CapturableDatasetError,
+                "tracked path is invalid",
+            ):
+                _tracked_blob_sha256(
+                    root,
+                    "../pnpm-lock.yaml",
+                    "fixture lockfile",
                 )
 
     def test_private_root_rejects_both_public_repositories(self) -> None:

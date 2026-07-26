@@ -13,6 +13,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -266,6 +267,18 @@ class ResolvedToolchain:
             "--config.offline=true",
             *arguments,
         ]
+
+
+def require_isolated_python_runtime() -> None:
+    if (
+        sys.version_info[:2] != (3, 11)
+        or not sys.dont_write_bytecode
+        or sys.flags.ignore_environment != 1
+        or sys.flags.no_user_site != 1
+    ):
+        raise CapturableDatasetError(
+            "fixed confirmation requires Python 3.11 with -B -E -s"
+        )
 
 
 def _is_link_or_junction(path: Path) -> bool:
@@ -1563,6 +1576,43 @@ def _git_raw_blob_id(
     return digest.hexdigest()
 
 
+def _tracked_blob_sha256(
+    repository: Path,
+    relative: str,
+    label: str,
+) -> str:
+    relative_path = Path(relative)
+    if (
+        relative_path.is_absolute()
+        or not relative_path.parts
+        or any(part in {"", ".", ".."} for part in relative_path.parts)
+        or "\\" in relative
+        or relative_path.as_posix() != relative
+    ):
+        raise CapturableDatasetError(
+            f"{label} tracked path is invalid"
+        )
+    try:
+        repository_root = repository.resolve(strict=True)
+        completed = _authenticated_git_runner(repository_root)(
+            "cat-file",
+            "blob",
+            f"HEAD:{relative}",
+        )
+        payload = completed.stdout.encode("utf-8")
+    except (
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        UnicodeError,
+        ValueError,
+    ) as error:
+        raise CapturableDatasetError(
+            f"{label} tracked blob is unavailable"
+        ) from error
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _validate_tracked_worktree(
     *,
     git: Any,
@@ -1803,7 +1853,11 @@ def authenticate_corpus_environment(
     if (
         not lock_path.is_file()
         or _is_link_or_junction(lock_path)
-        or hashlib.sha256(lock_path.read_bytes()).hexdigest()
+        or _tracked_blob_sha256(
+            generator,
+            "pnpm-lock.yaml",
+            "fixed generator lockfile",
+        )
         != GENERATOR_LOCK_SHA256
     ):
         raise CapturableDatasetError(
@@ -2952,6 +3006,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
+    require_isolated_python_runtime()
     options = _parser().parse_args(arguments)
     print(
         json.dumps(
