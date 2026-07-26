@@ -66,3 +66,6 @@ Brier score, expected calibration error, accuracy after 5/10/15/20 observed
 moves, per-rule results, parameter accuracy, and hard-elimination diagnostics.
 No accuracy value may be reported unless it is read from the content-addressed
 evaluation artifact.
+
+The completed held-out evaluation is documented in
+`capturable-baseline-results.md`.
