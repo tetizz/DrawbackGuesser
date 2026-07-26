@@ -482,6 +482,42 @@ def evaluate_capturable(
         if raw_predictions is None
         else raw_predictions
     )
+    hybrid_probabilities = [
+        _hard_mask_fusion(
+            neural,
+            *active_symbolic(row.features),
+            alpha=fusion_alpha,
+            prior_smoothing=prior_smoothing,
+        )
+        for row, neural in zip(rows, residuals, strict=True)
+    ]
+    return evaluate_capturable_posteriors(
+        rows,
+        hybrid_probabilities,
+        trigger_probabilities,
+        forced_probabilities,
+        parameter_probabilities,
+    )
+
+
+def evaluate_capturable_posteriors(
+    rows: Sequence[CapturableDatasetRow],
+    hybrid_probabilities: Sequence[Sequence[float]],
+    trigger_probabilities: Sequence[float],
+    forced_probabilities: Sequence[float],
+    parameter_probabilities: Sequence[Sequence[float]],
+) -> Mapping[str, Any]:
+    """Evaluate already-fused public posteriors with the common metric path."""
+
+    row_count = len(rows)
+    if (
+        row_count == 0
+        or len(hybrid_probabilities) != row_count
+        or len(trigger_probabilities) != row_count
+        or len(forced_probabilities) != row_count
+        or len(parameter_probabilities) != row_count
+    ):
+        raise ValueError("capturable posterior rows must align")
     hybrid = StreamingEvaluation()
     symbolic = StreamingEvaluation()
     hybrid_by_color = {
@@ -497,14 +533,7 @@ def evaluate_capturable(
         key = (row.evaluation.game_id, row.features.player_color)
         observed[key] = observed.get(key, 0) + 1
         prior, eliminated = active_symbolic(row.features)
-        neural = residuals[index]
-        hybrid_probabilities = _hard_mask_fusion(
-            neural,
-            prior,
-            eliminated,
-            alpha=fusion_alpha,
-            prior_smoothing=prior_smoothing,
-        )
+        probabilities = hybrid_probabilities[index]
         symbolic_probabilities = _hard_mask_fusion(
             [0.0] * len(CAPTURABLE_RULE_IDS),
             prior,
@@ -515,10 +544,12 @@ def evaluate_capturable(
         hard_mask = dict(zip(CAPTURABLE_RULE_IDS, eliminated, strict=True))
         predicted_parameter = None
         if row.labels.true_drawback == "triple-play":
-            probabilities = parameter_probabilities[index]
+            parameter_posterior = parameter_probabilities[index]
             predicted_parameter = {
                 "requiredType": (
-                    "bishop" if probabilities[0] >= probabilities[1] else "knight"
+                    "bishop"
+                    if parameter_posterior[0] >= parameter_posterior[1]
+                    else "knight"
                 )
             }
         common = {
@@ -536,7 +567,7 @@ def evaluate_capturable(
             probabilities=dict(
                 zip(
                     CAPTURABLE_RULE_IDS,
-                    hybrid_probabilities,
+                    probabilities,
                     strict=True,
                 )
             ),

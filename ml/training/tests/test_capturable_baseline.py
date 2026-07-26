@@ -11,6 +11,7 @@ from drawback_ml.capturable_baseline import (
     _validation_selection_metrics,
     create_capturable_model,
     evaluate_capturable,
+    evaluate_capturable_posteriors,
     tensorize,
     train_capturable_baseline,
 )
@@ -111,6 +112,22 @@ class CapturableBaselineTests(unittest.TestCase):
             diagnostics["maximum_eliminated_probability"],
             0.0,
         )
+
+    def test_final_posterior_evaluator_rejects_misaligned_rows(self) -> None:
+        rows = self._split("posterior")
+        probabilities = [
+            [1.0 / CAPTURABLE_RULE_COUNT] * CAPTURABLE_RULE_COUNT
+            for _ in rows
+        ]
+
+        with self.assertRaisesRegex(ValueError, "must align"):
+            evaluate_capturable_posteriors(
+                rows,
+                probabilities[:-1],
+                [0.5] * len(rows),
+                [0.5] * len(rows),
+                [[0.5, 0.5]] * len(rows),
+            )
 
     def test_neural_signal_can_rerank_only_surviving_soft_hypotheses(
         self,

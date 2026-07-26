@@ -59,6 +59,26 @@ Authenticated version-1 comparisons remain readable, but their historical
 primary-only decision is normalized through the current release gate before
 any sealed test can be authorized.
 
+The preregistered 25-label control/treatment blend is a separate validation
+command with no test argument:
+
+```powershell
+py -m ml.training.drawback_ml.capturable_blend `
+  --control-selection ..\DrawbackTrainingData\capturable25-v3-control-s3235776259-t2\selection.json `
+  --treatment-selection ..\DrawbackTrainingData\capturable25-v3-balanced-s3235776257-t1\selection.json `
+  --validation ..\DrawbackTrainingData\capturable25-v3-balanced-validation-schema8.ndjson `
+  --prior-comparison ..\DrawbackTrainingData\capturable25-v3-balanced-treatment-comparison.json `
+  --output ..\DrawbackTrainingData\capturable25-v3-convex-blend-validation.json
+```
+
+It accepts only the byte-frozen inputs and weight grid in
+`docs/research/capturable-25-convex-blend-protocol.md`, requires a clean
+committed worktree, reproduces both component reports exactly, rejects mask
+disagreement, and writes a canonical no-clobber decision. The blend cannot
+authorize a fresh test unless ranking, calibration, both colors, auxiliary
+heads, hidden-parameter accuracy, every move horizon, every audited rule, and
+exact hard elimination all pass their preregistered gates.
+
 After a treatment wins validation and a new test split has been preregistered,
 evaluate the authenticated control and treatment together:
 
