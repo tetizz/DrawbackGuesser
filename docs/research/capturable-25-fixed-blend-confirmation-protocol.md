@@ -77,6 +77,8 @@ between model selection and confirmation. The schedule is:
 The private trace basename is
 `capturable25-v4-fixed-blend-confirmation-trace.ndjson`; the converted test
 basename is `capturable25-v4-fixed-blend-confirmation-schema8.ndjson`.
+The canonical preparation receipt basename is
+`capturable25-v4-fixed-blend-confirmation-corpus-receipt.json`.
 The schedule must contain every one of the 625 ordered label pairs exactly
 once, with 25 player-games in every label/color cell. Every scheduled game
 must be emitted and row-bearing for both colors, retaining both player
@@ -95,6 +97,44 @@ retain their actual result. The trace and converted schema-8 corpus must pass:
 
 The trace, dataset, checkpoints, and evaluation report remain outside Git.
 
+## Corpus preparation receipt
+
+Before sealed evaluation, one committed audit command must validate the
+generated trace and converted dataset without loading either model. The
+command must:
+
+1. authenticate a clean DrawbackGuesser revision containing the audit tool;
+2. authenticate the detached generator worktree at Engine revision
+   `74eb6fc95571994bd96b7a351278f3f74f0972e3` and the frozen Engine lockfile;
+3. independently reconstruct every scheduled assignment, including game,
+   parameter, and label seeds;
+4. strictly parse and semantically replay all 625 schema-v2 trace records;
+5. require the standard initial position, exact unrestricted-baseline
+   opponent hypotheses, exact worst-case material search policy, exact
+   censoring semantics, and game indexes `0` through `624`;
+6. regenerate every schema-8 row from the trace and require byte-for-byte
+   identity with the converted dataset;
+7. authenticate the frozen prior-corpus registry and prove zero game-ID
+   overlap; and
+8. hash the trace and dataset both before and after verification, failing if
+   either changes.
+
+The command publishes one create-only canonical UTF-8/LF JSON receipt. The
+receipt uses closed format
+`drawbackguesser-capturable-fixed-confirmation-corpus-receipt` version 1. It
+contains only protocol and clean audit-revision identity; generator commit,
+lockfile hash, and complete frozen schedule; trace filename, byte hash, byte
+count, game/ply/result counts, schema/authority/random-policy identity, replay
+status, pair/marginal counts, and index bounds; converter and Engine-submodule
+identity; dataset filename, byte hash, byte count, row/game/schema/authority
+counts and true-hypothesis-survival status; and prior-registry
+filename/hash/count/overlap status. It contains no moves, positions, hidden
+parameters, private states, or per-game labels.
+
+Receipt preparation is part of deterministic corpus construction, after the
+candidate and protocol are frozen and before any model inference. It may not
+load checkpoints, calculate predictions, or expose evaluation metrics.
+
 ## One-pass sealed evaluator
 
 The evaluator must be committed and the source tree clean before it may read
@@ -104,15 +144,21 @@ the fresh dataset. It must:
    reports, and both checkpoints;
 2. require the grid artifact's weight-`0.1` validation candidate to pass the
    complete gate, without using the grid's rejected selected weight;
-3. atomically publish a no-clobber consumption marker before opening the test
-   bytes, so any later load, inference, or publication failure still leaves
-   the test irreversibly marked consumed;
-4. authenticate the pre-generation corpus registry and reject any registered
+3. authenticate the fixed-basename corpus receipt as metadata and bind its
+   exact SHA-256 without opening the trace or test dataset;
+4. durably publish a no-clobber consumption marker before opening either the
+   trace or test bytes, so any later audit, load, inference, or publication
+   failure still leaves the test irreversibly marked consumed;
+5. rerun the committed semantic replay and byte-for-byte trace-to-dataset
+   audit after marker publication, and require exact agreement with the bound
+   receipt;
+6. authenticate the pre-generation corpus registry and reject any registered
    game-ID overlap before inference;
-5. run each component once over the same ordered test rows;
-6. evaluate only control and fixed weight `0.1`;
-7. write one canonical, content-addressed, no-clobber report on successful
-   completion and bind the consumption marker's SHA-256.
+7. run each component once over the same ordered test rows;
+8. evaluate only control and fixed weight `0.1`;
+9. write one canonical, content-addressed, no-clobber report on successful
+   completion and bind the consumption marker, receipt, trace, and dataset
+   SHA-256 values.
 
 The evaluator accepts no weight argument and cannot enumerate alternatives.
 
@@ -123,15 +169,21 @@ JSON with the closed format
 only: state `consumed`; protocol file/commit/hash; clean execution revision;
 the frozen weight; the grid, selection, checkpoint, and registry bindings;
 the fixed test basename; and the complete generation schedule above. It does
-not contain or require the test hash because it must be durably created,
-flushed, and linked into place before the first test byte is opened. It is
-never removed after a later exception.
+not contain or require the trace or test hash because it must be durably
+created before either file is opened. It additionally contains only the
+fixed receipt basename and receipt SHA-256. The marker's same-directory
+temporary file is flushed and fsynced before a no-replace link is created,
+then the containing directory or equivalent platform metadata barrier is
+flushed before evaluation continues. Failure to establish that durability
+barrier fails closed before trace or test access. The marker is never removed
+after a later exception.
 
 The CLI accepts a private output directory, not a caller-selected report
 filename. A successful evaluation is canonical JSON named
 `capturable25-v4-fixed-blend-confirmation-report-<sha256>.json`, where the
 suffix is the SHA-256 of the exact report bytes. Publication is create-only,
-and the report binds the marker filename and hash.
+durable, and the report binds the marker filename and hash, receipt filename
+and hash, trace filename and hash, and dataset filename and hash.
 
 ## Paired uncertainty gate
 
