@@ -599,7 +599,7 @@ export function createDefaultHypothesisSeeds(): readonly PredictionSeed[] {
 /**
  * Exact hypothesis particles for the audited capturable-king authority.
  *
- * Triple Play has two observed hidden parameter values, while the other nine
+ * Triple Play has two observed hidden parameter values, while the other 24
  * rules are parameterless. The public rule order is owned by DrawbackEngine's
  * audited authority allowlist so labels cannot drift from executable support.
  */
@@ -607,10 +607,25 @@ export function createCapturableHypothesisSeeds():
   readonly PredictionSeed[] {
   const parameterless = [
     asHypothesisSeed(veganRule, {}, 1),
+    asHypothesisSeed(trueGentlemanRule, {}, 1),
+    asHypothesisSeed(falseProphetsRule, {}, 1),
+    asHypothesisSeed(trophyWifeRule, {}, 1),
     asHypothesisSeed(lameDuckRule, {}, 1),
+    asHypothesisSeed(cessRule, {}, 1),
+    asHypothesisSeed(forwardMarchRule, {}, 1),
     asHypothesisSeed(checkersRule, {}, 1),
+    asHypothesisSeed(pacmanRule, {}, 1),
+    asHypothesisSeed(oddballRule, {}, 1),
+    asHypothesisSeed(evenKeeledRule, {}, 1),
     asHypothesisSeed(truantRule, {}, 1),
     asHypothesisSeed(spiceOfLifeRule, {}, 1),
+    asHypothesisSeed(quitHorsingAroundRule, {}, 1),
+    asHypothesisSeed(remorsefulRule, {}, 1),
+    asHypothesisSeed(battleFatigueRule, {}, 1),
+    asHypothesisSeed(eyeForAnEyeRule, {}, 1),
+    asHypothesisSeed(barbarianRageRule, {}, 1),
+    asHypothesisSeed(conscientiousObjectorsRule, {}, 1),
+    asHypothesisSeed(horseTranquilizerRule, {}, 1),
     asHypothesisSeed(femmeFataleRule, {}, 1),
     asHypothesisSeed(nurturerRule, {}, 1),
     asHypothesisSeed(youBestNotMissRule, {}, 1),

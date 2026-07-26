@@ -42,6 +42,7 @@ const AGENT = Object.freeze({
     maxNodes: 2_000,
     leafCacheEntries: 1_024,
     leafCacheHistoryMode: "full",
+    opponentAggregation: "worst-case",
     temperatureCp: 1,
     topK: 1,
   }),
@@ -113,7 +114,7 @@ export function playerPrivateTraceFixture(
     authorityId: "capturable-king/v1",
     ruleset: {
       kind: "audited-player-private",
-      version: 1,
+      version: PLAYER_PRIVATE_SIMULATION_TRACE_SCHEMA_VERSION,
     },
     randomPolicy: SIMULATION_RANDOM_POLICY,
     gameIndex,

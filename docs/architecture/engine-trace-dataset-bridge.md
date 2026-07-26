@@ -42,12 +42,12 @@ must not change the derived public features. Tests enforce this invariant.
 The converter also fails if exact symbolic legality has eliminated the trace's
 claimed true drawback; a learned model can never override that contradiction.
 
-Capturable schema 7 uses a separate 10-rule audited vocabulary. Triple Play
-has exact bishop and knight parameter particles. The other nine current
+Capturable schema 8 uses a separate 25-rule audited vocabulary. Triple Play
+has exact bishop and knight parameter particles. The other 24 current
 authority rules are parameterless. Unsupported rules are absent rather than
 represented by fake unrestricted behavior.
 
-Trace V1 does not carry the evaluator fact needed to recompute an
+Trace V2 does not carry the evaluator fact needed to recompute an
 evaluator-backed rule's legal mask at the final post-move turn. The bridge
 therefore rejects a game whose final side has one of those rules instead of
 trusting an unauthenticated result label. A later trace schema must record that
@@ -81,8 +81,9 @@ authenticated UCI sidecar.
 
 This bridge establishes the dataset producer and its public/private boundary.
 It does not turn the historical schema-6 corpus protocol into a new release.
-Schema 6 remains reproducible legacy research data. Capturable schema 7 is an
-additive training schema, not a promoted model release. A schema-7 release
+Schema 6 and the ten-label capturable schema 7 remain reproducible legacy
+research data. Capturable schema 8 is the current additive training schema,
+not a promoted model release. A schema-8 release
 manifest must separately bind the exact Engine trace bytes, Engine/catalog
 revision, bridge artifact and source revision, derived dataset bytes, split
 ledger, and evaluator identity before any trained model may be promoted.

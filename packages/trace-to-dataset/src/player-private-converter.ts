@@ -31,7 +31,7 @@ import type {
   TrainingDatasetRow,
 } from "./converter.js";
 
-export const CAPTURABLE_SYMBOLIC_FEATURE_VERSION = 7 as const;
+export const CAPTURABLE_SYMBOLIC_FEATURE_VERSION = 8 as const;
 export const CAPTURABLE_SYMBOLIC_RULE_COUNT =
   CAPTURABLE_HYPOTHESIS_RULE_IDS.length;
 

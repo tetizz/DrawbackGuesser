@@ -119,10 +119,14 @@ pnpm --filter @drawbackguesser/dataset-cli start -- \
   --require-evaluator none
 ```
 
-Capturable rows use symbolic feature schema 7 and the Engine's 10-rule audited
+Capturable rows use symbolic feature schema 8 and the Engine's 25-rule audited
 authority catalog. They include the complete public position snapshot needed
 for one-reply king-passant, but secret IDs, parameters, rule state, legal
 masks, trigger flags, and results remain label-only fields.
+
+Historical 10-label schema-7 corpora and checkpoints remain research
+artifacts; they are deliberately incompatible with schema 8 and cannot be
+silently loaded as 25-label data.
 
 The input and output contain hidden labels and must remain private. The
 example deliberately writes outside the repository; do not place private

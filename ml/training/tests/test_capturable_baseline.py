@@ -16,6 +16,7 @@ from drawback_ml.capturable_baseline import (
 )
 from drawback_ml.capturable_records import (
     CAPTURABLE_FEATURE_DIMENSION,
+    CAPTURABLE_RULE_COUNT,
     parse_capturable_dataset_row,
 )
 
@@ -27,8 +28,14 @@ class CapturableBaselineTests(unittest.TestCase):
         model = create_capturable_model(8)
         outputs = model(torch.zeros((3, CAPTURABLE_FEATURE_DIMENSION)))
 
-        self.assertEqual(tuple(outputs["white_drawback"].shape), (3, 10))
-        self.assertEqual(tuple(outputs["black_drawback"].shape), (3, 10))
+        self.assertEqual(
+            tuple(outputs["white_drawback"].shape),
+            (3, CAPTURABLE_RULE_COUNT),
+        )
+        self.assertEqual(
+            tuple(outputs["black_drawback"].shape),
+            (3, CAPTURABLE_RULE_COUNT),
+        )
         self.assertEqual(tuple(outputs["trigger"].shape), (3,))
         self.assertEqual(tuple(outputs["forced"].shape), (3,))
         self.assertEqual(
@@ -124,8 +131,8 @@ class CapturableBaselineTests(unittest.TestCase):
     ) -> None:
         rows = self._split("selection")
         residuals = [
-            [float(index) for index in range(10)],
-            [float(-index) for index in range(10)],
+            [float(index) for index in range(CAPTURABLE_RULE_COUNT)],
+            [float(-index) for index in range(CAPTURABLE_RULE_COUNT)],
         ]
         selection = _validation_selection_metrics(
             rows,

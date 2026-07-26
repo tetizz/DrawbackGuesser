@@ -2,7 +2,7 @@
 
 ## Capturable-king research baseline
 
-Schema-7 capturable datasets have a separate, non-release baseline. It accepts
+Schema-8 capturable datasets have a separate, non-release baseline. It accepts
 three already-converted, game-disjoint files and trains from a deterministic
 random initialization:
 
@@ -38,9 +38,11 @@ piece and tactical history, recent piece types, and repeated-piece streaks.
 
 The output directory must not already contain `model.pt` or
 `evaluation.json`. Both files bind the input hashes and record
-`freshStart: true`; they belong outside the repository. This is an honestly
-measured research baseline for the Engine's current 10-rule capturable catalog,
-not a promoted browser model or a claim about the full catalog.
+`freshStart: true`; they belong outside the repository. The training code now
+targets the Engine's 25-rule capturable catalog. No 25-label accuracy is
+claimed until a fresh, disjoint schema-8 experiment is complete. Published
+schema-7 results remain a historical 10-label baseline, not a promoted browser
+model or a claim about the full catalog.
 
 ## Manifest-bound current-catalog training
 

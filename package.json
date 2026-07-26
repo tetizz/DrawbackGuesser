@@ -17,7 +17,8 @@
     "check:engine": "node scripts/require-engine.mjs",
     "python:compile": "python -m compileall -q ml/training ml/evaluation",
     "python:test": "python -m unittest discover -s ml/training/tests -v && python -m unittest discover -s ml/evaluation/tests -v",
-    "check": "pnpm check:boundary && pnpm check:engine && pnpm typecheck && pnpm lint && pnpm test && pnpm build && pnpm python:compile && pnpm python:test"
+    "check:capturable-vocabulary": "node scripts/verify-capturable-vocabulary.mjs",
+    "check": "pnpm check:boundary && pnpm check:engine && pnpm typecheck && pnpm lint && pnpm test && pnpm build && pnpm check:capturable-vocabulary && pnpm python:compile && pnpm python:test"
   },
   "devDependencies": {
     "@eslint/js": "^9.32.0",

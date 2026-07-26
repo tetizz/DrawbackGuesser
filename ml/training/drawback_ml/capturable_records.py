@@ -1,4 +1,4 @@
-"""Strict schema-7 records for capturable-king self-play.
+"""Strict schema-8 records for capturable-king self-play.
 
 This module is deliberately additive. The historical schema-6 release
 pipeline remains frozen, while capturable training uses its own exact public
@@ -18,13 +18,28 @@ from .features import FEATURE_DIMENSION, build_feature_vector
 from .records import FeatureRecord
 
 
-CAPTURABLE_SYMBOLIC_FEATURE_VERSION = 7
+CAPTURABLE_SYMBOLIC_FEATURE_VERSION = 8
 CAPTURABLE_RULE_IDS = (
     "vegan",
+    "true-gentleman",
+    "false-prophets",
+    "trophy-wife",
     "lame-duck",
+    "cess",
+    "forward-march",
     "checkers",
+    "pacman",
+    "oddball",
+    "even-keeled",
     "truant",
     "spice-of-life",
+    "quit-horsing-around",
+    "remorseful",
+    "battle-fatigue",
+    "eye-for-an-eye",
+    "barbarian-rage",
+    "conscientious-objectors",
+    "horse-tranquilizer",
     "femme-fatale",
     "nurturer",
     "triple-play",
@@ -36,7 +51,12 @@ CAPTURABLE_RULE_INDEX = {
     rule_id: index for index, rule_id in enumerate(CAPTURABLE_RULE_IDS)
 }
 CAPTURABLE_BEHAVIOR_FEATURES = 73
-CAPTURABLE_FEATURE_DIMENSION = FEATURE_DIMENSION + 27 + CAPTURABLE_BEHAVIOR_FEATURES
+CAPTURABLE_FEATURE_DIMENSION = (
+    FEATURE_DIMENSION
+    + 2 * CAPTURABLE_RULE_COUNT
+    + 7
+    + CAPTURABLE_BEHAVIOR_FEATURES
+)
 
 _UCI_MOVE = re.compile(r"^[a-h][1-8][a-h][1-8][nbrq]?$")
 _BOARD_SQUARE = re.compile(r"^[a-h][1-8]$")
@@ -113,7 +133,7 @@ _SAN_PIECE = {
 
 
 class CapturableDatasetError(ValueError):
-    """Raised when schema-7 data fails the public/private contract."""
+    """Raised when schema-8 data fails the public/private contract."""
 
 
 @dataclass(frozen=True)
@@ -323,10 +343,10 @@ def parse_capturable_dataset_row(row: Mapping[str, Any]) -> CapturableDatasetRow
     if row.get("authorityId") != "capturable-king/v1":
         raise CapturableDatasetError("authorityId must be capturable-king/v1")
     if row.get("symbolicFeatureVersion") != CAPTURABLE_SYMBOLIC_FEATURE_VERSION:
-        raise CapturableDatasetError("symbolicFeatureVersion must be 7")
+        raise CapturableDatasetError("symbolicFeatureVersion must be 8")
     if row.get("publicEvaluatorConstraint") is not None:
         raise CapturableDatasetError(
-            "capturable schema 7 does not accept evaluator constraints"
+            "capturable schema 8 does not accept evaluator constraints"
         )
     fen_before = _string(row.get("fenBefore"), "fenBefore")
     color = row.get("playerColor")

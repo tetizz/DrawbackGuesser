@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   capturableKingIrresistibleRule,
+  cessRule,
+  conscientiousObjectorsRule,
+  falseProphetsRule,
   femmeFataleRule,
+  horseTranquilizerRule,
   nurturerRule,
+  trophyWifeRule,
   triplePlayRule,
   unrestrictedRule,
   youBestNotMissRule,
@@ -108,6 +113,62 @@ describe("capturable-king rule prediction", () => {
       { requiredType: "bishop" },
       { requiredType: "knight" },
     ]);
+  });
+
+  it.each([
+    {
+      name: "False Prophets",
+      rule: falseProphetsRule,
+      fen: "4k3/3B4/8/8/8/8/8/K7 w - - 0 1",
+      move: { from: "d7", to: "e8" } as const,
+    },
+    {
+      name: "Trophy Wife",
+      rule: trophyWifeRule,
+      fen: "4k3/4Q3/8/8/8/8/8/K7 w - - 0 1",
+      move: { from: "e7", to: "e8" } as const,
+    },
+    {
+      name: "Conscientious Objectors",
+      rule: conscientiousObjectorsRule,
+      fen: "1k6/P7/8/8/8/8/8/K7 w - - 0 1",
+      move: {
+        from: "a7",
+        to: "b8",
+        promotion: "queen",
+      } as const,
+    },
+    {
+      name: "Horse Tranquilizer",
+      rule: horseTranquilizerRule,
+      fen: "4k3/8/5N2/8/8/8/8/K7 w - - 0 1",
+      move: { from: "f6", to: "e8" } as const,
+    },
+    {
+      name: "Cess",
+      rule: cessRule,
+      fen: "7k/7R/8/8/8/8/8/K7 w - - 0 1",
+      move: { from: "h7", to: "h8" } as const,
+    },
+  ])("hard-eliminates expanded $name after its forbidden king capture", ({
+    rule,
+    fen,
+    move,
+  }) => {
+    const position = CapturableKingPosition.fromFen(fen);
+    const predictor = predictorFor(position, [
+      asHypothesisSeed(rule, {}),
+      asHypothesisSeed(unrestrictedRule, {}),
+    ]);
+    const state = observe(predictor, position, [], move);
+    expect(byId(state, "white", rule.id)).toMatchObject({
+      eliminated: true,
+      logProbability: Number.NEGATIVE_INFINITY,
+    });
+    expect(byId(state, "white", "unrestricted")).toMatchObject({
+      eliminated: false,
+      logProbability: 0,
+    });
   });
 
   it("hard-eliminates Irresistible after a quiet move declines adjacency", () => {

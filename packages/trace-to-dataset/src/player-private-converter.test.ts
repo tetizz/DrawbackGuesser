@@ -27,7 +27,7 @@ describe("player-private Engine trace conversion", () => {
       playerColor: "white",
       historySan: [],
       ordinaryLegalMoves: trace.plies[0]?.authorityLegalMoves,
-      symbolicFeatureVersion: 7,
+      symbolicFeatureVersion: 8,
       trueDrawback: "vegan",
       hiddenParameters: {},
       drawbackInternalState: { movesApplied: 0 },

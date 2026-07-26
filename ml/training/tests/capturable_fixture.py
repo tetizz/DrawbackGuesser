@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from drawback_ml.capturable_records import CAPTURABLE_RULE_IDS
+from drawback_ml.capturable_records import (
+    CAPTURABLE_RULE_IDS,
+    CAPTURABLE_SYMBOLIC_FEATURE_VERSION,
+)
 
 
 def capturable_row(
@@ -59,7 +62,7 @@ def capturable_row(
         "historySan": history,
         "ordinaryLegalMoves": ordinary_legal_moves,
         "clockMs": None,
-        "symbolicFeatureVersion": 7,
+        "symbolicFeatureVersion": CAPTURABLE_SYMBOLIC_FEATURE_VERSION,
         "symbolicWhiteRuleProbabilities": probabilities,
         "symbolicBlackRuleProbabilities": probabilities,
         "symbolicWhiteEliminated": eliminated,

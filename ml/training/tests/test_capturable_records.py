@@ -10,6 +10,7 @@ import _bootstrap  # noqa: F401
 from capturable_fixture import capturable_row
 from drawback_ml.capturable_records import (
     CAPTURABLE_FEATURE_DIMENSION,
+    CAPTURABLE_RULE_COUNT,
     CAPTURABLE_RULE_INDEX,
     CapturableDatasetError,
     assert_disjoint_games,
@@ -46,6 +47,29 @@ class CapturableRecordTests(unittest.TestCase):
             len(capturable_feature_vector(parsed.features)),
             CAPTURABLE_FEATURE_DIMENSION,
         )
+
+    def test_rejects_legacy_ten_label_symbolic_rows(self) -> None:
+        legacy_version = {
+            **capturable_row(),
+            "symbolicFeatureVersion": 7,
+        }
+        with self.assertRaisesRegex(
+            CapturableDatasetError, "symbolicFeatureVersion must be 8"
+        ):
+            parse_capturable_dataset_row(legacy_version)
+
+        legacy_vocabulary = {
+            **capturable_row(),
+            "symbolicWhiteRuleProbabilities": [0.1] * 10,
+            "symbolicBlackRuleProbabilities": [0.1] * 10,
+            "symbolicWhiteEliminated": [False] * 10,
+            "symbolicBlackEliminated": [False] * 10,
+        }
+        with self.assertRaisesRegex(
+            CapturableDatasetError,
+            f"must contain {CAPTURABLE_RULE_COUNT} probabilities",
+        ):
+            parse_capturable_dataset_row(legacy_vocabulary)
 
     def test_same_length_histories_preserve_public_piece_behavior(self) -> None:
         pawn_history = capturable_row(color="black")
