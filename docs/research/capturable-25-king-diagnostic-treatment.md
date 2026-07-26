@@ -100,6 +100,43 @@ fresh split. Report all three metrics and per-rule regressions regardless of
 the outcome. A confirmation would still apply only to this 25-label synthetic
 domain; it would not establish reliable human-game performance.
 
+## Fresh paired-test result
+
+The preregistered test was generated and converted without changing its plan:
+
+| Artifact | Size | SHA-256 |
+| --- | ---: | --- |
+| fresh privileged trace | 625 games / 34,057,873 bytes | `73f24c5a2c4c6b1e4262137b124afd1ec090003d94844c4261b3f3da9442f1fc` |
+| fresh schema-8 test | 31,189 rows / 74,737,434 bytes | `f564e4742b6b6f1ecde1f1696e0a4e7094ccd71d4abf8c9add4fdc5f3316f60f` |
+| paired sealed report | 1,250 player-games per model | `56f1e6e6140ab944a782788b2969ff42cbccdfaa8f05aa3673a681b2a0af53ae` |
+
+The trace has global indexes 0–624, all 625 ordered pairs exactly once,
+25 games in every label/color cell, no zero-ply games, and no game-ID overlap
+with the v1 train, validation, test, or diagnostic supplement.
+
+| Fresh test metric | Control | Treatment t2 | Delta |
+| --- | ---: | ---: | ---: |
+| game-normalized Top-1 | 32.3032% | 32.3529% | +0.0497 pp |
+| game-normalized Top-3 | 51.4493% | 51.7370% | +0.2877 pp |
+| game-normalized Top-5 | 63.2118% | 63.4828% | +0.2711 pp |
+| game-normalized NLL | 2.46127 | 2.49835 | +0.03708 |
+| game-normalized Brier | 0.82792 | 0.84073 | +0.01280 |
+| expected calibration error | 0.16978 | 0.18817 | +0.01839 |
+| trigger accuracy | 72.3332% | 66.5748% | -5.7584 pp |
+
+The preregistered lexicographic classification rule therefore records
+`confirm-treatment`, but this is not a reliable release improvement. NLL,
+Brier score, calibration, trigger accuracy, and all four 5/10/15/20-move
+horizons regressed. Irresistible Top-1 fell 4.75 points and Nurturer also
+regressed. Femme Fatale and Triple Play improved modestly, while You Best Not
+Miss gained 9.76 points at Top-3 with unchanged Top-1.
+
+The production decision is **retain the control**. Future paired evaluation
+reports separate the primary classification tie-break from a stricter release
+gate requiring non-regression across accuracy, probability quality, horizons,
+and auxiliary outputs. This post-test release safeguard does not rewrite the
+frozen primary result.
+
 ## Known corrective follow-up
 
 The concentrated supplement changes the empirical class prior and makes the

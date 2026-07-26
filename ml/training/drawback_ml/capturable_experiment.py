@@ -456,6 +456,56 @@ def _test_performance_order(result: Mapping[str, Any]) -> tuple[float, ...]:
     )
 
 
+def _paired_reliability_checks(
+    control: Mapping[str, Any],
+    treatment: Mapping[str, Any],
+    primary_confirmed: bool,
+) -> Mapping[str, bool]:
+    control_hybrid = control["metrics"]["hybrid"]
+    treatment_hybrid = treatment["metrics"]["hybrid"]
+    control_horizons = control_hybrid["accuracy_after_moves"]
+    treatment_horizons = treatment_hybrid["accuracy_after_moves"]
+    return {
+        "primaryRankingConfirmed": primary_confirmed,
+        "top1NonRegression": (
+            treatment_hybrid["game_normalized_top_1_accuracy"]
+            >= control_hybrid["game_normalized_top_1_accuracy"]
+        ),
+        "top3NonRegression": (
+            treatment_hybrid["game_normalized_top_3_accuracy"]
+            >= control_hybrid["game_normalized_top_3_accuracy"]
+        ),
+        "negativeLogLikelihoodNonRegression": (
+            treatment_hybrid[
+                "game_normalized_negative_log_likelihood"
+            ]
+            <= control_hybrid[
+                "game_normalized_negative_log_likelihood"
+            ]
+        ),
+        "brierNonRegression": (
+            treatment_hybrid["game_normalized_brier_score"]
+            <= control_hybrid["game_normalized_brier_score"]
+        ),
+        "calibrationNonRegression": (
+            treatment_hybrid["expected_calibration_error"]
+            <= control_hybrid["expected_calibration_error"]
+        ),
+        "allMoveHorizonsNonRegression": all(
+            treatment_horizons[horizon] >= control_accuracy
+            for horizon, control_accuracy in control_horizons.items()
+        ),
+        "triggerAccuracyNonRegression": (
+            treatment["metrics"]["trigger"]["accuracy"]
+            >= control["metrics"]["trigger"]["accuracy"]
+        ),
+        "forcedAccuracyNonRegression": (
+            treatment["metrics"]["forced"]["accuracy"]
+            >= control["metrics"]["forced"]["accuracy"]
+        ),
+    }
+
+
 def run_paired_sealed_evaluation(
     comparison_path: Path,
     test_path: Path,
@@ -498,13 +548,19 @@ def run_paired_sealed_evaluation(
     control_order = _test_performance_order(control)
     treatment_order = _test_performance_order(treatment)
     confirmed = treatment_order > control_order
+    reliability_checks = _paired_reliability_checks(
+        control,
+        treatment,
+        confirmed,
+    )
+    reliable = all(reliability_checks.values())
     control_hybrid = control["metrics"]["hybrid"]
     treatment_hybrid = treatment["metrics"]["hybrid"]
     report = {
         "format": (
             "drawbackguesser-capturable-paired-sealed-evaluation"
         ),
-        "version": 1,
+        "version": 2,
         "comparison": {
             "file": comparison_path.resolve().name,
             "sha256": comparison_sha256,
@@ -539,8 +595,12 @@ def run_paired_sealed_evaluation(
                     ]
                 ),
             },
-            "decision": (
+            "primaryDecision": (
                 "confirm-treatment" if confirmed else "reject-treatment"
+            ),
+            "reliabilityChecks": reliability_checks,
+            "releaseDecision": (
+                "promote-treatment" if reliable else "retain-control"
             ),
         },
         "sealedTestStatus": "consumed",
@@ -551,7 +611,8 @@ def run_paired_sealed_evaluation(
     return {
         "reportPath": str(output_path),
         "reportSha256": hashlib.sha256(payload).hexdigest(),
-        "decision": report["test"]["decision"],
+        "primaryDecision": report["test"]["primaryDecision"],
+        "releaseDecision": report["test"]["releaseDecision"],
         "testSha256": test_sha256,
         "controlGameNormalizedTop1": control_order[0],
         "treatmentGameNormalizedTop1": treatment_order[0],

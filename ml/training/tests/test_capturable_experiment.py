@@ -214,8 +214,12 @@ class CapturableExperimentTests(unittest.TestCase):
                 paired_output.read_text("utf-8")
             )
             self.assertIn(
-                paired["decision"],
+                paired["primaryDecision"],
                 {"confirm-treatment", "reject-treatment"},
+            )
+            self.assertIn(
+                paired["releaseDecision"],
+                {"promote-treatment", "retain-control"},
             )
             self.assertEqual(
                 paired_report["test"]["input"]["games"],
@@ -224,6 +228,20 @@ class CapturableExperimentTests(unittest.TestCase):
             self.assertEqual(
                 paired_report["sealedTestStatus"],
                 "consumed",
+            )
+            self.assertEqual(
+                set(paired_report["test"]["reliabilityChecks"]),
+                {
+                    "primaryRankingConfirmed",
+                    "top1NonRegression",
+                    "top3NonRegression",
+                    "negativeLogLikelihoodNonRegression",
+                    "brierNonRegression",
+                    "calibrationNonRegression",
+                    "allMoveHorizonsNonRegression",
+                    "triggerAccuracyNonRegression",
+                    "forcedAccuracyNonRegression",
+                },
             )
             with self.assertRaisesRegex(
                 CapturableDatasetError,

@@ -64,6 +64,10 @@ py -m ml.training.drawback_ml.capturable_experiment evaluate-treatment `
 The paired evaluator rejects altered comparison/checkpoint identities and
 train/validation overlap, loads the fresh test once, evaluates both frozen
 models without an intervening decision, and publishes one no-clobber report.
+It reports the preregistered primary ranking separately from the release
+decision. Release additionally requires non-regression in Top-1, Top-3, NLL,
+Brier score, calibration error, every declared move horizon, trigger accuracy,
+and forced-move accuracy.
 
 ```powershell
 py -m ml.training.drawback_ml.capturable_experiment evaluate `
