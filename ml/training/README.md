@@ -1,5 +1,44 @@
 # Drawback model training
 
+## Capturable-king research baseline
+
+Schema-7 capturable datasets have a separate, non-release baseline. It accepts
+three already-converted, game-disjoint files and trains from a deterministic
+random initialization:
+
+```powershell
+py -m ml.training.drawback_ml.capturable_baseline `
+  --train ..\DrawbackTrainingData\capturable-train.ndjson `
+  --train ..\DrawbackTrainingData\capturable-train-extra.ndjson `
+  --validation ..\DrawbackTrainingData\capturable-validation.ndjson `
+  --test ..\DrawbackTrainingData\capturable-test.ndjson `
+  --output ..\DrawbackTrainingData\capturable-baseline-run `
+  --seed 3235776257 --epochs 8 --batch-size 256 `
+  --hidden-dimension 128 --torch-threads 14
+```
+
+`--train` may be repeated for independently generated training corpora. The
+loader requires canonical UTF-8/LF records, exact schema keys, complete
+public capturable-authority state, and a surviving true symbolic hypothesis.
+It separates public features from labels before feature construction and
+rejects overlapping game IDs. Validation game-normalized Top-1, then Top-3,
+then game-normalized NLL jointly select the epoch and frozen fusion settings; the test split is
+evaluated only after that choice. Hard-mask fusion keeps every exact
+elimination irreversible while
+allowing learned public move patterns to rerank the surviving soft
+hypotheses. Validation also selects bounded prior smoothing so a non-eliminated
+hypothesis with tiny soft mass is not mistaken for a mathematical
+contradiction. Training losses weight every player-game equally, so a long game
+cannot dominate simply by contributing more move rows. Public behavior features
+cover current mover/capture/castling facts, authority-move composition, per-side
+piece and tactical history, recent piece types, and repeated-piece streaks.
+
+The output directory must not already contain `model.pt` or
+`evaluation.json`. Both files bind the input hashes and record
+`freshStart: true`; they belong outside the repository. This is an honestly
+measured research baseline for the Engine's current 10-rule capturable catalog,
+not a promoted browser model or a claim about the full catalog.
+
 ## Manifest-bound current-catalog training
 
 Release-candidate training must start from the public release root plus only
