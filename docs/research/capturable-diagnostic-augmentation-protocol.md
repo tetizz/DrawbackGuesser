@@ -138,3 +138,6 @@ accuracy after 5/10/15/20 observed moves, per-rule accuracy, hidden-parameter
 accuracy, trigger and forced-move accuracy, and hard-elimination diagnostics.
 No value may be reported unless it is read from the content-addressed final
 evaluation artifact.
+
+The completed, rejected result is recorded in
+`capturable-diagnostic-augmentation-results.md`.
