@@ -1,0 +1,263 @@
+:root {
+  color: #eef2f6;
+  background: #0b1016;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  font-synthesis: none;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top right, #1c3340 0, transparent 38rem),
+    #0b1016;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button,
+.pgn-file-button {
+  min-height: 42px;
+  border: 1px solid #49616e;
+  border-radius: 9px;
+  color: #f5f8fa;
+  background: #22333d;
+  cursor: pointer;
+  padding: 0.65rem 0.9rem;
+}
+
+button:hover,
+.pgn-file-button:hover {
+  border-color: #85c8b7;
+  background: #29434c;
+}
+
+button.secondary {
+  background: transparent;
+}
+
+main {
+  width: min(1180px, calc(100% - 2rem));
+  margin: 0 auto;
+  padding: 2rem 0 4rem;
+}
+
+.product-header {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.7fr) minmax(280px, 1fr);
+  gap: 2rem;
+  align-items: end;
+  margin-bottom: 1rem;
+}
+
+.product-header h1 {
+  margin: 0.2rem 0 0;
+  font-size: clamp(2.1rem, 6vw, 4.5rem);
+  line-height: 0.95;
+}
+
+.product-header p,
+.pgn-lab-heading p {
+  color: #aebbc2;
+  line-height: 1.6;
+}
+
+.eyebrow,
+.offline-badge {
+  color: #a9edcd;
+  font-size: 0.75rem;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.safety-note {
+  padding: 0.85rem 1rem;
+  margin-bottom: 1rem;
+  border-left: 3px solid #f4c96b;
+  color: #d9d2bd;
+  background: #171a1e;
+}
+
+.pgn-lab {
+  border: 1px solid #2d424d;
+  border-radius: 14px;
+  background: rgb(15 23 30 / 94%);
+  padding: clamp(1rem, 3vw, 2rem);
+}
+
+.pgn-lab-heading,
+.section-heading,
+.pgn-report-tools,
+.pgn-truth-score,
+.pgn-report-status,
+.pgn-evaluator-trust {
+  display: flex;
+  gap: 0.8rem;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+
+.pgn-lab-heading h2,
+.section-heading h3 {
+  margin: 0;
+}
+
+.pgn-input {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 1.25rem;
+}
+
+.pgn-input textarea {
+  width: 100%;
+  min-height: 210px;
+  resize: vertical;
+  border: 1px solid #384e5a;
+  border-radius: 10px;
+  padding: 1rem;
+  color: #f2f5f7;
+  background: #090e13;
+}
+
+.pgn-input > div,
+.pgn-report-tools {
+  display: flex;
+  gap: 0.65rem;
+  flex-wrap: wrap;
+}
+
+.pgn-file-button input {
+  display: none;
+}
+
+.pgn-error,
+.pgn-availability-warning {
+  color: #ffb0a6;
+}
+
+.pgn-empty,
+.pgn-error,
+.pgn-evaluator-trust,
+.pgn-report-status,
+.pgn-analysis-progress {
+  margin-top: 1rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid #304852;
+  border-radius: 9px;
+  background: #101b21;
+}
+
+.pgn-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  margin-top: 1.25rem;
+}
+
+.pgn-summary > div,
+.pgn-guesses,
+.pgn-coverage span {
+  border: 1px solid #2e424c;
+  border-radius: 10px;
+  padding: 1rem;
+  background: #0d151b;
+}
+
+.pgn-guesses > div {
+  display: grid;
+  grid-template-columns: 2rem 1fr auto;
+  gap: 0.65rem;
+  padding: 0.6rem 0;
+  border-top: 1px solid #253740;
+}
+
+.pgn-guesses small,
+.pgn-guesses em,
+.pgn-history td span,
+.pgn-coverage span {
+  color: #9eafb7;
+  font-style: normal;
+}
+
+.pgn-guesses small {
+  display: block;
+}
+
+.pgn-coverage {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.6rem;
+  margin-top: 1rem;
+}
+
+.pgn-coverage strong {
+  display: block;
+  color: #edf4f6;
+}
+
+.pgn-history {
+  margin-top: 1.5rem;
+}
+
+.pgn-history-scroll {
+  overflow: auto;
+  margin-top: 0.75rem;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 760px;
+}
+
+th,
+td {
+  padding: 0.75rem;
+  border-bottom: 1px solid #283b44;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  color: #a9edcd;
+}
+
+select {
+  margin-left: 0.5rem;
+  border: 1px solid #49616e;
+  border-radius: 7px;
+  padding: 0.55rem;
+  color: #eef2f6;
+  background: #0b1218;
+}
+
+@media (max-width: 720px) {
+  main {
+    width: min(100% - 1rem, 1180px);
+    padding-top: 1rem;
+  }
+
+  .product-header,
+  .pgn-summary {
+    grid-template-columns: 1fr;
+    gap: 0.75rem;
+  }
+
+  .pgn-lab {
+    padding: 1rem;
+  }
+}

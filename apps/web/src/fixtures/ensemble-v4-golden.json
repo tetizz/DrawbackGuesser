@@ -1,0 +1,66 @@
+{
+  "caseIndex": 0,
+  "calibration": {
+    "whiteTemperature": 1.7,
+    "blackTemperature": 0.65
+  },
+  "residualFormula": {
+    "white": {
+      "modulus": 11,
+      "center": 5,
+      "scale": 0.04,
+      "memberOffsets": [
+        -0.15,
+        0.05,
+        0.1
+      ]
+    },
+    "black": {
+      "modulus": 7,
+      "center": 3,
+      "scale": -0.06,
+      "memberOffsets": [
+        0.2,
+        -0.1,
+        0.05
+      ]
+    }
+  },
+  "expected": {
+    "white": {
+      "topIds": [
+        "ichtyophobe",
+        "hand-and-gigabrain",
+        "bridge-over-troubled-water",
+        "ooh-shiny",
+        "drag"
+      ],
+      "zeroCount": 17,
+      "probabilities": {
+        "vegan": 0.00044886973363646886,
+        "checkers": 0.0008565936922174505,
+        "hand-and-gigabrain": 0.009553633787236759,
+        "ichtyophobe": 0.009584646322222272,
+        "absolution": 0.008109923643331286
+      }
+    },
+    "black": {
+      "topIds": [
+        "vegan",
+        "lame-duck",
+        "checkers",
+        "truant",
+        "spice-of-life"
+      ],
+      "zeroCount": 14,
+      "probabilities": {
+        "vegan": 0.015021627969128558,
+        "checkers": 0.014768432207249762,
+        "hand-and-gigabrain": 0.000014548951850921156,
+        "ichtyophobe": 0.000005008983117356577,
+        "absolution": 0.0018103954874323926
+      }
+    }
+  },
+  "fusionAlpha": 0.5
+}

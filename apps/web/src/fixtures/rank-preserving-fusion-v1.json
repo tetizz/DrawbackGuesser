@@ -1,0 +1,59 @@
+{
+  "format": "drawbacktrainer-rank-preserving-fusion-parity",
+  "version": 1,
+  "method": "rank-preserving-bounded-residual-plus-symbolic-prior-v1",
+  "cases": [
+    {
+      "name": "extreme-mask",
+      "residuals": [-1000.0, 1000.0, 1e+300],
+      "prior": [0.9, 0.1, 0.4],
+      "eliminated": [false, false, true],
+      "alpha": 1.0,
+      "expected": {
+        "logits": [-0.38001358782485367, -2.027932020827018, 0.0],
+        "probabilities": [0.8386095222035911, 0.16139047779640892, 0.0],
+        "boundedNeuralSignal": [-0.5, 0.5, 0.0],
+        "neuralScales": [0.5493061443340548, 0.5493061443340548, 0.0]
+      }
+    },
+    {
+      "name": "local-near-tier",
+      "residuals": [-1000.0, 1000.0, 1000.0, -1000.0],
+      "prior": [0.4, 0.4, 0.100000000000001, 0.1],
+      "eliminated": [false, false, false, false],
+      "alpha": 0.5,
+      "expected": {
+        "logits": [-0.9596124306591512, -0.8729690330891587, -2.3025850929940352, -2.302585092994046],
+        "probabilities": [0.382753930963374, 0.41739612142358323, 0.09992497380652196, 0.09992497380652089],
+        "boundedNeuralSignal": [-0.25, 0.25, 0.25, -0.25],
+        "neuralScales": [0.34657359027997015, 0.34657359027997015, 2.4424906541753444e-15, 2.4424906541753444e-15]
+      }
+    },
+    {
+      "name": "collapsed-log-tier",
+      "residuals": [0.0, 2.0, -2.0],
+      "prior": [0.9999999998, 9.999999998e-11, 9.999999997999999e-11],
+      "eliminated": [false, false, false],
+      "alpha": 1.0,
+      "expected": {
+        "logits": [-0.21602290570713495, -23.025850930140454, -23.025850930140457],
+        "probabilities": [0.9999999997517739, 1.241130807097574e-10, 1.2411308070975697e-10],
+        "boundedNeuralSignal": [-0.21602290550713493, 0.5334799988640015, -0.31745709335686656],
+        "neuralScales": [1.0, 8.881784197001252e-16, 8.881784197001252e-16]
+      }
+    },
+    {
+      "name": "zero-survivor",
+      "residuals": [-5.0, 5.0, 100.0],
+      "prior": [0.75, 0.25, 0.0],
+      "eliminated": [false, false, false],
+      "alpha": 0.25,
+      "expected": {
+        "logits": [-0.31056982846569986, -1.4091821171338095, -1000001.2196276945],
+        "probabilities": [0.7499999999999999, 0.25, 0.0],
+        "boundedNeuralSignal": [-0.3333333333333333, -0.3333333333333333, 0.6666666666666667],
+        "neuralScales": [0.2746530721670274, 0.2746530721670274, 1.0]
+      }
+    }
+  ]
+}

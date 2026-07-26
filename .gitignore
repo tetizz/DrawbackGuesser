@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite3
+*.parquet
+data/generated/
+data/releases/
+ml/models/*.pt
+ml/models/*.onnx
+__pycache__/
+.venv/
+.playwright-cli/
+output/playwright/

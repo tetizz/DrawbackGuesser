@@ -1,0 +1,12 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+  - "engine/packages/shared"
+  - "engine/packages/drawback-engine"
+  - "engine/packages/chess-core"
+  - "engine/packages/probe-search"
+  - "engine/packages/drawback-search"
+  - "engine/packages/chess-evaluator"
+
+allowBuilds:
+  esbuild: true
