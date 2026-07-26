@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -132,6 +133,72 @@ class SealedTestBoundaryTests(unittest.TestCase):
                         invocation=invocation,
                         directory=root,
                     )
+
+    def test_authorized_evaluation_uses_the_pinned_engine_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            reference, value = self._authorization(root)
+            source_revision = value["dependencies"][  # type: ignore[index]
+                "source_revision"
+            ]
+            invocation = value["test_plan"]["argv"]  # type: ignore[index]
+
+            @contextmanager
+            def pinned_inputs(*_args: object):
+                yield {
+                    "public_root": (root / "release.public.json", "22" * 32),
+                    "private_test": (root / "test.private.json", "33" * 32),
+                    "dataset": (root / "test.ndjson", "44" * 32),
+                }
+
+            @contextmanager
+            def audited_split(*_args: object):
+                yield object()
+
+            report = SimpleNamespace(
+                ensemble_release_sha256="50" * 32,
+                calibration_sha256="51" * 32,
+                training_frequency_sha256="52" * 32,
+                partition_seed_sha256="53" * 32,
+                transcript=SimpleNamespace(sha256="54" * 32, record_count=1),
+                bootstrap_seed=20260831,
+                move_examples=1,
+            )
+            with self._cwd(root), patch(
+                "ml.evaluation.sealed_test._source_identity",
+                return_value=(root, source_revision),
+            ), patch(
+                "ml.evaluation.sealed_test._pinned_sealed_inputs",
+                side_effect=pinned_inputs,
+            ), patch(
+                "ml.evaluation.sealed_test.open_audited_private_corpus_split",
+                side_effect=audited_split,
+            ), patch(
+                "ml.evaluation.sealed_test.evaluate_candidate_partition",
+                return_value=report,
+            ) as evaluate, patch(
+                "ml.evaluation.sealed_test._test_decision",
+                return_value=(True, []),
+            ), patch(
+                "ml.evaluation.sealed_test._candidate_metrics",
+                return_value={},
+            ):
+                execute_authorized_test(
+                    authorization=reference,
+                    invocation=invocation,
+                    directory=root,
+                )
+
+            self.assertEqual(
+                evaluate.call_args.kwargs["catalogs"],
+                (
+                    root
+                    / "engine"
+                    / "data"
+                    / "catalog"
+                    / "observed-drawbacks.json",
+                ),
+            )
 
     def test_nested_ignored_evidence_resolves_clean_repository_root(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

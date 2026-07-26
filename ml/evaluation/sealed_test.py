@@ -388,7 +388,13 @@ def execute_authorized_test(
                 ensemble_release=ContentAddressedJson(directory / ensemble_name, ensemble_sha),
                 calibration=ContentAddressedFile(directory / calibration_name, calibration_sha),
                 training_frequency=TrainingFrequencyReference(directory / frequency_name, frequency_sha),
-                catalogs=(source_root / "data" / "catalog" / "observed-drawbacks.json",),
+                catalogs=(
+                    source_root
+                    / "engine"
+                    / "data"
+                    / "catalog"
+                    / "observed-drawbacks.json",
+                ),
                 bootstrap_seed=int(plan["bootstrap_seed"]),
                 batch_size=256,
             )
