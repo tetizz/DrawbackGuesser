@@ -19,16 +19,25 @@ from .capturable_records import (
     CAPTURABLE_RULE_IDS,
     CapturableDatasetError,
 )
+from .capturable_reliability import validation_reliability_checks
 
 CAPTURABLE_TREATMENT_COMPARISON_FORMAT = (
     "drawbackguesser-capturable-treatment-comparison"
 )
-CAPTURABLE_TREATMENT_COMPARISON_VERSION = 1
+CAPTURABLE_TREATMENT_COMPARISON_VERSION = 2
 _TREATMENT_SELECTION_METRIC = (
     "validation game-normalized Top-1, then Top-3, then lowest "
     "NLL, then lower trigger multiplier, then lower seed"
 )
 _TREATMENT_PROMOTION_METRIC = (
+    "strictly better validation game-normalized Top-1, then Top-3, "
+    "then lowest NLL, with no regression in Top-1, Top-3, NLL, "
+    "Brier score, calibration, move horizons, trigger accuracy, or "
+    "forced accuracy, no per-drawback Top-1 loss above one absolute "
+    "percentage point, and exact symbolic authority; parameter "
+    "tie-breaks cannot promote"
+)
+_LEGACY_TREATMENT_PROMOTION_METRIC = (
     "strictly better validation game-normalized Top-1, then Top-3, "
     "then lowest NLL; parameter tie-breaks cannot promote"
 )
@@ -337,6 +346,7 @@ def run_treatment_comparison(
         )
     }
     treatments: list[dict[str, Any]] = []
+    treatment_reports: dict[str, Mapping[str, Any]] = {}
     for path in treatment_report_paths:
         treatment, report = _validated_candidate(path)
         identity = (
@@ -359,11 +369,23 @@ def run_treatment_comparison(
             )
         treatment["trainInput"] = inputs["train"]
         treatments.append(treatment)
+        treatment_reports[treatment["selectionReportSha256"]] = report
     control["trainInput"] = control_inputs["train"]
     best_treatment = max(treatments, key=_selection_order)
-    promoted = _performance_order(best_treatment) > _performance_order(
+    primary_confirmed = _performance_order(
+        best_treatment
+    ) > _performance_order(
         control
     )
+    best_treatment_report = treatment_reports[
+        best_treatment["selectionReportSha256"]
+    ]
+    reliability_checks = validation_reliability_checks(
+        control_report["validation"],
+        best_treatment_report["validation"],
+        primary_confirmed,
+    )
+    promoted = all(reliability_checks.values())
     selected = best_treatment if promoted else control
     artifact = {
         "format": CAPTURABLE_TREATMENT_COMPARISON_FORMAT,
@@ -374,6 +396,15 @@ def run_treatment_comparison(
         "control": control,
         "treatments": treatments,
         "bestTreatment": best_treatment,
+        "primaryDecision": (
+            "confirm-treatment"
+            if primary_confirmed
+            else "reject-treatment"
+        ),
+        "reliabilityChecks": reliability_checks,
+        "releaseDecision": (
+            "promote-treatment" if promoted else "retain-control"
+        ),
         "decision": (
             "promote-treatment" if promoted else "retain-control"
         ),
@@ -386,6 +417,8 @@ def run_treatment_comparison(
     return {
         "artifactPath": str(output_path),
         "artifactSha256": hashlib.sha256(payload).hexdigest(),
+        "primaryDecision": artifact["primaryDecision"],
+        "releaseDecision": artifact["releaseDecision"],
         "decision": artifact["decision"],
         "selectedDirectory": selected["selectionDirectory"],
         "selectedCheckpointSha256": selected["checkpointSha256"],
@@ -404,7 +437,7 @@ def load_treatment_comparison(
     """Authenticate a comparison and every selection checkpoint it binds."""
 
     artifact, artifact_sha256 = _selection_report(path)
-    expected_keys = {
+    current_expected_keys = {
         "format",
         "version",
         "treatmentSelectionMetric",
@@ -413,20 +446,37 @@ def load_treatment_comparison(
         "control",
         "treatments",
         "bestTreatment",
+        "primaryDecision",
+        "reliabilityChecks",
+        "releaseDecision",
         "decision",
         "selected",
         "sealedTestStatus",
     }
+    legacy_expected_keys = current_expected_keys - {
+        "primaryDecision",
+        "reliabilityChecks",
+        "releaseDecision",
+    }
+    version = artifact.get("version")
+    legacy = version == 1
+    expected_keys = (
+        legacy_expected_keys if legacy else current_expected_keys
+    )
+    expected_promotion_metric = (
+        _LEGACY_TREATMENT_PROMOTION_METRIC
+        if legacy
+        else _TREATMENT_PROMOTION_METRIC
+    )
     if (
         set(artifact) != expected_keys
         or artifact.get("format")
         != CAPTURABLE_TREATMENT_COMPARISON_FORMAT
-        or artifact.get("version")
-        != CAPTURABLE_TREATMENT_COMPARISON_VERSION
+        or type(version) is not int
+        or version not in {1, CAPTURABLE_TREATMENT_COMPARISON_VERSION}
         or artifact.get("treatmentSelectionMetric")
         != _TREATMENT_SELECTION_METRIC
-        or artifact.get("promotionMetric")
-        != _TREATMENT_PROMOTION_METRIC
+        or artifact.get("promotionMetric") != expected_promotion_metric
         or artifact.get("sealedTestStatus") != "unopened"
     ):
         raise CapturableDatasetError(
@@ -477,6 +527,22 @@ def load_treatment_comparison(
         authenticate(entry) for entry in treatment_entries
     ]
     treatments = [item[0] for item in treatments_with_reports]
+    identities = {
+        (
+            control["selectionReportSha256"],
+            control["checkpointSha256"],
+        )
+    }
+    for treatment in treatments:
+        identity = (
+            treatment["selectionReportSha256"],
+            treatment["checkpointSha256"],
+        )
+        if identity in identities:
+            raise CapturableDatasetError(
+                f"{path.name} reuses a comparison candidate"
+            )
+        identities.add(identity)
     validation_input = control_report["inputs"]["validation"]
     comparable_config = _comparable_config(control_report["config"])
     if artifact.get("validationInput") != validation_input:
@@ -493,19 +559,71 @@ def load_treatment_comparison(
                 f"{path.name} candidates use different model configurations"
             )
     best_treatment = max(treatments, key=_selection_order)
-    promoted = _performance_order(best_treatment) > _performance_order(
+    primary_confirmed = _performance_order(
+        best_treatment
+    ) > _performance_order(
         control
     )
+    best_treatment_report = next(
+        report
+        for candidate, report in treatments_with_reports
+        if candidate["selectionReportSha256"]
+        == best_treatment["selectionReportSha256"]
+    )
+    reliability_checks = validation_reliability_checks(
+        control_report["validation"],
+        best_treatment_report["validation"],
+        primary_confirmed,
+    )
+    promoted = all(reliability_checks.values())
     selected = best_treatment if promoted else control
+    expected_primary_decision = (
+        "confirm-treatment"
+        if primary_confirmed
+        else "reject-treatment"
+    )
     expected_decision = (
         "promote-treatment" if promoted else "retain-control"
     )
-    if (
-        artifact.get("bestTreatment") != best_treatment
-        or artifact.get("decision") != expected_decision
-        or artifact.get("selected") != selected
-    ):
+    if legacy:
+        legacy_decision = (
+            "promote-treatment"
+            if primary_confirmed
+            else "retain-control"
+        )
+        legacy_selected = (
+            best_treatment if primary_confirmed else control
+        )
+        consistent = (
+            artifact.get("bestTreatment") == best_treatment
+            and artifact.get("decision") == legacy_decision
+            and artifact.get("selected") == legacy_selected
+        )
+    else:
+        consistent = (
+            artifact.get("bestTreatment") == best_treatment
+            and artifact.get("primaryDecision")
+            == expected_primary_decision
+            and artifact.get("reliabilityChecks")
+            == reliability_checks
+            and artifact.get("releaseDecision") == expected_decision
+            and artifact.get("decision") == expected_decision
+            and artifact.get("selected") == selected
+        )
+    if not consistent:
         raise CapturableDatasetError(
             f"{path.name} comparison decision is inconsistent"
         )
-    return artifact, artifact_sha256
+    if not legacy:
+        return artifact, artifact_sha256
+    normalized = dict(artifact)
+    normalized.update(
+        {
+            "primaryDecision": expected_primary_decision,
+            "reliabilityChecks": reliability_checks,
+            "releaseDecision": expected_decision,
+            "decision": expected_decision,
+            "selected": selected,
+        }
+    )
+    return normalized, artifact_sha256

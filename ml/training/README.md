@@ -49,7 +49,15 @@ validation identity and identical model/training configuration apart from the
 random seed and trigger-row multiplier. It authenticates every checkpoint,
 uses validation metrics only, and leaves the sealed test unopened. Parameter
 tie-breaks may select between treatments, but cannot promote a treatment whose
-Top-1, Top-3, and NLL tuple merely ties the control.
+Top-1, Top-3, and NLL tuple merely ties the control. The comparison records
+the primary ranking separately from its release decision; release also
+requires non-regression in Top-1, Top-3, NLL, Brier score, calibration error,
+the fixed 5/10/15/20-move horizons, trigger accuracy, and forced-move
+accuracy. It also rejects any per-drawback Top-1 loss above one absolute
+percentage point or any violation of exact symbolic hard elimination.
+Authenticated version-1 comparisons remain readable, but their historical
+primary-only decision is normalized through the current release gate before
+any sealed test can be authorized.
 
 After a treatment wins validation and a new test split has been preregistered,
 evaluate the authenticated control and treatment together:

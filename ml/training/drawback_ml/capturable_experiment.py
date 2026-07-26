@@ -28,6 +28,7 @@ from .capturable_records import (
     assert_disjoint_games,
     load_capturable_dataset,
 )
+from .capturable_reliability import validation_reliability_checks
 
 CAPTURABLE_SELECTION_FORMAT = "drawbackguesser-capturable-selection"
 CAPTURABLE_SELECTION_VERSION = 1
@@ -400,14 +401,14 @@ def run_sealed_evaluation(
     }
 
 
-def _evaluate_selection_on_test(
+def _evaluate_loaded_selection_on_test(
     checkpoint_path: Path,
+    model: Any,
+    metadata: Mapping[str, Any],
+    checkpoint_sha256: str,
     test_rows: Sequence[CapturableDatasetRow],
     test_tensors: Any,
 ) -> Mapping[str, Any]:
-    model, metadata, checkpoint_sha256 = _load_selection_checkpoint(
-        checkpoint_path.resolve()
-    )
     source_game_ids = set(metadata["sourceGameIds"])
     overlap = sorted(
         {
@@ -447,6 +448,20 @@ def _evaluate_selection_on_test(
     }
 
 
+def _load_bound_selection_checkpoint(
+    checkpoint_path: Path,
+    expected_sha256: str,
+) -> tuple[Path, Any, Mapping[str, Any], str]:
+    model, metadata, measured_sha256 = _load_selection_checkpoint(
+        checkpoint_path.resolve()
+    )
+    if measured_sha256 != expected_sha256:
+        raise CapturableDatasetError(
+            f"{checkpoint_path.name} changed after comparison authentication"
+        )
+    return checkpoint_path, model, metadata, measured_sha256
+
+
 def _test_performance_order(result: Mapping[str, Any]) -> tuple[float, ...]:
     metrics = result["metrics"]["hybrid"]
     return (
@@ -454,56 +469,6 @@ def _test_performance_order(result: Mapping[str, Any]) -> tuple[float, ...]:
         float(metrics["game_normalized_top_3_accuracy"]),
         -float(metrics["game_normalized_negative_log_likelihood"]),
     )
-
-
-def _paired_reliability_checks(
-    control: Mapping[str, Any],
-    treatment: Mapping[str, Any],
-    primary_confirmed: bool,
-) -> Mapping[str, bool]:
-    control_hybrid = control["metrics"]["hybrid"]
-    treatment_hybrid = treatment["metrics"]["hybrid"]
-    control_horizons = control_hybrid["accuracy_after_moves"]
-    treatment_horizons = treatment_hybrid["accuracy_after_moves"]
-    return {
-        "primaryRankingConfirmed": primary_confirmed,
-        "top1NonRegression": (
-            treatment_hybrid["game_normalized_top_1_accuracy"]
-            >= control_hybrid["game_normalized_top_1_accuracy"]
-        ),
-        "top3NonRegression": (
-            treatment_hybrid["game_normalized_top_3_accuracy"]
-            >= control_hybrid["game_normalized_top_3_accuracy"]
-        ),
-        "negativeLogLikelihoodNonRegression": (
-            treatment_hybrid[
-                "game_normalized_negative_log_likelihood"
-            ]
-            <= control_hybrid[
-                "game_normalized_negative_log_likelihood"
-            ]
-        ),
-        "brierNonRegression": (
-            treatment_hybrid["game_normalized_brier_score"]
-            <= control_hybrid["game_normalized_brier_score"]
-        ),
-        "calibrationNonRegression": (
-            treatment_hybrid["expected_calibration_error"]
-            <= control_hybrid["expected_calibration_error"]
-        ),
-        "allMoveHorizonsNonRegression": all(
-            treatment_horizons[horizon] >= control_accuracy
-            for horizon, control_accuracy in control_horizons.items()
-        ),
-        "triggerAccuracyNonRegression": (
-            treatment["metrics"]["trigger"]["accuracy"]
-            >= control["metrics"]["trigger"]["accuracy"]
-        ),
-        "forcedAccuracyNonRegression": (
-            treatment["metrics"]["forced"]["accuracy"]
-            >= control["metrics"]["forced"]["accuracy"]
-        ),
-    }
 
 
 def run_paired_sealed_evaluation(
@@ -524,8 +489,10 @@ def run_paired_sealed_evaluation(
     comparison, comparison_sha256 = load_treatment_comparison(
         comparison_path
     )
-    test_rows, test_sha256 = _load_stable_capturable_dataset(test_path)
-    test_tensors = tensorize(test_rows)
+    if comparison["releaseDecision"] != "promote-treatment":
+        raise CapturableDatasetError(
+            "validation comparison did not authorize sealed test"
+        )
     root = comparison_path.resolve().parent
 
     def checkpoint_path(candidate: Mapping[str, Any]) -> Path:
@@ -535,22 +502,32 @@ def run_paired_sealed_evaluation(
             / str(candidate["checkpointFile"])
         )
 
-    control = _evaluate_selection_on_test(
+    control_loaded = _load_bound_selection_checkpoint(
         checkpoint_path(comparison["control"]),
+        str(comparison["control"]["checkpointSha256"]),
+    )
+    treatment_loaded = _load_bound_selection_checkpoint(
+        checkpoint_path(comparison["bestTreatment"]),
+        str(comparison["bestTreatment"]["checkpointSha256"]),
+    )
+    test_rows, test_sha256 = _load_stable_capturable_dataset(test_path)
+    test_tensors = tensorize(test_rows)
+    control = _evaluate_loaded_selection_on_test(
+        *control_loaded,
         test_rows,
         test_tensors,
     )
-    treatment = _evaluate_selection_on_test(
-        checkpoint_path(comparison["bestTreatment"]),
+    treatment = _evaluate_loaded_selection_on_test(
+        *treatment_loaded,
         test_rows,
         test_tensors,
     )
     control_order = _test_performance_order(control)
     treatment_order = _test_performance_order(treatment)
     confirmed = treatment_order > control_order
-    reliability_checks = _paired_reliability_checks(
-        control,
-        treatment,
+    reliability_checks = validation_reliability_checks(
+        control["metrics"],
+        treatment["metrics"],
         confirmed,
     )
     reliable = all(reliability_checks.values())
