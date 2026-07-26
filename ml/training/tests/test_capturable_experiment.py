@@ -43,6 +43,9 @@ class CapturableExperimentTests(unittest.TestCase):
                 selection,
                 config,
             )
+            self.assertIn("validationGameNormalizedTop1", selected)
+            self.assertIn("validationMoveWeightedTop1", selected)
+            self.assertNotIn("validationHybridTop1", selected)
             alternate_selection = root / "selection-alternate"
             run_selection(
                 (train,),
@@ -76,6 +79,8 @@ class CapturableExperimentTests(unittest.TestCase):
                 chosen["selectedDirectory"],
                 {"selection", "selection-alternate"},
             )
+            self.assertIn("validationGameNormalizedTop1", chosen)
+            self.assertNotIn("validationHybridTop1", chosen)
             selection_report = json.loads(
                 (selection / "selection.json").read_text("utf-8")
             )

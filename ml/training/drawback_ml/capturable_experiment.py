@@ -171,10 +171,16 @@ def run_selection(
         "selectedEpoch": report["selectedEpoch"],
         "selectedFusionAlpha": report["selectedFusionAlpha"],
         "selectedPriorSmoothing": report["selectedPriorSmoothing"],
-        "validationHybridTop1": report["validation"]["hybrid"][
+        "validationGameNormalizedTop1": report["validation"]["hybrid"][
+            "game_normalized_top_1_accuracy"
+        ],
+        "validationGameNormalizedTop3": report["validation"]["hybrid"][
+            "game_normalized_top_3_accuracy"
+        ],
+        "validationMoveWeightedTop1": report["validation"]["hybrid"][
             "top_1_accuracy"
         ],
-        "validationHybridTop3": report["validation"]["hybrid"][
+        "validationMoveWeightedTop3": report["validation"]["hybrid"][
             "top_3_accuracy"
         ],
     }

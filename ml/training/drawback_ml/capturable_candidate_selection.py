@@ -256,10 +256,10 @@ def run_candidate_selection(
         "artifactSha256": hashlib.sha256(payload).hexdigest(),
         "selectedDirectory": selected["selectionDirectory"],
         "selectedCheckpointSha256": selected["checkpointSha256"],
-        "validationHybridTop1": selected[
+        "validationGameNormalizedTop1": selected[
             "validationGameNormalizedTop1"
         ],
-        "validationHybridTop3": selected[
+        "validationGameNormalizedTop3": selected[
             "validationGameNormalizedTop3"
         ],
     }
