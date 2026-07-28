@@ -1,0 +1,172 @@
+# Capturable Opportunity Validation Protocol
+
+Status: preregistered workflow contract, version 2.
+
+This protocol governs the schema-9 opportunity ablation only. It preserves
+the three model seeds, training configuration, two public validation stages,
+and one sealed-test access. It does not authorize a release by itself.
+
+## Frozen experiment
+
+- Domain: `capturable25-schema9-opportunity-v1`
+- Model seeds: `3685459371`, `480184104`, `3192956725`
+- Training: 8 epochs, batch size 256, hidden dimension 128, trigger-row
+  multiplier 1.0
+- Seed stream order: `label`, `gameplay`, `parameters`
+- Train roots: `1261462769`, `242269024`, `1837697911`
+- Validation-A roots: `2069246597`, `1391196133`, `2739675947`
+- Validation-B roots: `3786384219`, `3547865132`, `2689552677`
+- Sealed-test roots: `2033321041`, `1354035545`, `4189758462`
+- Validation-A, validation-B, and test each contain exactly 2,500 converted
+  games.
+
+The train roots were derived with the same frozen rule as every other split:
+the first four bytes of
+`SHA-256(capturable25-schema9-opportunity-v1/<split>/<stream>)`, interpreted
+as an unsigned big-endian integer. The corpus-ledger split name `test` maps
+to the workflow domain token `sealed-test`.
+
+## Required corpus ledger
+
+Every command requires both an explicit corpus-ledger artifact and its
+caller-authenticated file SHA-256. A digest string without the artifact is
+not sufficient.
+
+The accepted ledger is canonical
+`drawbackguesser-schema9-corpus-ledger` version 1 with:
+
+- a valid self-hash over the canonical payload excluding `contentSha256`;
+- exact top-level and nested fields, with unknown fields rejected;
+- the exact schema-9 opportunity rule IDs, fields, shape, and authority;
+- the exact schedule authority, seed-stream order, and roots above;
+- canonical train, validation-A, validation-B, and test ordering;
+- exact enumerable source and converted game-ID and simulation-seed sets,
+  plus matching canonical set hashes;
+- exact converted dataset SHA-256, byte, row, and game counts;
+- authenticated launch and completion receipt identities;
+- exact per-label game counts for both colors, including zero-ply games;
+- source/converted accounting in which converted games equal source games
+  minus zero-ply games;
+- pairwise game-ID and simulation-seed disjointness across all four source
+  splits, with independently recomputed partition commitments; and
+- full Guesser, converter, and producer commit identities.
+
+The Python workflow accepts `producerConverterPolicy: exact/v1` only and
+requires every producer commit to equal the converter commit. The ledger
+producer also supports `converter-ancestor/v1`, but this workflow rejects
+that policy because it does not receive an independently authenticated
+Engine repository with which to replay ancestry. Adding that support
+requires an explicit versioned protocol change; it must never be inferred
+from the ledger's assertion alone.
+
+Stage A binds the authenticated train and validation-A ledger identities to
+the three selection comparisons. Stage B and the sealed test additionally
+recompute the loaded dataset's exact game-ID and simulation-seed sets and
+compare them with the ledger. A dataset using a claimed frozen root but
+containing another seed, including seed 7, is rejected.
+
+## Stage transitions
+
+Stage A authenticates exactly three same-seed control/treatment comparisons,
+one for each frozen model seed. At least two pairs must be eligible and
+promote the treatment. Aggregate gates require:
+
+- positive mean Top-1;
+- non-regressing Top-3 and Top-5;
+- non-regressing negative log likelihood, Brier score, calibration, and all
+  move horizons; and
+- for both White and Black independently, Top-1 at least 0, Top-3 at least
+  0, and negative-log-likelihood delta at most 0.
+
+The selected pair is the lower median of eligible promoted pairs by Top-1
+delta. Ties use lower negative-log-likelihood delta and then lower model
+seed.
+
+Stage B reauthenticates Stage A, the ledger, the frozen checkpoints, and the
+validation-B bytes. Only the exact authorization
+`sealed-test-authorized` permits sealed-test access. A blocked Stage B is
+also rejected when loading an existing sealed report.
+
+## One sealed-test access
+
+The consumption marker is a create-only durable artifact named:
+
+`sealed-test-consumption-<authenticated-stage-b-sha256>.json`
+
+Its location and name are independent of the requested final report name.
+Its content binds the authenticated Stage-B SHA-256, exact authorization,
+ledger, protocol, and frozen pair. The marker is published before the test
+path is resolved, opened, hashed, or inspected. Publication races are
+resolved by create-only filesystem semantics.
+
+Once marker publication succeeds, access is consumed even if inference or
+final-report publication fails. Changing `report-one.json` to
+`report-two.json`, or retrying under another report name after a failure,
+cannot create another marker and cannot reopen the test.
+
+The direct-sibling workflow directory is the trusted local consumption
+registry. The one-access guarantee assumes that this registry is not copied,
+deleted, or replaced and that all evaluators use the same filesystem. A
+cross-host or adversarial-copy guarantee requires an external append-only
+registry keyed by Stage-B SHA-256; this local workflow does not claim that
+stronger distributed guarantee.
+
+## Final report authentication
+
+`verify-sealed-test` requires `--report-sha256`. The value must come from the
+create operation's `artifactSha256` result or another caller-controlled
+receipt. Verification compares this digest before trusting or recomputing
+the report's metrics. Rewriting control/treatment metrics and all derived
+deltas into a new internally consistent report therefore fails against the
+original caller-authenticated digest.
+
+The verifier still replays the Stage-B, marker, frozen-pair, input-identity,
+metric, reliability, and decision contracts. The caller digest is an
+additional outer integrity anchor, not a replacement for semantic checks.
+
+## Command shape
+
+All paths shown below must name explicit files. The ledger, workflow
+artifacts, and comparisons are direct siblings.
+
+```text
+python -m drawback_ml.capturable_opportunity_workflow stage-a \
+  --comparison pair-1.json --comparison pair-2.json --comparison pair-3.json \
+  --corpus-ledger schema9-corpus-ledger.json \
+  --corpus-ledger-sha256 <ledger-sha256> \
+  --output stage-a.json
+
+python -m drawback_ml.capturable_opportunity_workflow stage-b \
+  --stage-a stage-a.json --validation-b validation-b.ndjson \
+  --corpus-ledger schema9-corpus-ledger.json \
+  --corpus-ledger-sha256 <ledger-sha256> \
+  --output stage-b.json
+
+python -m drawback_ml.capturable_opportunity_workflow sealed-test \
+  --stage-b stage-b.json --validation-b validation-b.ndjson \
+  --test sealed-test.ndjson \
+  --corpus-ledger schema9-corpus-ledger.json \
+  --corpus-ledger-sha256 <ledger-sha256> \
+  --output sealed-test-report.json
+
+python -m drawback_ml.capturable_opportunity_workflow verify-sealed-test \
+  --report sealed-test-report.json --report-sha256 <report-sha256> \
+  --stage-b stage-b.json --validation-b validation-b.ndjson \
+  --corpus-ledger schema9-corpus-ledger.json \
+  --corpus-ledger-sha256 <ledger-sha256>
+```
+
+CLI JSON emits basenames only. Published artifacts recursively reject
+absolute Windows paths, absolute POSIX paths, and directory-bearing Windows
+or POSIX reference fields. Windows alternate-data-stream syntax, control
+characters, trailing dots/spaces, and reserved device names are also
+rejected. This applies on creation and every load/verify boundary.
+
+## Compatibility
+
+Workflow version-1 Stage-A, Stage-B, sealed-test, and consumption artifacts
+are intentionally incompatible with version 2. The ledger path is now
+mandatory, sealed-report verification now requires the caller's final
+report SHA-256, the consumption-marker name is Stage-B keyed, and bound
+dataset identities include schedule and set commitments. There is no
+silent legacy fallback.
