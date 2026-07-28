@@ -119,14 +119,17 @@ pnpm --filter @drawbackguesser/dataset-cli start -- \
   --require-evaluator none
 ```
 
-Capturable rows use symbolic feature schema 8 and the Engine's 25-rule audited
-authority catalog. They include the complete public position snapshot needed
-for one-reply king-passant, but secret IDs, parameters, rule state, legal
-masks, trigger flags, and results remain label-only fields.
+New capturable rows use symbolic feature schema 9 and the Engine's frozen
+25-rule audited authority catalog. They include the complete public position
+snapshot needed for one-reply king-passant plus a public, exact
+`25 rules x 4 fields` opportunity tensor. Secret IDs, parameters, rule state,
+legal masks, trigger flags, and results remain label-only fields. The feature
+chronology and leakage boundary are defined in
+[`docs/architecture/rule-opportunity-features.md`](docs/architecture/rule-opportunity-features.md).
 
-Historical 10-label schema-7 corpora and checkpoints remain research
-artifacts; they are deliberately incompatible with schema 8 and cannot be
-silently loaded as 25-label data.
+Historical 10-label schema-7 corpora and 25-label schema-8 corpora remain
+frozen research artifacts. Legacy and opportunity-aware loaders are explicit;
+one schema cannot be silently interpreted as another.
 
 The first 25-label experiment uses a two-stage selection/sealed-test boundary
 defined in
@@ -134,6 +137,11 @@ defined in
 Training and validation publish a frozen checkpoint without accepting a test
 path; the separate sealed evaluator rejects overlapping games and writes one
 authenticated, no-clobber report.
+
+The schema-9 opportunity residual is evaluated as a matched, same-seed
+`public-exact` versus `zero-ablation` experiment on newly generated data. Its
+preregistered selection and promotion gates are defined in
+[`docs/research/capturable-25-opportunity-ablation-protocol.md`](docs/research/capturable-25-opportunity-ablation-protocol.md).
 
 The input and output contain hidden labels and must remain private. The
 example deliberately writes outside the repository; do not place private

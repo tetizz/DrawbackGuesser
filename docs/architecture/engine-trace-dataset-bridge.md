@@ -42,10 +42,17 @@ must not change the derived public features. Tests enforce this invariant.
 The converter also fails if exact symbolic legality has eliminated the trace's
 claimed true drawback; a learned model can never override that contradiction.
 
-Capturable schema 8 uses a separate 25-rule audited vocabulary. Triple Play
-has exact bishop and knight parameter particles. The other 24 current
-authority rules are parameterless. Unsupported rules are absent rather than
-represented by fake unrestricted behavior.
+Capturable schemas 8 and 9 use a separate frozen 25-rule audited vocabulary.
+Triple Play has exact bishop and knight parameter particles. The other 24
+current authority rules are parameterless. Unsupported rules are absent rather
+than represented by fake unrestricted behavior.
+
+Schema 9 adds a public rule-opportunity tensor. It is aggregated from the
+active color's pre-observation live hypotheses and contains conditional known
+mass, allowed-move fraction, trigger mass, and forced mass for every rule.
+The observed move is processed exactly once. Post-observation symbolic
+probabilities retain hard-elimination authority. See
+`rule-opportunity-features.md` for the closed contract and leakage boundary.
 
 Trace V2 does not carry the evaluator fact needed to recompute an
 evaluator-backed rule's legal mask at the final post-move turn. The bridge
@@ -82,8 +89,9 @@ authenticated UCI sidecar.
 This bridge establishes the dataset producer and its public/private boundary.
 It does not turn the historical schema-6 corpus protocol into a new release.
 Schema 6 and the ten-label capturable schema 7 remain reproducible legacy
-research data. Capturable schema 8 is the current additive training schema,
-not a promoted model release. A schema-8 release
+research data. Capturable schema 8 remains a frozen legacy 25-label training
+schema. Schema 9 is the additive opportunity-aware research schema, not a
+promoted model release. A schema-9 release
 manifest must separately bind the exact Engine trace bytes, Engine/catalog
 revision, bridge artifact and source revision, derived dataset bytes, split
 ledger, and evaluator identity before any trained model may be promoted.

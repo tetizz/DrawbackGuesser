@@ -84,3 +84,39 @@ invalid artifacts for audit only:
   `a02adb8e5bb94808fdadeb80473212cebdedb644e7b364f75506e9da7fccf0ea`;
 - invalid checkpoint SHA-256:
   `24872b343c1bb362664e6dc3a91254a9bd09c09d6fa67d105e4c0322f1ed1af2`.
+
+## Corrected validation result
+
+The corrected run completed with the declared
+`global-source-mean-player-game/v1` objective. It selected epoch 2 with alpha
+`2.0` and smoothing `0.0`.
+
+| Metric | Frozen control | Weighted treatment | Change |
+| --- | ---: | ---: | ---: |
+| Top-1 | 31.9432% | 32.6027% | +0.6594 percentage points |
+| Top-3 | 52.3559% | 52.5830% | +0.2270 percentage points |
+| Top-5 | 64.2221% | 63.8832% | -0.3389 percentage points |
+| NLL | 3.153120 | 3.154055 | +0.000936 |
+| Brier score | 0.910303 | 0.904664 | -0.005638 |
+| ECE | 0.260714 | 0.250483 | -0.010230 |
+| Top-1 after 5 moves | 11.76% | 13.20% | +1.44 percentage points |
+| Top-1 after 10 moves | 26.32% | 27.12% | +0.80 percentage points |
+| Top-1 after 15 moves | 36.24% | 37.28% | +1.04 percentage points |
+| Top-1 after 20 moves | 44.96% | 44.88% | -0.08 percentage points |
+
+Exact hard-elimination authority passed: the maximum probability assigned to
+an eliminated hypothesis was zero, with zero violations.
+
+The treatment **fails the preregistered reliability gate** because Top-5,
+NLL, and the 20-move horizon regressed. It is not eligible for promotion, does
+not replace the retained control, and does not change the reported fresh
+held-out result. Opportunity-aware features and source weighting must be
+retested on newly generated, independent validation folds before any sealed
+evaluation.
+
+Audit identities:
+
+- corrected report SHA-256:
+  `af7e999de6e7ea03c181a4b3a1e011b1eae76467342936d9b28f1e444e50f95a`;
+- corrected checkpoint SHA-256:
+  `6822996b6af888a41bd518c64335ec251022038cab324f27cd81e0bb63fa3318`.

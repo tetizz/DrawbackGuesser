@@ -1,8 +1,9 @@
-"""Strict schema-8 records for capturable-king self-play.
+"""Strict schema-8 and schema-9 records for capturable-king self-play.
 
 This module is deliberately additive. The historical schema-6 release
-pipeline remains frozen, while capturable training uses its own exact public
-feature vocabulary and never passes labels or provenance to feature builders.
+pipeline and schema-8 capturable loader remain frozen. Schema 9 adds an
+explicit public opportunity tensor without passing labels or provenance to
+feature builders.
 """
 
 from __future__ import annotations
@@ -157,7 +158,7 @@ _SAN_PIECE = {
 
 
 class CapturableDatasetError(ValueError):
-    """Raised when schema-8 data fails the public/private contract."""
+    """Raised when capturable data fails its public/private contract."""
 
 
 @dataclass(frozen=True)
