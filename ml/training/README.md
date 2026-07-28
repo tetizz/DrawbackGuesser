@@ -213,6 +213,17 @@ weight or using the trigger label at inference time. Public behavior features
 cover current mover/capture/castling facts, authority-move composition, per-side
 piece and tactical history, recent piece types, and repeated-piece streaks.
 
+When multiple train-only corpora serve different purposes, selection also
+accepts one positive `--train-source-weight` for every `--train`, in the same
+order. Relative weights scale each player-game's total loss mass after the
+within-game trigger weighting and are normalized to a player-game-weighted mean
+of one so a common rescaling cannot change optimization. Explicit weights and
+the versioned weighting objective are stored with each source's path-independent
+hash, row count, and game count in both the report and checkpoint identity.
+Omitting all source weights preserves the historical equal-player-game
+behavior; partial, non-finite, non-positive, or unrepresentable relative weight
+lists fail before training.
+
 The selection output directory must not already contain `model.pt` or
 `selection.json`. Both files bind the input hashes and record
 `freshStart: true`; all selection and sealed-test artifacts belong outside the

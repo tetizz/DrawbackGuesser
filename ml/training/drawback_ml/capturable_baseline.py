@@ -32,6 +32,7 @@ from .capturable_records import (
 )
 CAPTURABLE_BASELINE_FORMAT = "drawbackguesser-capturable-baseline"
 CAPTURABLE_BASELINE_VERSION = 2
+SOURCE_WEIGHTING_OBJECTIVE = "global-source-mean-player-game/v1"
 _PRIOR_FLOOR = 1e-12
 
 
@@ -146,6 +147,7 @@ class TensorRows:
     forced: Any
     triple_play_parameters: Any
     player_game_weights: Any
+    player_game_normalization_weights: Any
     symbolic_priors: Any
     symbolic_eliminated: Any
 
@@ -193,6 +195,7 @@ def create_capturable_model(hidden_dimension: int) -> Any:
 def tensorize(
     rows: Sequence[CapturableDatasetRow],
     trigger_row_multiplier: float = 1.0,
+    game_source_weights: Mapping[str, float] | None = None,
 ) -> TensorRows:
     try:
         import torch
@@ -211,6 +214,10 @@ def tensorize(
         raise ValueError(
             "trigger_row_multiplier must be finite from one to 100"
         )
+    source_weights = _validated_game_source_weights(
+        rows,
+        game_source_weights,
+    )
     player_game_weight_totals: dict[tuple[str, str], float] = {}
     for row in rows:
         key = (row.evaluation.game_id, row.features.player_color)
@@ -233,6 +240,72 @@ def tensorize(
         prior, eliminated = active_symbolic(row.features)
         symbolic_priors.append(list(prior))
         symbolic_eliminated.append(list(eliminated))
+    base_player_game_weights = [
+        (
+            float(trigger_row_multiplier)
+            if row.labels.rule_triggered
+            else 1.0
+        )
+        / player_game_weight_totals[
+            (row.evaluation.game_id, row.features.player_color)
+        ]
+        for row in rows
+    ]
+    effective_player_game_weights = list(base_player_game_weights)
+    if game_source_weights is not None:
+        maximum_source_weight = max(source_weights.values())
+        scaled_source_weights = {
+            game_id: weight / maximum_source_weight
+            for game_id, weight in source_weights.items()
+        }
+        if any(weight == 0.0 for weight in scaled_source_weights.values()):
+            raise ValueError(
+                "game_source_weights relative ratios exceed the supported "
+                "training range"
+            )
+        mean_scaled_source_weight = (
+            math.fsum(
+                base_weight
+                * scaled_source_weights[row.evaluation.game_id]
+                for row, base_weight in zip(
+                    rows,
+                    base_player_game_weights,
+                    strict=True,
+                )
+            )
+            / math.fsum(base_player_game_weights)
+        )
+        effective_player_game_weights = [
+            base_weight
+            * (
+                scaled_source_weights[row.evaluation.game_id]
+                / mean_scaled_source_weight
+            )
+            for row, base_weight in zip(
+                rows,
+                base_player_game_weights,
+                strict=True,
+            )
+        ]
+    player_game_weights = torch.tensor(
+        effective_player_game_weights,
+        dtype=torch.float32,
+    )
+    if not bool(torch.all(torch.isfinite(player_game_weights))) or bool(
+        torch.any(player_game_weights <= 0.0)
+    ):
+        raise ValueError(
+            "game_source_weights relative ratios exceed the supported "
+            "float32 training range"
+        )
+    player_game_normalization_weights = (
+        player_game_weights
+        if game_source_weights is None
+        else torch.tensor(
+            base_player_game_weights,
+            dtype=torch.float32,
+        )
+    )
     return TensorRows(
         inputs=torch.tensor(
             [capturable_feature_vector(row.features) for row in rows],
@@ -258,19 +331,9 @@ def tensorize(
             parameter_targets,
             dtype=torch.long,
         ),
-        player_game_weights=torch.tensor(
-            [
-                (
-                    float(trigger_row_multiplier)
-                    if row.labels.rule_triggered
-                    else 1.0
-                )
-                / player_game_weight_totals[
-                    (row.evaluation.game_id, row.features.player_color)
-                ]
-                for row in rows
-            ],
-            dtype=torch.float32,
+        player_game_weights=player_game_weights,
+        player_game_normalization_weights=(
+            player_game_normalization_weights
         ),
         symbolic_priors=torch.tensor(
             symbolic_priors,
@@ -281,6 +344,40 @@ def tensorize(
             dtype=torch.bool,
         ),
     )
+
+
+def _validated_game_source_weights(
+    rows: Sequence[CapturableDatasetRow],
+    weights: Mapping[str, float] | None,
+) -> Mapping[str, float]:
+    game_ids = {row.evaluation.game_id for row in rows}
+    if weights is None:
+        return MappingProxyType({game_id: 1.0 for game_id in game_ids})
+    if set(weights) != game_ids:
+        raise ValueError(
+            "game_source_weights must contain every training game exactly once"
+        )
+    checked: dict[str, float] = {}
+    for game_id, value in weights.items():
+        checked[game_id] = _checked_positive_weight(
+            value,
+            "game_source_weights",
+        )
+    return MappingProxyType(checked)
+
+
+def _checked_positive_weight(value: object, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field_name} must be finite and positive")
+    try:
+        checked = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError(
+            f"{field_name} must be finite and positive"
+        ) from error
+    if not math.isfinite(checked) or checked <= 0.0:
+        raise ValueError(f"{field_name} must be finite and positive")
+    return checked
 
 
 def _selected_drawback_logits(outputs: Mapping[str, Any], colors: Any) -> Any:
@@ -322,6 +419,7 @@ def _batch_loss(
                     reduction="none",
                 ),
                 batch.player_game_weights,
+                batch.player_game_normalization_weights,
             )
         )
     classification = torch.stack(classification_terms).mean()
@@ -332,6 +430,7 @@ def _batch_loss(
             reduction="none",
         ),
         batch.player_game_weights,
+        batch.player_game_normalization_weights,
     )
     forced = _weighted_mean(
         functional.binary_cross_entropy_with_logits(
@@ -340,6 +439,7 @@ def _batch_loss(
             reduction="none",
         ),
         batch.player_game_weights,
+        batch.player_game_normalization_weights,
     )
     parameter_mask = batch.triple_play_parameters >= 0
     parameter = (
@@ -350,6 +450,7 @@ def _batch_loss(
                 reduction="none",
             ),
             batch.player_game_weights[parameter_mask],
+            batch.player_game_normalization_weights[parameter_mask],
         )
         if bool(torch.any(parameter_mask))
         else classification.new_zeros(())
@@ -362,10 +463,16 @@ def _batch_loss(
     )
 
 
-def _weighted_mean(values: Any, weights: Any) -> Any:
-    total = weights.sum()
+def _weighted_mean(
+    values: Any,
+    weights: Any,
+    normalization_weights: Any,
+) -> Any:
+    total = normalization_weights.sum()
     if float(total.detach()) <= 0.0:
-        raise RuntimeError("player-game batch weights must sum to a positive value")
+        raise RuntimeError(
+            "player-game normalization weights must sum to a positive value"
+        )
     return (values * weights).sum() / total
 
 
@@ -403,6 +510,9 @@ def _slice_tensors(batch: TensorRows, indices: Any) -> TensorRows:
         forced=batch.forced[indices],
         triple_play_parameters=batch.triple_play_parameters[indices],
         player_game_weights=batch.player_game_weights[indices],
+        player_game_normalization_weights=(
+            batch.player_game_normalization_weights[indices]
+        ),
         symbolic_priors=batch.symbolic_priors[indices],
         symbolic_eliminated=batch.symbolic_eliminated[indices],
     )
@@ -733,6 +843,8 @@ def train_capturable_baseline(
     validation_rows: Sequence[CapturableDatasetRow],
     test_rows: Sequence[CapturableDatasetRow] | None,
     config: CapturableTrainingConfig,
+    *,
+    train_game_source_weights: Mapping[str, float] | None = None,
 ) -> tuple[Any, Mapping[str, Any]]:
     """Train from random initialization and select epochs on validation only."""
 
@@ -758,6 +870,7 @@ def train_capturable_baseline(
     train_tensors = tensorize(
         train_rows,
         config.trigger_row_multiplier,
+        train_game_source_weights,
     )
     validation_tensors = tensorize(validation_rows)
     test_tensors = None if test_rows is None else tensorize(test_rows)
@@ -994,14 +1107,18 @@ def run_training(
     test_path: Path,
     output_directory: Path,
     config: CapturableTrainingConfig,
+    train_source_weights: Sequence[float] | None = None,
 ) -> Mapping[str, Any]:
-    output_directory.mkdir(parents=True, exist_ok=True)
     report_path = output_directory / "evaluation.json"
     checkpoint_path = output_directory / "model.pt"
     if report_path.exists() or checkpoint_path.exists():
         raise FileExistsError("capturable training outputs already exist")
     if not train_paths:
         raise ValueError("at least one train dataset is required")
+    checked_source_weights = _checked_train_source_weights(
+        train_paths,
+        train_source_weights,
+    )
     train_sources = [
         load_capturable_dataset(path) for path in train_paths
     ]
@@ -1017,11 +1134,25 @@ def run_training(
         for source in train_sources
         for row in source
     )
+    game_source_weights = (
+        None
+        if checked_source_weights is None
+        else {
+            row.evaluation.game_id: weight
+            for source, weight in zip(
+                train_sources,
+                checked_source_weights,
+                strict=True,
+            )
+            for row in source
+        }
+    )
     model, measured = train_capturable_baseline(
         train_rows,
         validation_rows,
         test_rows,
         config,
+        train_game_source_weights=game_source_weights,
     )
     input_identity = {
         "train": {
@@ -1033,15 +1164,31 @@ def run_training(
                     "games": len(
                         {row.evaluation.game_id for row in rows}
                     ),
+                    **(
+                        {}
+                        if checked_source_weights is None
+                        else {"weight": checked_source_weights[index]}
+                    ),
                 }
-                for path, rows in zip(
-                    train_paths,
-                    train_sources,
-                    strict=True,
+                for index, (path, rows) in enumerate(
+                    zip(
+                        train_paths,
+                        train_sources,
+                        strict=True,
+                    )
                 )
             ],
             "rows": len(train_rows),
             "games": len({row.evaluation.game_id for row in train_rows}),
+            **(
+                {}
+                if checked_source_weights is None
+                else {
+                    "sourceWeightingObjective": (
+                        SOURCE_WEIGHTING_OBJECTIVE
+                    )
+                }
+            ),
         },
         "validation": {
             "path": validation_path.resolve().name,
@@ -1058,6 +1205,7 @@ def run_training(
             "games": len({row.evaluation.game_id for row in test_rows}),
         },
     }
+    output_directory.mkdir(parents=True, exist_ok=True)
     checkpoint_sha256 = _publish_checkpoint(
         checkpoint_path,
         model,
@@ -1096,6 +1244,24 @@ def run_training(
     }
 
 
+def _checked_train_source_weights(
+    train_paths: Sequence[Path],
+    weights: Sequence[float] | None,
+) -> tuple[float, ...] | None:
+    if weights is None:
+        return None
+    if len(weights) != len(train_paths):
+        raise ValueError(
+            "train_source_weights must contain one value per train dataset"
+        )
+    checked = []
+    for value in weights:
+        checked.append(
+            _checked_positive_weight(value, "train_source_weights")
+        )
+    return tuple(checked)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train a fresh capturable-king hybrid baseline."
@@ -1106,6 +1272,15 @@ def _parser() -> argparse.ArgumentParser:
         action="append",
         required=True,
         help="Repeat for each disjoint training dataset.",
+    )
+    parser.add_argument(
+        "--train-source-weight",
+        type=float,
+        action="append",
+        help=(
+            "Optional positive weight for each --train dataset, in the same "
+            "order. Supply one value per --train."
+        ),
     )
     parser.add_argument("--validation", type=Path, required=True)
     parser.add_argument("--test", type=Path, required=True)
@@ -1139,6 +1314,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         options.test,
         options.output,
         config,
+        options.train_source_weight,
     )
     print(json.dumps(result, allow_nan=False, sort_keys=True))
     return 0

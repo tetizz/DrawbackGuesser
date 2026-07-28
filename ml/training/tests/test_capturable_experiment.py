@@ -11,12 +11,20 @@ import _bootstrap  # noqa: F401
 from capturable_fixture import capturable_row
 from drawback_ml.capturable_baseline import (
     CapturableTrainingConfig,
+    SOURCE_WEIGHTING_OBJECTIVE,
+    _checked_train_source_weights,
+    _parser as _baseline_parser,
+    main as baseline_main,
+    run_training,
 )
 from drawback_ml.capturable_candidate_selection import (
     load_treatment_comparison,
 )
 from drawback_ml.capturable_experiment import (
     _load_bound_selection_checkpoint,
+    _load_selection_checkpoint,
+    _parser as _experiment_parser,
+    main as experiment_main,
     run_candidate_selection,
     run_paired_sealed_evaluation,
     run_sealed_evaluation,
@@ -472,6 +480,342 @@ class CapturableExperimentTests(unittest.TestCase):
                     overlap_output,
                 )
             self.assertFalse(overlap_output.exists())
+
+    def test_selection_authenticates_explicit_train_source_weights(self) -> None:
+        options = _experiment_parser().parse_args(
+            (
+                "select",
+                "--train",
+                "baseline.ndjson",
+                "--train-source-weight",
+                "1",
+                "--train",
+                "diagnostic.ndjson",
+                "--train-source-weight",
+                "0.1",
+                "--validation",
+                "validation.ndjson",
+                "--output",
+                "selection",
+            )
+        )
+        self.assertEqual(
+            options.train,
+            [Path("baseline.ndjson"), Path("diagnostic.ndjson")],
+        )
+        self.assertEqual(options.train_source_weight, [1.0, 0.1])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = self._write_split(root, "baseline")
+            diagnostic = self._write_split(root, "diagnostic")
+            validation = self._write_split(root, "validation")
+            test = self._write_split(root, "test")
+            output = root / "weighted-selection"
+            config = CapturableTrainingConfig(
+                seed=20260728,
+                epochs=1,
+                batch_size=2,
+                hidden_dimension=8,
+                torch_threads=1,
+            )
+
+            run_selection(
+                (baseline, diagnostic),
+                validation,
+                output,
+                config,
+                (1.0, 0.1),
+            )
+            report_path = output / "selection.json"
+            report = json.loads(report_path.read_text("utf-8"))
+
+            self.assertEqual(
+                [
+                    source["weight"]
+                    for source in report["inputs"]["train"]["sources"]
+                ],
+                [1.0, 0.1],
+            )
+            self.assertEqual(
+                report["inputs"]["train"]["sourceWeightingObjective"],
+                SOURCE_WEIGHTING_OBJECTIVE,
+            )
+
+            tampered = json.loads(json.dumps(report))
+            tampered["inputs"]["train"]["sources"][1]["weight"] = 1.0
+            tampered_path = output / "tampered-weight.json"
+            tampered_path.write_text(
+                json.dumps(
+                    tampered,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            with self.assertRaisesRegex(
+                CapturableDatasetError,
+                "checkpoint does not bind",
+            ):
+                run_candidate_selection(
+                    (tampered_path, report_path),
+                    root / "tampered-choice.json",
+                )
+
+            tampered_objective = json.loads(json.dumps(report))
+            tampered_objective["inputs"]["train"].pop(
+                "sourceWeightingObjective"
+            )
+            tampered_objective_path = output / "tampered-objective.json"
+            tampered_objective_path.write_text(
+                json.dumps(
+                    tampered_objective,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            with self.assertRaisesRegex(
+                CapturableDatasetError,
+                "checkpoint does not bind",
+            ):
+                run_candidate_selection(
+                    (tampered_objective_path, report_path),
+                    root / "tampered-objective-choice.json",
+                )
+
+            import torch
+
+            checkpoint_path = output / "model.pt"
+            checkpoint = torch.load(
+                checkpoint_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+            checkpoint["metadata"]["inputs"]["train"].pop(
+                "sourceWeightingObjective"
+            )
+            tampered_checkpoint_path = output / "tampered-objective.pt"
+            torch.save(checkpoint, tampered_checkpoint_path)
+            with self.assertRaisesRegex(
+                CapturableDatasetError,
+                "source weighting objective",
+            ):
+                _load_selection_checkpoint(tampered_checkpoint_path)
+
+            for weights in ((1.0,), (1.0, 0.0), (1.0, float("nan"))):
+                with self.subTest(weights=weights):
+                    invalid_output = (
+                        root / f"invalid-{len(weights)}-{str(weights[-1])}"
+                    )
+                    with self.assertRaises(ValueError):
+                        run_selection(
+                            (baseline, diagnostic),
+                            validation,
+                            invalid_output,
+                            config,
+                            weights,
+                        )
+                    self.assertFalse(invalid_output.exists())
+
+            oversized_output = root / "invalid-oversized"
+            with self.assertRaises(ValueError):
+                run_selection(
+                    (baseline, diagnostic),
+                    validation,
+                    oversized_output,
+                    config,
+                    (1.0, 10**10000),
+                )
+            self.assertFalse(oversized_output.exists())
+
+            extreme_selection_output = root / "invalid-relative-selection"
+            with self.assertRaisesRegex(ValueError, "relative ratios"):
+                run_selection(
+                    (baseline, diagnostic),
+                    validation,
+                    extreme_selection_output,
+                    config,
+                    (1e300, 1e-300),
+                )
+            self.assertFalse(extreme_selection_output.exists())
+
+            training_output = root / "invalid-training"
+            with self.assertRaises(ValueError):
+                run_training(
+                    (baseline, diagnostic),
+                    validation,
+                    test,
+                    training_output,
+                    config,
+                    (1.0,),
+                )
+            self.assertFalse(training_output.exists())
+
+            extreme_training_output = root / "invalid-relative-training"
+            with self.assertRaisesRegex(ValueError, "relative ratios"):
+                run_training(
+                    (baseline, diagnostic),
+                    validation,
+                    test,
+                    extreme_training_output,
+                    config,
+                    (1e300, 1e-300),
+                )
+            self.assertFalse(extreme_training_output.exists())
+
+    def test_source_weight_cli_pairing_contract(self) -> None:
+        common = (
+            "--train",
+            "baseline.ndjson",
+            "--train",
+            "diagnostic.ndjson",
+            "--train-source-weight",
+            "1",
+            "--train-source-weight",
+            "0.1",
+            "--validation",
+            "validation.ndjson",
+            "--output",
+            "output",
+        )
+        selection = _experiment_parser().parse_args(("select", *common))
+        training = _baseline_parser().parse_args(
+            (*common, "--test", "test.ndjson")
+        )
+
+        for options in (selection, training):
+            self.assertEqual(
+                options.train,
+                [Path("baseline.ndjson"), Path("diagnostic.ndjson")],
+            )
+            self.assertEqual(options.train_source_weight, [1.0, 0.1])
+
+        omitted = _experiment_parser().parse_args(
+            (
+                "select",
+                "--train",
+                "baseline.ndjson",
+                "--validation",
+                "validation.ndjson",
+                "--output",
+                "output",
+            )
+        )
+        self.assertIsNone(omitted.train_source_weight)
+        with self.assertRaisesRegex(ValueError, "one value per train"):
+            _checked_train_source_weights(
+                (Path("baseline.ndjson"), Path("diagnostic.ndjson")),
+                (1.0,),
+            )
+
+    def test_source_weight_cli_mains_forward_or_fail_closed(self) -> None:
+        train = (
+            "--train",
+            "baseline.ndjson",
+            "--train",
+            "diagnostic.ndjson",
+        )
+        cases = (
+            (
+                (
+                    "--train",
+                    "baseline.ndjson",
+                    "--train-source-weight",
+                    "1",
+                    "--train",
+                    "diagnostic.ndjson",
+                    "--train-source-weight",
+                    "0.1",
+                ),
+                [1.0, 0.1],
+            ),
+            (
+                (
+                    *train,
+                    "--train-source-weight",
+                    "1",
+                    "--train-source-weight",
+                    "0.1",
+                ),
+                [1.0, 0.1],
+            ),
+            (train, None),
+        )
+        for train_arguments, expected_weights in cases:
+            shared = (
+                *train_arguments,
+                "--validation",
+                "validation.ndjson",
+                "--output",
+                "output",
+            )
+            with (
+                self.subTest(entrypoint="selection", args=train_arguments),
+                patch(
+                    "drawback_ml.capturable_experiment.run_selection",
+                    return_value={},
+                ) as selection,
+                patch("builtins.print"),
+            ):
+                self.assertEqual(
+                    experiment_main(("select", *shared)),
+                    0,
+                )
+                self.assertEqual(
+                    selection.call_args.args[4],
+                    expected_weights,
+                )
+            with (
+                self.subTest(entrypoint="training", args=train_arguments),
+                patch(
+                    "drawback_ml.capturable_baseline.run_training",
+                    return_value={},
+                ) as training,
+                patch("builtins.print"),
+            ):
+                self.assertEqual(
+                    baseline_main((*shared, "--test", "test.ndjson")),
+                    0,
+                )
+                self.assertEqual(
+                    training.call_args.args[5],
+                    expected_weights,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            partial = (
+                *train,
+                "--train-source-weight",
+                "1",
+                "--validation",
+                str(root / "validation.ndjson"),
+                "--output",
+                str(root / "output"),
+            )
+            with patch(
+                "drawback_ml.capturable_experiment."
+                "_load_stable_capturable_dataset"
+            ) as selection_load:
+                with self.assertRaisesRegex(ValueError, "one value per train"):
+                    experiment_main(("select", *partial))
+                selection_load.assert_not_called()
+            with patch(
+                "drawback_ml.capturable_baseline.load_capturable_dataset"
+            ) as training_load:
+                with self.assertRaisesRegex(ValueError, "one value per train"):
+                    baseline_main(
+                        (*partial, "--test", str(root / "test.ndjson"))
+                    )
+                training_load.assert_not_called()
+            self.assertFalse((root / "output").exists())
 
     def test_treatment_comparison_allows_train_only_intervention(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -11,7 +11,10 @@ from typing import Any, Mapping, Sequence
 
 from .capturable_baseline import (
     CapturableTrainingConfig,
+    SOURCE_WEIGHTING_OBJECTIVE,
     _canonical_json,
+    _checked_positive_weight,
+    _checked_train_source_weights,
     _publish_bytes,
     _publish_checkpoint,
     _sha256_file,
@@ -52,6 +55,7 @@ def _capturable_source_identity(
     paths: Sequence[Path],
     sources: Sequence[Sequence[CapturableDatasetRow]],
     sha256s: Sequence[str],
+    weights: Sequence[float] | None = None,
 ) -> list[Mapping[str, Any]]:
     return [
         {
@@ -59,12 +63,15 @@ def _capturable_source_identity(
             "sha256": sha256,
             "rows": len(rows),
             "games": len({row.evaluation.game_id for row in rows}),
+            **({} if weights is None else {"weight": weights[index]}),
         }
-        for path, rows, sha256 in zip(
-            paths,
-            sources,
-            sha256s,
-            strict=True,
+        for index, (path, rows, sha256) in enumerate(
+            zip(
+                paths,
+                sources,
+                sha256s,
+                strict=True,
+            )
         )
     ]
 
@@ -74,16 +81,20 @@ def run_selection(
     validation_path: Path,
     output_directory: Path,
     config: CapturableTrainingConfig,
+    train_source_weights: Sequence[float] | None = None,
 ) -> Mapping[str, Any]:
     """Select and publish a model without opening any test dataset."""
 
-    output_directory.mkdir(parents=True, exist_ok=True)
     report_path = output_directory / "selection.json"
     checkpoint_path = output_directory / "model.pt"
     if report_path.exists() or checkpoint_path.exists():
         raise FileExistsError("capturable selection outputs already exist")
     if not train_paths:
         raise ValueError("at least one train dataset is required")
+    checked_source_weights = _checked_train_source_weights(
+        train_paths,
+        train_source_weights,
+    )
     loaded_train_sources = [
         _load_stable_capturable_dataset(path) for path in train_paths
     ]
@@ -98,11 +109,25 @@ def run_selection(
         for source in train_sources
         for row in source
     )
+    game_source_weights = (
+        None
+        if checked_source_weights is None
+        else {
+            row.evaluation.game_id: weight
+            for source, weight in zip(
+                train_sources,
+                checked_source_weights,
+                strict=True,
+            )
+            for row in source
+        }
+    )
     model, measured = train_capturable_baseline(
         train_rows,
         validation_rows,
         None,
         config,
+        train_game_source_weights=game_source_weights,
     )
     input_identity = {
         "train": {
@@ -110,9 +135,19 @@ def run_selection(
                 train_paths,
                 train_sources,
                 train_sha256s,
+                checked_source_weights,
             ),
             "rows": len(train_rows),
             "games": len({row.evaluation.game_id for row in train_rows}),
+            **(
+                {}
+                if checked_source_weights is None
+                else {
+                    "sourceWeightingObjective": (
+                        SOURCE_WEIGHTING_OBJECTIVE
+                    )
+                }
+            ),
         },
         "validation": {
             "path": validation_path.resolve().name,
@@ -130,6 +165,7 @@ def run_selection(
             for row in rows
         }
     )
+    output_directory.mkdir(parents=True, exist_ok=True)
     checkpoint_sha256 = _publish_checkpoint(
         checkpoint_path,
         model,
@@ -310,6 +346,7 @@ def _load_selection_checkpoint(
         raise CapturableDatasetError(
             "checkpoint inputs or validation metrics are invalid"
         )
+    _validate_source_weighting_identity(metadata["inputs"])
     model = create_capturable_model(config.hidden_dimension)
     try:
         model.load_state_dict(checkpoint.get("stateDict"), strict=True)
@@ -318,6 +355,49 @@ def _load_selection_checkpoint(
             "checkpoint tensors do not match the selected model"
         ) from error
     return model, metadata, digest.hexdigest()
+
+
+def _validate_source_weighting_identity(inputs: Mapping[str, Any]) -> None:
+    train = inputs.get("train")
+    if not isinstance(train, Mapping):
+        raise CapturableDatasetError(
+            "checkpoint training inputs are invalid"
+        )
+    sources = train.get("sources")
+    if not isinstance(sources, list) or not sources:
+        raise CapturableDatasetError(
+            "checkpoint training sources are invalid"
+        )
+    weight_presence = []
+    for source in sources:
+        if not isinstance(source, Mapping):
+            raise CapturableDatasetError(
+                "checkpoint training sources are invalid"
+            )
+        weight_presence.append("weight" in source)
+        if "weight" in source:
+            try:
+                _checked_positive_weight(
+                    source["weight"],
+                    "checkpoint source weight",
+                )
+            except ValueError as error:
+                raise CapturableDatasetError(
+                    "checkpoint source weight is invalid"
+                ) from error
+    objective = train.get("sourceWeightingObjective")
+    if any(weight_presence):
+        if (
+            not all(weight_presence)
+            or objective != SOURCE_WEIGHTING_OBJECTIVE
+        ):
+            raise CapturableDatasetError(
+                "checkpoint source weighting objective is invalid"
+            )
+    elif "sourceWeightingObjective" in train:
+        raise CapturableDatasetError(
+            "unweighted checkpoint declares a source weighting objective"
+        )
 
 
 def run_sealed_evaluation(
@@ -649,6 +729,15 @@ def _parser() -> argparse.ArgumentParser:
         required=True,
         help="Repeat for each disjoint training dataset.",
     )
+    select.add_argument(
+        "--train-source-weight",
+        type=float,
+        action="append",
+        help=(
+            "Optional positive weight for each --train dataset, in the same "
+            "order. Supply one value per --train."
+        ),
+    )
     select.add_argument("--validation", type=Path, required=True)
     select.add_argument("--output", type=Path, required=True)
     select.add_argument("--seed", type=int, default=0xC0DE_0701)
@@ -727,6 +816,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             options.validation,
             options.output,
             config,
+            options.train_source_weight,
         )
     elif options.command == "evaluate":
         result = run_sealed_evaluation(

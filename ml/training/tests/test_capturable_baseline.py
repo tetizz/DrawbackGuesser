@@ -9,6 +9,7 @@ from drawback_ml.capturable_baseline import (
     CapturableTrainingConfig,
     _hard_mask_fusion,
     _validation_selection_metrics,
+    _weighted_mean,
     create_capturable_model,
     evaluate_capturable,
     evaluate_capturable_posteriors,
@@ -81,6 +82,198 @@ class CapturableBaselineTests(unittest.TestCase):
 
         self.assertEqual(weights, [0.75, 0.25, 1.0])
         self.assertEqual(sum(weights[:2]), weights[2])
+
+    def test_source_weighting_scales_each_player_game_total(self) -> None:
+        rows = (
+            parse_capturable_dataset_row(
+                capturable_row(game_id="diagnostic")
+            ),
+            parse_capturable_dataset_row(
+                capturable_row(game_id="diagnostic")
+            ),
+            parse_capturable_dataset_row(
+                capturable_row(game_id="baseline", color="black")
+            ),
+        )
+
+        weights = tensorize(
+            rows,
+            game_source_weights={
+                "diagnostic": 0.1,
+                "baseline": 1.0,
+            },
+        ).player_game_weights.tolist()
+
+        diagnostic_total = sum(weights[:2])
+        baseline_total = weights[2]
+        self.assertAlmostEqual(weights[0], weights[1])
+        self.assertAlmostEqual(diagnostic_total, baseline_total * 0.1)
+        self.assertAlmostEqual(
+            (diagnostic_total + baseline_total) / 2.0,
+            1.0,
+        )
+
+    def test_source_weighting_rejects_incomplete_or_invalid_maps(self) -> None:
+        rows = (
+            parse_capturable_dataset_row(
+                capturable_row(game_id="baseline")
+            ),
+        )
+
+        for weights in (
+            {},
+            {"baseline": 0.0},
+            {"baseline": float("nan")},
+            {"baseline": 10**10000},
+            {"baseline": 1.0, "unknown": 1.0},
+        ):
+            with self.subTest(weights=weights):
+                with self.assertRaises(ValueError):
+                    tensorize(rows, game_source_weights=weights)
+
+    def test_source_weighting_survives_homogeneous_minibatches(self) -> None:
+        import torch
+
+        rows = (
+            parse_capturable_dataset_row(
+                capturable_row(game_id="diagnostic")
+            ),
+            parse_capturable_dataset_row(
+                capturable_row(game_id="diagnostic")
+            ),
+            parse_capturable_dataset_row(
+                capturable_row(game_id="baseline", color="black")
+            ),
+            parse_capturable_dataset_row(
+                capturable_row(game_id="baseline", color="black")
+            ),
+        )
+        weighted = tensorize(
+            rows,
+            game_source_weights={
+                "diagnostic": 0.1,
+                "baseline": 1.0,
+            },
+        )
+        diagnostic = torch.tensor([0, 1])
+        baseline = torch.tensor([2, 3])
+        one = torch.ones(2)
+        diagnostic_loss = _weighted_mean(
+            one,
+            weighted.player_game_weights[diagnostic],
+            weighted.player_game_normalization_weights[diagnostic],
+        )
+        baseline_loss = _weighted_mean(
+            one,
+            weighted.player_game_weights[baseline],
+            weighted.player_game_normalization_weights[baseline],
+        )
+        singleton_diagnostic_loss = _weighted_mean(
+            one[:1],
+            weighted.player_game_weights[:1],
+            weighted.player_game_normalization_weights[:1],
+        )
+        singleton_baseline_loss = _weighted_mean(
+            one[:1],
+            weighted.player_game_weights[2:3],
+            weighted.player_game_normalization_weights[2:3],
+        )
+
+        self.assertAlmostEqual(
+            float(diagnostic_loss),
+            float(baseline_loss) * 0.1,
+        )
+        self.assertAlmostEqual(
+            float(singleton_diagnostic_loss),
+            float(singleton_baseline_loss) * 0.1,
+        )
+
+        unweighted = tensorize(rows)
+        self.assertIs(
+            unweighted.player_game_weights,
+            unweighted.player_game_normalization_weights,
+        )
+        all_one = tensorize(
+            rows,
+            game_source_weights={
+                "diagnostic": 1.0,
+                "baseline": 1.0,
+            },
+        )
+        self.assertTrue(
+            torch.equal(
+                all_one.player_game_weights,
+                unweighted.player_game_weights,
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                all_one.player_game_normalization_weights,
+                unweighted.player_game_weights,
+            )
+        )
+
+        rescaled = tensorize(
+            rows,
+            game_source_weights={
+                "diagnostic": 1.0,
+                "baseline": 10.0,
+            },
+        )
+        values = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        weighted_loss = _weighted_mean(
+            values,
+            weighted.player_game_weights,
+            weighted.player_game_normalization_weights,
+        )
+        rescaled_loss = _weighted_mean(
+            values,
+            rescaled.player_game_weights,
+            rescaled.player_game_normalization_weights,
+        )
+        self.assertAlmostEqual(float(weighted_loss), float(rescaled_loss))
+        weighted_values = values.clone().requires_grad_(True)
+        rescaled_values = values.clone().requires_grad_(True)
+        _weighted_mean(
+            weighted_values,
+            weighted.player_game_weights,
+            weighted.player_game_normalization_weights,
+        ).backward()
+        _weighted_mean(
+            rescaled_values,
+            rescaled.player_game_weights,
+            rescaled.player_game_normalization_weights,
+        ).backward()
+        torch.testing.assert_close(
+            weighted_values.grad,
+            rescaled_values.grad,
+        )
+        for common_scale in (1e300, 1e-300):
+            extreme = tensorize(
+                rows,
+                game_source_weights={
+                    "diagnostic": common_scale,
+                    "baseline": common_scale,
+                },
+            )
+            self.assertTrue(torch.all(torch.isfinite(extreme.player_game_weights)))
+            self.assertTrue(torch.all(extreme.player_game_weights > 0.0))
+            torch.testing.assert_close(
+                extreme.player_game_weights,
+                unweighted.player_game_weights,
+            )
+            torch.testing.assert_close(
+                extreme.player_game_normalization_weights,
+                unweighted.player_game_weights,
+            )
+        with self.assertRaisesRegex(ValueError, "relative ratios"):
+            tensorize(
+                rows,
+                game_source_weights={
+                    "diagnostic": 1e300,
+                    "baseline": 1e-300,
+                },
+            )
 
     def test_hybrid_never_restores_a_hard_eliminated_rule(self) -> None:
         rows = (
@@ -225,6 +418,42 @@ class CapturableBaselineTests(unittest.TestCase):
             "game_normalized_top_3_accuracy, then "
             "game_normalized_negative_log_likelihood",
         )
+        for key, first_value in first_model.state_dict().items():
+            self.assertTrue(
+                first_value.equal(second_model.state_dict()[key])
+            )
+
+    def test_weighted_batch_size_one_training_is_deterministic(self) -> None:
+        train = self._split("weighted-train")
+        validation = self._split("weighted-validation")
+        weights = {
+            "weighted-train-white": 1.0,
+            "weighted-train-black": 0.1,
+        }
+        config = CapturableTrainingConfig(
+            seed=20260728,
+            epochs=1,
+            batch_size=1,
+            hidden_dimension=8,
+            torch_threads=1,
+        )
+
+        first_model, first_report = train_capturable_baseline(
+            train,
+            validation,
+            None,
+            config,
+            train_game_source_weights=weights,
+        )
+        second_model, second_report = train_capturable_baseline(
+            train,
+            validation,
+            None,
+            config,
+            train_game_source_weights=weights,
+        )
+
+        self.assertEqual(first_report, second_report)
         for key, first_value in first_model.state_dict().items():
             self.assertTrue(
                 first_value.equal(second_model.state_dict()[key])
