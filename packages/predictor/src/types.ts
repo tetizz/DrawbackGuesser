@@ -61,6 +61,54 @@ export interface PredictionState {
   readonly black: HypothesisDistribution;
 }
 
+interface HypothesisMoveOpportunityBase {
+  /**
+   * Index in the active color's hypothesis distribution. This is deliberately
+   * opaque so parameter values cannot be reconstructed from an identifier.
+   */
+  readonly hypothesisIndex: number;
+  readonly drawbackId: string;
+  readonly ordinaryLegalMoveCount: number;
+}
+
+export interface KnownHypothesisMoveOpportunity
+  extends HypothesisMoveOpportunityBase {
+  readonly status: "known";
+  readonly allowedMoveCount: number;
+  readonly allowedMoveFraction: number;
+  readonly triggered: boolean;
+  readonly forced: boolean;
+  readonly observedMoveLegal: boolean;
+}
+
+export interface UnavailableHypothesisMoveOpportunity
+  extends HypothesisMoveOpportunityBase {
+  readonly status: "unknown" | "eliminated";
+  readonly allowedMoveCount: null;
+  readonly allowedMoveFraction: null;
+  readonly triggered: null;
+  readonly forced: null;
+  readonly observedMoveLegal: null;
+}
+
+/**
+ * Public, label-blind legality evidence for one hypothesis before an observed
+ * move is applied. It contains no move lists, parameters, or rule state.
+ */
+export type HypothesisMoveOpportunity =
+  | KnownHypothesisMoveOpportunity
+  | UnavailableHypothesisMoveOpportunity;
+
+export interface PredictionOpportunitySnapshot {
+  readonly color: PlayerColor;
+  readonly hypotheses: readonly HypothesisMoveOpportunity[];
+}
+
+export interface PredictionObservationResult {
+  readonly state: PredictionState;
+  readonly opportunity: PredictionOpportunitySnapshot;
+}
+
 /**
  * Public move data available to a real predictor. It deliberately contains no
  * true drawback, secret parameters, or authoritative drawback state.

@@ -23,9 +23,12 @@ import type {
   DrawbackHypothesis,
   ExternalConstraintHypothesisSeed,
   HypothesisDistribution,
+  HypothesisMoveOpportunity,
   HypothesisSeed,
   LikelihoodFeatures,
   MoveObservation,
+  PredictionObservationResult,
+  PredictionOpportunitySnapshot,
   PredictorOptions,
   PredictionSeeds,
   PredictionSeed,
@@ -36,11 +39,19 @@ import type {
 
 interface RuntimeHypothesis {
   readonly publicState: DrawbackHypothesis;
-  readonly legalMoves: (observation: MoveObservation) => readonly ChessMove[];
-  readonly transition: (
+  readonly observe: (
     observation: MoveObservation,
     scoreLogLikelihood: (features: LikelihoodFeatures) => number,
-  ) => RuntimeHypothesis;
+  ) => RuntimeObservation;
+}
+
+interface RuntimeObservation {
+  /**
+   * `null` means public evidence is insufficient to know this mask. An empty
+   * array is a known mask with no permitted continuation.
+   */
+  readonly legalMoves: readonly ChessMove[] | null;
+  readonly next: RuntimeHypothesis;
 }
 
 function sameMove(left: ChessMove, right: ChessMove): boolean {
@@ -462,16 +473,22 @@ function validatedOutcomes<Outcome>(
   return outcomes;
 }
 
-function unionMoves(moveSets: readonly (readonly ChessMove[])[]): readonly ChessMove[] {
-  const union: ChessMove[] = [];
-  for (const moves of moveSets) {
-    for (const move of moves) {
-      if (!union.some((candidate) => sameMove(candidate, move))) {
-        union.push(move);
-      }
-    }
+function consensusMoves(
+  moveSets: readonly (readonly ChessMove[])[],
+): readonly ChessMove[] | null {
+  const first = moveSets[0];
+  if (first === undefined) {
+    throw new Error("Rerandomized opportunity requires at least one outcome");
   }
-  return Object.freeze(union);
+  return moveSets.every(
+    (moves) =>
+      moves.length === first.length
+      && moves.every((move) =>
+        first.some((candidate) => sameMove(candidate, move))
+      ),
+  )
+    ? first
+    : null;
 }
 
 function makeRerandomizedRuntime<State, Outcome>(
@@ -495,37 +512,19 @@ function makeRerandomizedRuntime<State, Outcome>(
 
   return {
     publicState,
-    legalMoves: (observation) => {
-      const context = {
-        color,
-        state,
-        position: observation.positionBefore,
-      };
-      const outcomes = validatedOutcomes(seed.outcomes(context));
-      return unionMoves(
-        outcomes.map(({ outcome }) =>
-          validatedFilteredMoves(
-            observation.authorityLegalMoves,
-            seed.filterLegalMoves(
-              context,
-              outcome,
-              [...observation.authorityLegalMoves],
-            ),
-            seed.name,
-          )
-        ),
-      );
-    },
-    transition: (observation, scoreLogLikelihood) => {
+    observe: (observation, scoreLogLikelihood) => {
       if (publicState.eliminated) {
-        return makeRerandomizedRuntime(
-          color,
-          seed,
-          state,
-          Number.NEGATIVE_INFINITY,
-          publicState.evidence,
-          true,
-        );
+        return {
+          legalMoves: null,
+          next: makeRerandomizedRuntime(
+            color,
+            seed,
+            state,
+            Number.NEGATIVE_INFINITY,
+            publicState.evidence,
+            true,
+          ),
+        };
       }
       const context = {
         color,
@@ -533,6 +532,7 @@ function makeRerandomizedRuntime<State, Outcome>(
         position: observation.positionBefore,
       };
       const outcomes = validatedOutcomes(seed.outcomes(context));
+      const branchMoveSets: (readonly ChessMove[])[] = [];
       const compatibleLogs: number[] = [];
       let compatibleCount = 0;
       for (const { outcome, probability: outcomeProbability } of outcomes) {
@@ -545,6 +545,7 @@ function makeRerandomizedRuntime<State, Outcome>(
           ),
           seed.name,
         );
+        branchMoveSets.push(allowed);
         if (!allowed.some((candidate) => sameMove(candidate, observation.move))) {
           continue;
         }
@@ -572,14 +573,17 @@ function makeRerandomizedRuntime<State, Outcome>(
             `${seed.name} outcome.`,
           move: observation.move,
         });
-        return makeRerandomizedRuntime(
-          color,
-          seed,
-          state,
-          Number.NEGATIVE_INFINITY,
-          appendEvidence(publicState.evidence, [elimination]),
-          true,
-        );
+        return {
+          legalMoves: consensusMoves(branchMoveSets),
+          next: makeRerandomizedRuntime(
+            color,
+            seed,
+            state,
+            Number.NEGATIVE_INFINITY,
+            appendEvidence(publicState.evidence, [elimination]),
+            true,
+          ),
+        };
       }
       const marginalizedLogLikelihood = logSumExp(compatibleLogs);
       const nextState = seed.applyObservedMove(
@@ -601,13 +605,16 @@ function makeRerandomizedRuntime<State, Outcome>(
         move: observation.move,
         weight: marginalizedLogLikelihood,
       });
-      return makeRerandomizedRuntime(
-        color,
-        seed,
-        nextState,
-        publicState.logProbability + marginalizedLogLikelihood,
-        appendEvidence(publicState.evidence, [likelihoodEvidence]),
-      );
+      return {
+        legalMoves: consensusMoves(branchMoveSets),
+        next: makeRerandomizedRuntime(
+          color,
+          seed,
+          nextState,
+          publicState.logProbability + marginalizedLogLikelihood,
+          appendEvidence(publicState.evidence, [likelihoodEvidence]),
+        ),
+      };
     },
   };
 }
@@ -634,35 +641,20 @@ function makeRuntime<State, Parameters extends Record<string, unknown>>(
 
   return {
     publicState,
-    legalMoves: (observation) => {
-      const context = {
-        color,
-        parameters,
-        state: initialState,
-        position: observation.positionBefore,
-      };
-      return seed.rule.checkStartOfTurnLoss(context) === null
-        ? validatedFilteredMoves(
-            observation.authorityLegalMoves,
-            seed.rule.filterLegalMoves(
-              context,
-              [...observation.authorityLegalMoves],
-            ),
-            seed.rule.name,
-          )
-        : [];
-    },
-    transition: (observation, scoreLogLikelihood) => {
+    observe: (observation, scoreLogLikelihood) => {
       if (publicState.eliminated) {
-        return makeRuntime(
-          color,
-          seed,
-          initialState,
-          parameters,
-          Number.NEGATIVE_INFINITY,
-          publicState.evidence,
-          true,
-        );
+        return {
+          legalMoves: null,
+          next: makeRuntime(
+            color,
+            seed,
+            initialState,
+            parameters,
+            Number.NEGATIVE_INFINITY,
+            publicState.evidence,
+            true,
+          ),
+        };
       }
 
       const moveContext = {
@@ -681,15 +673,18 @@ function makeRuntime<State, Parameters extends Record<string, unknown>>(
             `would already have lost: ${startOfTurnLoss.reason}`,
           move: observation.move,
         });
-        return makeRuntime(
-          color,
-          seed,
-          initialState,
-          parameters,
-          Number.NEGATIVE_INFINITY,
-          appendEvidence(publicState.evidence, [elimination]),
-          true,
-        );
+        return {
+          legalMoves: Object.freeze([]),
+          next: makeRuntime(
+            color,
+            seed,
+            initialState,
+            parameters,
+            Number.NEGATIVE_INFINITY,
+            appendEvidence(publicState.evidence, [elimination]),
+            true,
+          ),
+        };
       }
 
       const allowed = validatedFilteredMoves(
@@ -707,15 +702,18 @@ function makeRuntime<State, Parameters extends Record<string, unknown>>(
           message: `${observation.move.san} is impossible under ${seed.rule.name}.`,
           move: observation.move,
         });
-        return makeRuntime(
-          color,
-          seed,
-          initialState,
-          parameters,
-          Number.NEGATIVE_INFINITY,
-          appendEvidence(publicState.evidence, [elimination]),
-          true,
-        );
+        return {
+          legalMoves: allowed,
+          next: makeRuntime(
+            color,
+            seed,
+            initialState,
+            parameters,
+            Number.NEGATIVE_INFINITY,
+            appendEvidence(publicState.evidence, [elimination]),
+            true,
+          ),
+        };
       }
 
       const explanation =
@@ -761,17 +759,20 @@ function makeRuntime<State, Parameters extends Record<string, unknown>>(
         },
         observation.move,
       );
-      return makeRuntime(
-        color,
-        seed,
-        nextState,
-        parameters,
-        publicState.logProbability + logLikelihood,
-        appendEvidence(publicState.evidence, [
-          ...explanation,
-          ...likelihoodEvidence,
-        ]),
-      );
+      return {
+        legalMoves: allowed,
+        next: makeRuntime(
+          color,
+          seed,
+          nextState,
+          parameters,
+          publicState.logProbability + logLikelihood,
+          appendEvidence(publicState.evidence, [
+            ...explanation,
+            ...likelihoodEvidence,
+          ]),
+        ),
+      };
     },
   };
 }
@@ -804,38 +805,23 @@ function makeExternalRuntime<
     state,
     position: observation.positionBefore,
   });
-  const allowed = (observation: MoveObservation): readonly ChessMove[] => {
-    const moveContext = context(observation);
-    if (seed.rule.checkStartOfTurnLoss(moveContext) !== null) {
-      return [];
-    }
-    return observation.externalConstraint === undefined
-      ? Object.freeze([...observation.authorityLegalMoves])
-      : validatedFilteredMoves(
-          observation.authorityLegalMoves,
-          seed.rule.filterLegalMovesWithConstraint(
-            moveContext,
-            [...observation.authorityLegalMoves],
-            observation.externalConstraint,
-          ),
-          seed.rule.name,
-        );
-  };
 
   return {
     publicState,
-    legalMoves: allowed,
-    transition: (observation, scoreLogLikelihood) => {
+    observe: (observation, scoreLogLikelihood) => {
       if (publicState.eliminated) {
-        return makeExternalRuntime(
-          color,
-          seed,
-          state,
-          parameters,
-          Number.NEGATIVE_INFINITY,
-          publicState.evidence,
-          true,
-        );
+        return {
+          legalMoves: null,
+          next: makeExternalRuntime(
+            color,
+            seed,
+            state,
+            parameters,
+            Number.NEGATIVE_INFINITY,
+            publicState.evidence,
+            true,
+          ),
+        };
       }
       const moveContext = context(observation);
       const loss = seed.rule.checkStartOfTurnLoss(moveContext);
@@ -848,15 +834,18 @@ function makeExternalRuntime<
             `would already have lost: ${loss.reason}`,
           move: observation.move,
         });
-        return makeExternalRuntime(
-          color,
-          seed,
-          state,
-          parameters,
-          Number.NEGATIVE_INFINITY,
-          appendEvidence(publicState.evidence, [elimination]),
-          true,
-        );
+        return {
+          legalMoves: Object.freeze([]),
+          next: makeExternalRuntime(
+            color,
+            seed,
+            state,
+            parameters,
+            Number.NEGATIVE_INFINITY,
+            appendEvidence(publicState.evidence, [elimination]),
+            true,
+          ),
+        };
       }
 
       const nextState = seed.rule.applyMove(
@@ -873,14 +862,17 @@ function makeExternalRuntime<
       // Missing public evaluator data is unknown evidence. Advance only public
       // state so history stays aligned; do not eliminate or change probability.
       if (constraint === undefined) {
-        return makeExternalRuntime(
-          color,
-          seed,
-          nextState,
-          parameters,
-          publicState.logProbability,
-          publicState.evidence,
-        );
+        return {
+          legalMoves: null,
+          next: makeExternalRuntime(
+            color,
+            seed,
+            nextState,
+            parameters,
+            publicState.logProbability,
+            publicState.evidence,
+          ),
+        };
       }
 
       const legalMoves = validatedFilteredMoves(
@@ -899,15 +891,18 @@ function makeExternalRuntime<
           message: `${observation.move.san} is impossible under ${seed.rule.name}.`,
           move: observation.move,
         });
-        return makeExternalRuntime(
-          color,
-          seed,
-          state,
-          parameters,
-          Number.NEGATIVE_INFINITY,
-          appendEvidence(publicState.evidence, [elimination]),
-          true,
-        );
+        return {
+          legalMoves,
+          next: makeExternalRuntime(
+            color,
+            seed,
+            state,
+            parameters,
+            Number.NEGATIVE_INFINITY,
+            appendEvidence(publicState.evidence, [elimination]),
+            true,
+          ),
+        };
       }
 
       const triggered =
@@ -940,17 +935,20 @@ function makeExternalRuntime<
                 weight: moveLogLikelihood,
               }),
             ];
-      return makeExternalRuntime(
-        color,
-        seed,
-        nextState,
-        parameters,
-        publicState.logProbability + moveLogLikelihood,
-        appendEvidence(publicState.evidence, [
-          ...explanation,
-          ...likelihoodEvidence,
-        ]),
-      );
+      return {
+        legalMoves,
+        next: makeExternalRuntime(
+          color,
+          seed,
+          nextState,
+          parameters,
+          publicState.logProbability + moveLogLikelihood,
+          appendEvidence(publicState.evidence, [
+            ...explanation,
+            ...likelihoodEvidence,
+          ]),
+        ),
+      };
     },
   };
 }
@@ -1039,6 +1037,71 @@ function publicDistribution(
 ): HypothesisDistribution {
   return Object.freeze({
     hypotheses: Object.freeze(runtimes.map((runtime) => runtime.publicState)),
+  });
+}
+
+function publicOpportunity(
+  observation: MoveObservation,
+  runtimes: readonly RuntimeHypothesis[],
+  runtimeObservations: readonly RuntimeObservation[],
+): PredictionOpportunitySnapshot {
+  if (runtimes.length !== runtimeObservations.length) {
+    throw new Error("Opportunity evaluation did not preserve hypothesis count");
+  }
+  const ordinaryLegalMoveCount = observation.authorityLegalMoves.length;
+  const hypotheses = runtimes.map((runtime, index): HypothesisMoveOpportunity => {
+    const runtimeObservation = runtimeObservations[index];
+    if (runtimeObservation === undefined) {
+      throw new Error("Opportunity evaluation did not preserve hypothesis order");
+    }
+    const identity = {
+      hypothesisIndex: index,
+      drawbackId: runtime.publicState.drawbackId,
+      ordinaryLegalMoveCount,
+    };
+    if (runtime.publicState.eliminated) {
+      return Object.freeze({
+        ...identity,
+        status: "eliminated",
+        allowedMoveCount: null,
+        allowedMoveFraction: null,
+        triggered: null,
+        forced: null,
+        observedMoveLegal: null,
+      });
+    }
+    if (runtimeObservation.legalMoves === null) {
+      return Object.freeze({
+        ...identity,
+        status: "unknown",
+        allowedMoveCount: null,
+        allowedMoveFraction: null,
+        triggered: null,
+        forced: null,
+        observedMoveLegal: null,
+      });
+    }
+
+    const allowedMoves = runtimeObservation.legalMoves;
+    const allowedMoveCount = allowedMoves.length;
+    return Object.freeze({
+      ...identity,
+      status: "known",
+      allowedMoveCount,
+      allowedMoveFraction:
+        ordinaryLegalMoveCount === 0
+          ? 0
+          : allowedMoveCount / ordinaryLegalMoveCount,
+      triggered: allowedMoveCount !== ordinaryLegalMoveCount,
+      forced: allowedMoveCount === 1,
+      observedMoveLegal: allowedMoves.some((candidate) =>
+        sameMove(candidate, observation.move)
+      ),
+    });
+  });
+  return Object.freeze({
+    color: observation.color,
+    hypotheses: Object.freeze(hypotheses),
   });
 }
 
@@ -1141,28 +1204,42 @@ export class SymbolicPredictor {
   }
 
   public observe(observation: MoveObservation): PredictionState {
+    return this.observeWithOpportunities(observation).state;
+  }
+
+  public observeWithOpportunities(
+    observation: MoveObservation,
+  ): PredictionObservationResult {
     const nextAuthorityPosition = validateObservation(
       observation,
       this.#authorityId,
       this.#expectedPosition,
       this.#expectedAuthorityPosition,
     );
+    const activeRuntimes =
+      observation.color === "white" ? this.#white : this.#black;
+    const runtimeObservations = activeRuntimes.map((runtime) =>
+      runtime.observe(observation, this.#scoreLogLikelihood)
+    );
+    const opportunity = publicOpportunity(
+      observation,
+      activeRuntimes,
+      runtimeObservations,
+    );
+    const nextRuntimes = renormalize(
+      runtimeObservations.map(({ next }) => next),
+    );
     if (observation.color === "white") {
-      this.#white = renormalize(
-        this.#white.map((runtime) =>
-          runtime.transition(observation, this.#scoreLogLikelihood),
-        ),
-      );
+      this.#white = nextRuntimes;
     } else {
-      this.#black = renormalize(
-        this.#black.map((runtime) =>
-          runtime.transition(observation, this.#scoreLogLikelihood),
-        ),
-      );
+      this.#black = nextRuntimes;
     }
     this.#expectedPosition = immutablePosition(observation.positionAfter);
     this.#expectedAuthorityPosition = nextAuthorityPosition;
-    return this.state;
+    return Object.freeze({
+      state: this.state,
+      opportunity,
+    });
   }
 }
 

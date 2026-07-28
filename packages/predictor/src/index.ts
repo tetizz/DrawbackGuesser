@@ -19,7 +19,11 @@ export type {
   ExternalConstraintHypothesisSeed,
   HypothesisDistribution,
   HypothesisSeed,
+  HypothesisMoveOpportunity,
+  KnownHypothesisMoveOpportunity,
   PredictionSeed,
+  PredictionObservationResult,
+  PredictionOpportunitySnapshot,
   RerandomizedContext,
   RerandomizedHypothesisSeed,
   RerandomizedOutcome,
@@ -35,6 +39,7 @@ export type {
   PredictionSeeds,
   PredictionState,
   RulePosterior,
+  UnavailableHypothesisMoveOpportunity,
 } from "./types.js";
 export {
   DEFAULT_LIKELIHOOD_WEIGHTS,
