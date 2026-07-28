@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .capturable_baseline import (
+    CAPTURABLE_OPPORTUNITY_MODES,
     CapturableTrainingConfig,
     SOURCE_WEIGHTING_OBJECTIVE,
     _canonical_json,
@@ -18,31 +19,44 @@ from .capturable_baseline import (
     _publish_bytes,
     _publish_checkpoint,
     _sha256_file,
+    _opportunity_contract,
     create_capturable_model,
+    create_capturable_opportunity_model,
     evaluate_capturable,
     tensorize,
     train_capturable_baseline,
 )
 from .capturable_records import (
     CAPTURABLE_FEATURE_DIMENSION,
+    CAPTURABLE_OPPORTUNITY_FEATURE_VERSION,
+    CAPTURABLE_OPPORTUNITY_FIELDS,
+    CAPTURABLE_OPPORTUNITY_SHAPE,
+    CAPTURABLE_OPPORTUNITY_SYMBOLIC_FEATURE_VERSION,
     CAPTURABLE_RULE_IDS,
     CapturableDatasetError,
     CapturableDatasetRow,
     assert_disjoint_games,
     load_capturable_dataset,
+    load_capturable_opportunity_dataset,
 )
 from .capturable_reliability import validation_reliability_checks
 
 CAPTURABLE_SELECTION_FORMAT = "drawbackguesser-capturable-selection"
 CAPTURABLE_SELECTION_VERSION = 1
+CAPTURABLE_OPPORTUNITY_SELECTION_VERSION = 2
 
 
 def _load_stable_capturable_dataset(
     path: Path,
+    opportunity_mode: str | None = None,
 ) -> tuple[tuple[CapturableDatasetRow, ...], str]:
     resolved = path.resolve()
     before = _sha256_file(resolved)
-    rows = load_capturable_dataset(resolved)
+    rows = (
+        load_capturable_dataset(resolved)
+        if opportunity_mode is None
+        else load_capturable_opportunity_dataset(resolved)
+    )
     after = _sha256_file(resolved)
     if before != after:
         raise CapturableDatasetError(
@@ -82,6 +96,7 @@ def run_selection(
     output_directory: Path,
     config: CapturableTrainingConfig,
     train_source_weights: Sequence[float] | None = None,
+    opportunity_mode: str | None = None,
 ) -> Mapping[str, Any]:
     """Select and publish a model without opening any test dataset."""
 
@@ -96,12 +111,13 @@ def run_selection(
         train_source_weights,
     )
     loaded_train_sources = [
-        _load_stable_capturable_dataset(path) for path in train_paths
+        _load_stable_capturable_dataset(path, opportunity_mode)
+        for path in train_paths
     ]
     train_sources = [item[0] for item in loaded_train_sources]
     train_sha256s = [item[1] for item in loaded_train_sources]
     validation_rows, validation_sha256 = (
-        _load_stable_capturable_dataset(validation_path)
+        _load_stable_capturable_dataset(validation_path, opportunity_mode)
     )
     assert_disjoint_games(*train_sources, validation_rows)
     train_rows = tuple(
@@ -128,6 +144,7 @@ def run_selection(
         None,
         config,
         train_game_source_weights=game_source_weights,
+        opportunity_mode=opportunity_mode,
     )
     input_identity = {
         "train": {
@@ -179,18 +196,27 @@ def run_selection(
             ],
             "ruleIds": list(CAPTURABLE_RULE_IDS),
             "featureDimension": CAPTURABLE_FEATURE_DIMENSION,
+            **_opportunity_contract(opportunity_mode),
             "config": _jsonable_config(config),
             "inputs": input_identity,
             "sourceGameIds": source_game_ids,
             "validation": measured["validation"],
         },
         artifact_format=CAPTURABLE_SELECTION_FORMAT,
-        artifact_version=CAPTURABLE_SELECTION_VERSION,
+        artifact_version=(
+            CAPTURABLE_SELECTION_VERSION
+            if opportunity_mode is None
+            else CAPTURABLE_OPPORTUNITY_SELECTION_VERSION
+        ),
     )
     report = {
         **measured,
         "format": CAPTURABLE_SELECTION_FORMAT,
-        "version": CAPTURABLE_SELECTION_VERSION,
+        "version": (
+            CAPTURABLE_SELECTION_VERSION
+            if opportunity_mode is None
+            else CAPTURABLE_OPPORTUNITY_SELECTION_VERSION
+        ),
         "inputs": input_identity,
         "checkpoint": {
             "file": checkpoint_path.name,
@@ -274,11 +300,21 @@ def _load_selection_checkpoint(
             map_location="cpu",
             weights_only=True,
         )
+    checkpoint_version = (
+        checkpoint.get("version")
+        if isinstance(checkpoint, Mapping)
+        else None
+    )
     if (
         not isinstance(checkpoint, Mapping)
         or set(checkpoint) != {"format", "version", "metadata", "stateDict"}
         or checkpoint.get("format") != CAPTURABLE_SELECTION_FORMAT
-        or checkpoint.get("version") != CAPTURABLE_SELECTION_VERSION
+        or type(checkpoint_version) is not int
+        or checkpoint_version
+        not in {
+            CAPTURABLE_SELECTION_VERSION,
+            CAPTURABLE_OPPORTUNITY_SELECTION_VERSION,
+        }
     ):
         raise CapturableDatasetError(
             "checkpoint outer contract is invalid"
@@ -297,6 +333,18 @@ def _load_selection_checkpoint(
         "sourceGameIds",
         "validation",
     }
+    opportunity_checkpoint = (
+        checkpoint_version == CAPTURABLE_OPPORTUNITY_SELECTION_VERSION
+    )
+    if opportunity_checkpoint:
+        expected_metadata |= {
+            "symbolicFeatureVersion",
+            "opportunityFeatureVersion",
+            "opportunityRuleIds",
+            "opportunityFields",
+            "opportunityShape",
+            "opportunityMode",
+        }
     if (
         not isinstance(metadata, Mapping)
         or set(metadata) != expected_metadata
@@ -347,7 +395,13 @@ def _load_selection_checkpoint(
             "checkpoint inputs or validation metrics are invalid"
         )
     _validate_source_weighting_identity(metadata["inputs"])
-    model = create_capturable_model(config.hidden_dimension)
+    if opportunity_checkpoint:
+        _validate_opportunity_checkpoint_metadata(metadata)
+        model = create_capturable_opportunity_model(
+            config.hidden_dimension
+        )
+    else:
+        model = create_capturable_model(config.hidden_dimension)
     try:
         model.load_state_dict(checkpoint.get("stateDict"), strict=True)
     except (RuntimeError, TypeError) as error:
@@ -355,6 +409,34 @@ def _load_selection_checkpoint(
             "checkpoint tensors do not match the selected model"
         ) from error
     return model, metadata, digest.hexdigest()
+
+
+def _validate_opportunity_checkpoint_metadata(
+    metadata: Mapping[str, Any],
+) -> None:
+    if (
+        type(metadata.get("symbolicFeatureVersion")) is not int
+        or metadata.get("symbolicFeatureVersion")
+        != CAPTURABLE_OPPORTUNITY_SYMBOLIC_FEATURE_VERSION
+        or type(metadata.get("opportunityFeatureVersion")) is not int
+        or metadata.get("opportunityFeatureVersion")
+        != CAPTURABLE_OPPORTUNITY_FEATURE_VERSION
+        or metadata.get("opportunityRuleIds")
+        != list(CAPTURABLE_RULE_IDS)
+        or metadata.get("opportunityFields")
+        != list(CAPTURABLE_OPPORTUNITY_FIELDS)
+        or metadata.get("opportunityShape")
+        != list(CAPTURABLE_OPPORTUNITY_SHAPE)
+        or any(
+            type(value) is not int
+            for value in metadata.get("opportunityShape", ())
+        )
+        or metadata.get("opportunityMode")
+        not in CAPTURABLE_OPPORTUNITY_MODES
+    ):
+        raise CapturableDatasetError(
+            "checkpoint opportunity contract is invalid"
+        )
 
 
 def _validate_source_weighting_identity(inputs: Mapping[str, Any]) -> None:
@@ -413,7 +495,11 @@ def run_sealed_evaluation(
         checkpoint_path.resolve()
     )
     config = _training_config_from_json(metadata["config"])
-    test_rows, test_sha256 = _load_stable_capturable_dataset(test_path)
+    opportunity_mode = metadata.get("opportunityMode")
+    test_rows, test_sha256 = _load_stable_capturable_dataset(
+        test_path,
+        opportunity_mode,
+    )
     source_game_ids = set(metadata["sourceGameIds"])
     overlap = sorted(
         {
@@ -455,7 +541,10 @@ def run_sealed_evaluation(
             "metrics": evaluate_capturable(
                 model,
                 test_rows,
-                tensorize(test_rows),
+                tensorize(
+                    test_rows,
+                    opportunity_mode=opportunity_mode,
+                ),
                 config,
                 selected_alpha,
                 selected_smoothing,
@@ -590,17 +679,33 @@ def run_paired_sealed_evaluation(
         checkpoint_path(comparison["bestTreatment"]),
         str(comparison["bestTreatment"]["checkpointSha256"]),
     )
-    test_rows, test_sha256 = _load_stable_capturable_dataset(test_path)
-    test_tensors = tensorize(test_rows)
+    control_mode = control_loaded[2].get("opportunityMode")
+    treatment_mode = treatment_loaded[2].get("opportunityMode")
+    if (control_mode is None) != (treatment_mode is None):
+        raise CapturableDatasetError(
+            "paired checkpoints use different opportunity contracts"
+        )
+    test_rows, test_sha256 = _load_stable_capturable_dataset(
+        test_path,
+        control_mode,
+    )
+    control_test_tensors = tensorize(
+        test_rows,
+        opportunity_mode=control_mode,
+    )
+    treatment_test_tensors = tensorize(
+        test_rows,
+        opportunity_mode=treatment_mode,
+    )
     control = _evaluate_loaded_selection_on_test(
         *control_loaded,
         test_rows,
-        test_tensors,
+        control_test_tensors,
     )
     treatment = _evaluate_loaded_selection_on_test(
         *treatment_loaded,
         test_rows,
-        test_tensors,
+        treatment_test_tensors,
     )
     control_order = _test_performance_order(control)
     treatment_order = _test_performance_order(treatment)
@@ -746,6 +851,13 @@ def _parser() -> argparse.ArgumentParser:
     select.add_argument("--hidden-dimension", type=int, default=128)
     select.add_argument("--torch-threads", type=int, default=14)
     select.add_argument(
+        "--opportunity-mode",
+        choices=CAPTURABLE_OPPORTUNITY_MODES,
+        help=(
+            "Enable strict schema-9 opportunities or its zero-input ablation."
+        ),
+    )
+    select.add_argument(
         "--trigger-row-multiplier",
         type=float,
         default=1.0,
@@ -817,6 +929,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             options.output,
             config,
             options.train_source_weight,
+            options.opportunity_mode,
         )
     elif options.command == "evaluate":
         result = run_sealed_evaluation(

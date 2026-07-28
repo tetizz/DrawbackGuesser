@@ -19,6 +19,8 @@ from .records import FeatureRecord
 
 
 CAPTURABLE_SYMBOLIC_FEATURE_VERSION = 8
+CAPTURABLE_OPPORTUNITY_SYMBOLIC_FEATURE_VERSION = 9
+CAPTURABLE_OPPORTUNITY_FEATURE_VERSION = 1
 CAPTURABLE_RULE_IDS = (
     "vegan",
     "true-gentleman",
@@ -50,6 +52,19 @@ CAPTURABLE_RULE_COUNT = len(CAPTURABLE_RULE_IDS)
 CAPTURABLE_RULE_INDEX = {
     rule_id: index for index, rule_id in enumerate(CAPTURABLE_RULE_IDS)
 }
+CAPTURABLE_OPPORTUNITY_FIELDS = (
+    "knownMass",
+    "allowedMoveFractionMass",
+    "triggeredMass",
+    "forcedMass",
+)
+CAPTURABLE_OPPORTUNITY_SHAPE = (
+    CAPTURABLE_RULE_COUNT,
+    len(CAPTURABLE_OPPORTUNITY_FIELDS),
+)
+CAPTURABLE_OPPORTUNITY_DIMENSION = (
+    CAPTURABLE_OPPORTUNITY_SHAPE[0] * CAPTURABLE_OPPORTUNITY_SHAPE[1]
+)
 CAPTURABLE_BEHAVIOR_FEATURES = 73
 CAPTURABLE_FEATURE_DIMENSION = (
     FEATURE_DIMENSION
@@ -80,6 +95,12 @@ _PUBLIC_KEYS = frozenset(
         "publicEvaluatorConstraint",
     }
 )
+_OPPORTUNITY_PUBLIC_KEYS = _PUBLIC_KEYS | frozenset(
+    {
+        "opportunityFeatureVersion",
+        "symbolicActiveRuleOpportunityFeatures",
+    }
+)
 _LABEL_KEYS = frozenset(
     {
         "trueDrawback",
@@ -102,6 +123,9 @@ _EVALUATION_KEYS = frozenset(
     }
 )
 _ROW_KEYS = _PUBLIC_KEYS | _LABEL_KEYS | _EVALUATION_KEYS
+_OPPORTUNITY_ROW_KEYS = (
+    _OPPORTUNITY_PUBLIC_KEYS | _LABEL_KEYS | _EVALUATION_KEYS
+)
 _SNAPSHOT_KEYS = frozenset(
     {
         "format",
@@ -189,6 +213,7 @@ class CapturableDatasetRow:
     features: CapturablePublicFeatures
     labels: CapturableLabels
     evaluation: CapturableEvaluation
+    rule_opportunities: tuple[tuple[float, ...], ...] | None = None
 
 
 def _exact_keys(
@@ -278,6 +303,37 @@ def _booleans(value: Any, label: str) -> tuple[bool, ...]:
     return tuple(value)
 
 
+def _rule_opportunities(
+    value: Any,
+    label: str,
+) -> tuple[tuple[float, ...], ...]:
+    if (
+        not isinstance(value, list)
+        or len(value) != CAPTURABLE_OPPORTUNITY_DIMENSION
+        or any(
+            isinstance(item, bool)
+            or not isinstance(item, (int, float))
+            or not math.isfinite(float(item))
+            or not 0.0 <= float(item) <= 1.0
+            for item in value
+        )
+    ):
+        raise CapturableDatasetError(
+            f"{label} must contain exactly "
+            f"{CAPTURABLE_OPPORTUNITY_DIMENSION} finite values from zero to one"
+        )
+    flattened = tuple(float(item) for item in value)
+    field_count = len(CAPTURABLE_OPPORTUNITY_FIELDS)
+    return tuple(
+        flattened[start : start + field_count]
+        for start in range(
+            0,
+            CAPTURABLE_OPPORTUNITY_DIMENSION,
+            field_count,
+        )
+    )
+
+
 def _authority_snapshot(
     value: Any,
     fen_before: str,
@@ -336,17 +392,45 @@ def _authority_snapshot(
     )
 
 
-def parse_capturable_dataset_row(row: Mapping[str, Any]) -> CapturableDatasetRow:
+def _parse_capturable_dataset_row(
+    row: Mapping[str, Any],
+    *,
+    with_opportunities: bool,
+) -> CapturableDatasetRow:
     """Parse one combined storage row and separate features before labels."""
 
-    _exact_keys(row, _ROW_KEYS, "capturable dataset row")
+    expected_keys = _OPPORTUNITY_ROW_KEYS if with_opportunities else _ROW_KEYS
+    _exact_keys(row, expected_keys, "capturable dataset row")
     if row.get("authorityId") != "capturable-king/v1":
         raise CapturableDatasetError("authorityId must be capturable-king/v1")
-    if row.get("symbolicFeatureVersion") != CAPTURABLE_SYMBOLIC_FEATURE_VERSION:
-        raise CapturableDatasetError("symbolicFeatureVersion must be 8")
+    expected_symbolic_version = (
+        CAPTURABLE_OPPORTUNITY_SYMBOLIC_FEATURE_VERSION
+        if with_opportunities
+        else CAPTURABLE_SYMBOLIC_FEATURE_VERSION
+    )
+    if (
+        row.get("symbolicFeatureVersion") != expected_symbolic_version
+        or (
+            with_opportunities
+            and type(row.get("symbolicFeatureVersion")) is not int
+        )
+    ):
+        raise CapturableDatasetError(
+            f"symbolicFeatureVersion must be {expected_symbolic_version}"
+        )
+    if with_opportunities and (
+        row.get("opportunityFeatureVersion")
+        != CAPTURABLE_OPPORTUNITY_FEATURE_VERSION
+        or type(row.get("opportunityFeatureVersion")) is not int
+    ):
+        raise CapturableDatasetError(
+            "opportunityFeatureVersion must be 1"
+        )
     if row.get("publicEvaluatorConstraint") is not None:
         raise CapturableDatasetError(
-            "capturable schema 8 does not accept evaluator constraints"
+            "capturable schema "
+            f"{9 if with_opportunities else 8} "
+            "does not accept evaluator constraints"
         )
     fen_before = _string(row.get("fenBefore"), "fenBefore")
     color = row.get("playerColor")
@@ -469,7 +553,42 @@ def parse_capturable_dataset_row(row: Mapping[str, Any]) -> CapturableDatasetRow
         bot_style=bot_style,
         bot_strength=bot_strength,
     )
-    return CapturableDatasetRow(features, labels, evaluation)
+    opportunities = (
+        _rule_opportunities(
+            row.get("symbolicActiveRuleOpportunityFeatures"),
+            "symbolicActiveRuleOpportunityFeatures",
+        )
+        if with_opportunities
+        else None
+    )
+    return CapturableDatasetRow(
+        features,
+        labels,
+        evaluation,
+        opportunities,
+    )
+
+
+def parse_capturable_dataset_row(
+    row: Mapping[str, Any],
+) -> CapturableDatasetRow:
+    """Parse one frozen schema-8 row."""
+
+    return _parse_capturable_dataset_row(
+        row,
+        with_opportunities=False,
+    )
+
+
+def parse_capturable_opportunity_dataset_row(
+    row: Mapping[str, Any],
+) -> CapturableDatasetRow:
+    """Parse one strict schema-9 row carrying public rule opportunities."""
+
+    return _parse_capturable_dataset_row(
+        row,
+        with_opportunities=True,
+    )
 
 
 def active_symbolic(
@@ -742,9 +861,18 @@ def strict_json_object(line: str, label: str) -> Mapping[str, Any]:
     return _mapping(value, label)
 
 
-def read_capturable_dataset(path: Path) -> Iterator[CapturableDatasetRow]:
+def _read_capturable_dataset(
+    path: Path,
+    *,
+    with_opportunities: bool,
+) -> Iterator[CapturableDatasetRow]:
     """Stream strict LF-framed rows without accepting partial final records."""
 
+    parser = (
+        parse_capturable_opportunity_dataset_row
+        if with_opportunities
+        else parse_capturable_dataset_row
+    )
     with path.resolve().open("rb") as source:
         for line_number, raw_line in enumerate(source, start=1):
             label = f"{path.name}:{line_number}"
@@ -756,13 +884,38 @@ def read_capturable_dataset(path: Path) -> Iterator[CapturableDatasetRow]:
                 raise CapturableDatasetError(f"{label} is not UTF-8") from error
             if not line:
                 raise CapturableDatasetError(f"{label} is blank")
-            yield parse_capturable_dataset_row(strict_json_object(line, label))
+            yield parser(strict_json_object(line, label))
+
+
+def read_capturable_dataset(path: Path) -> Iterator[CapturableDatasetRow]:
+    """Stream frozen schema-8 records."""
+
+    return _read_capturable_dataset(path, with_opportunities=False)
+
+
+def read_capturable_opportunity_dataset(
+    path: Path,
+) -> Iterator[CapturableDatasetRow]:
+    """Stream strict schema-9 opportunity records."""
+
+    return _read_capturable_dataset(path, with_opportunities=True)
 
 
 def load_capturable_dataset(path: Path) -> tuple[CapturableDatasetRow, ...]:
     rows = tuple(read_capturable_dataset(path))
     if not rows:
         raise CapturableDatasetError("capturable dataset must contain rows")
+    return rows
+
+
+def load_capturable_opportunity_dataset(
+    path: Path,
+) -> tuple[CapturableDatasetRow, ...]:
+    rows = tuple(read_capturable_opportunity_dataset(path))
+    if not rows:
+        raise CapturableDatasetError(
+            "capturable opportunity dataset must contain rows"
+        )
     return rows
 
 

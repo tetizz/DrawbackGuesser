@@ -22,6 +22,10 @@ from ml.evaluation.metrics import (
 
 from .capturable_records import (
     CAPTURABLE_FEATURE_DIMENSION,
+    CAPTURABLE_OPPORTUNITY_FEATURE_VERSION,
+    CAPTURABLE_OPPORTUNITY_FIELDS,
+    CAPTURABLE_OPPORTUNITY_SHAPE,
+    CAPTURABLE_OPPORTUNITY_SYMBOLIC_FEATURE_VERSION,
     CAPTURABLE_RULE_IDS,
     CAPTURABLE_RULE_INDEX,
     CapturableDatasetRow,
@@ -29,9 +33,12 @@ from .capturable_records import (
     assert_disjoint_games,
     capturable_feature_vector,
     load_capturable_dataset,
+    load_capturable_opportunity_dataset,
 )
 CAPTURABLE_BASELINE_FORMAT = "drawbackguesser-capturable-baseline"
 CAPTURABLE_BASELINE_VERSION = 2
+CAPTURABLE_OPPORTUNITY_BASELINE_VERSION = 3
+CAPTURABLE_OPPORTUNITY_MODES = ("public-exact", "zero-ablation")
 SOURCE_WEIGHTING_OBJECTIVE = "global-source-mean-player-game/v1"
 _PRIOR_FLOOR = 1e-12
 
@@ -141,6 +148,7 @@ class CapturableTrainingConfig:
 @dataclass(frozen=True)
 class TensorRows:
     inputs: Any
+    rule_opportunities: Any | None
     colors: Any
     drawbacks: Any
     triggered: Any
@@ -192,10 +200,77 @@ def create_capturable_model(hidden_dimension: int) -> Any:
     return CapturableBaseline()
 
 
+def create_capturable_opportunity_model(hidden_dimension: int) -> Any:
+    """Create the schema-9 model with a zero-initialized rule residual."""
+
+    try:
+        import torch
+        import torch.nn as nn
+    except ImportError as error:
+        raise RuntimeError(
+            "PyTorch is required; install ml/requirements.txt"
+        ) from error
+
+    class CapturableOpportunityBaseline(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.encoder = nn.Sequential(
+                nn.Linear(CAPTURABLE_FEATURE_DIMENSION, hidden_dimension),
+                nn.ReLU(),
+                nn.Linear(hidden_dimension, hidden_dimension),
+                nn.ReLU(),
+            )
+            self.white_drawback = nn.Linear(
+                hidden_dimension, len(CAPTURABLE_RULE_IDS)
+            )
+            self.black_drawback = nn.Linear(
+                hidden_dimension, len(CAPTURABLE_RULE_IDS)
+            )
+            self.trigger = nn.Linear(hidden_dimension, 1)
+            self.forced = nn.Linear(hidden_dimension, 1)
+            self.triple_play_parameter = nn.Linear(hidden_dimension, 2)
+            self.opportunity_weights = nn.Parameter(
+                torch.zeros(CAPTURABLE_OPPORTUNITY_SHAPE)
+            )
+
+        def forward(
+            self,
+            inputs: Any,
+            rule_opportunities: Any,
+        ) -> dict[str, Any]:
+            if (
+                rule_opportunities.ndim != 3
+                or rule_opportunities.shape[0] != inputs.shape[0]
+                or tuple(rule_opportunities.shape[1:])
+                != CAPTURABLE_OPPORTUNITY_SHAPE
+            ):
+                raise ValueError(
+                    "rule opportunities must have shape [N, 25, 4]"
+                )
+            encoded = self.encoder(inputs)
+            opportunity_residual = (
+                rule_opportunities * self.opportunity_weights.unsqueeze(0)
+            ).sum(dim=-1)
+            return {
+                "white_drawback": (
+                    self.white_drawback(encoded) + opportunity_residual
+                ),
+                "black_drawback": (
+                    self.black_drawback(encoded) + opportunity_residual
+                ),
+                "trigger": self.trigger(encoded).squeeze(-1),
+                "forced": self.forced(encoded).squeeze(-1),
+                "triple_play_parameter": self.triple_play_parameter(encoded),
+            }
+
+    return CapturableOpportunityBaseline()
+
+
 def tensorize(
     rows: Sequence[CapturableDatasetRow],
     trigger_row_multiplier: float = 1.0,
     game_source_weights: Mapping[str, float] | None = None,
+    opportunity_mode: str | None = None,
 ) -> TensorRows:
     try:
         import torch
@@ -205,6 +280,7 @@ def tensorize(
         ) from error
     if not rows:
         raise ValueError("tensorization requires rows")
+    _validate_opportunity_rows(rows, opportunity_mode)
     if (
         isinstance(trigger_row_multiplier, bool)
         or not isinstance(trigger_row_multiplier, (int, float))
@@ -311,6 +387,24 @@ def tensorize(
             [capturable_feature_vector(row.features) for row in rows],
             dtype=torch.float32,
         ),
+        rule_opportunities=(
+            None
+            if opportunity_mode is None
+            else (
+                torch.zeros(
+                    (
+                        len(rows),
+                        *CAPTURABLE_OPPORTUNITY_SHAPE,
+                    ),
+                    dtype=torch.float32,
+                )
+                if opportunity_mode == "zero-ablation"
+                else torch.tensor(
+                    [row.rule_opportunities for row in rows],
+                    dtype=torch.float32,
+                )
+            )
+        ),
         colors=torch.tensor(
             [0 if row.features.player_color == "white" else 1 for row in rows],
             dtype=torch.long,
@@ -344,6 +438,26 @@ def tensorize(
             dtype=torch.bool,
         ),
     )
+
+
+def _validate_opportunity_rows(
+    rows: Sequence[CapturableDatasetRow],
+    opportunity_mode: str | None,
+) -> None:
+    if opportunity_mode is None:
+        if any(row.rule_opportunities is not None for row in rows):
+            raise ValueError(
+                "schema-9 rows require an explicit opportunity mode"
+            )
+        return
+    if opportunity_mode not in CAPTURABLE_OPPORTUNITY_MODES:
+        raise ValueError(
+            "opportunity_mode must be public-exact or zero-ablation"
+        )
+    if any(row.rule_opportunities is None for row in rows):
+        raise ValueError(
+            "opportunity-aware training requires schema-9 rows"
+        )
 
 
 def _validated_game_source_weights(
@@ -388,6 +502,12 @@ def _selected_drawback_logits(outputs: Mapping[str, Any], colors: Any) -> Any:
         outputs["white_drawback"],
         outputs["black_drawback"],
     )
+
+
+def _model_outputs(model: Any, batch: TensorRows) -> Mapping[str, Any]:
+    if batch.rule_opportunities is None:
+        return model(batch.inputs)
+    return model(batch.inputs, batch.rule_opportunities)
 
 
 def _batch_loss(
@@ -504,6 +624,11 @@ def _smoothed_log_priors(
 def _slice_tensors(batch: TensorRows, indices: Any) -> TensorRows:
     return TensorRows(
         inputs=batch.inputs[indices],
+        rule_opportunities=(
+            None
+            if batch.rule_opportunities is None
+            else batch.rule_opportunities[indices]
+        ),
         colors=batch.colors[indices],
         drawbacks=batch.drawbacks[indices],
         triggered=batch.triggered[indices],
@@ -534,7 +659,10 @@ def _raw_predictions(
         for start in range(0, len(tensors.inputs), batch_size):
             stop = min(start + batch_size, len(tensors.inputs))
             indices = slice(start, stop)
-            outputs = model(tensors.inputs[indices])
+            outputs = _model_outputs(
+                model,
+                _slice_tensors(tensors, indices),
+            )
             selected = _selected_drawback_logits(
                 outputs, tensors.colors[indices]
             )
@@ -845,6 +973,7 @@ def train_capturable_baseline(
     config: CapturableTrainingConfig,
     *,
     train_game_source_weights: Mapping[str, float] | None = None,
+    opportunity_mode: str | None = None,
 ) -> tuple[Any, Mapping[str, Any]]:
     """Train from random initialization and select epochs on validation only."""
 
@@ -871,10 +1000,22 @@ def train_capturable_baseline(
         train_rows,
         config.trigger_row_multiplier,
         train_game_source_weights,
+        opportunity_mode,
     )
-    validation_tensors = tensorize(validation_rows)
-    test_tensors = None if test_rows is None else tensorize(test_rows)
-    model = create_capturable_model(config.hidden_dimension)
+    validation_tensors = tensorize(
+        validation_rows,
+        opportunity_mode=opportunity_mode,
+    )
+    test_tensors = (
+        None
+        if test_rows is None
+        else tensorize(test_rows, opportunity_mode=opportunity_mode)
+    )
+    model = (
+        create_capturable_model(config.hidden_dimension)
+        if opportunity_mode is None
+        else create_capturable_opportunity_model(config.hidden_dimension)
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
@@ -897,7 +1038,7 @@ def train_capturable_baseline(
             indices = order[start : start + config.batch_size]
             batch = _slice_tensors(train_tensors, indices)
             optimizer.zero_grad(set_to_none=True)
-            outputs = model(batch.inputs)
+            outputs = _model_outputs(model, batch)
             loss = _batch_loss(outputs, batch, config)
             loss.backward()
             optimizer.step()
@@ -977,12 +1118,18 @@ def train_capturable_baseline(
     if best_state is None:
         raise RuntimeError("training did not produce a selected epoch")
     model.load_state_dict(best_state)
+    opportunity_contract = _opportunity_contract(opportunity_mode)
     report: dict[str, Any] = {
         "format": CAPTURABLE_BASELINE_FORMAT,
-        "version": CAPTURABLE_BASELINE_VERSION,
+        "version": (
+            CAPTURABLE_BASELINE_VERSION
+            if opportunity_mode is None
+            else CAPTURABLE_OPPORTUNITY_BASELINE_VERSION
+        ),
         "freshStart": True,
         "ruleIds": list(CAPTURABLE_RULE_IDS),
         "featureDimension": CAPTURABLE_FEATURE_DIMENSION,
+        **opportunity_contract,
         "config": _jsonable(config),
         "selectedEpoch": best_epoch,
         "selectedFusionAlpha": best_fusion_alpha,
@@ -1012,6 +1159,27 @@ def train_capturable_baseline(
             best_prior_smoothing,
         )
     return model, report
+
+
+def _opportunity_contract(
+    opportunity_mode: str | None,
+) -> Mapping[str, Any]:
+    if opportunity_mode is None:
+        return {}
+    if opportunity_mode not in CAPTURABLE_OPPORTUNITY_MODES:
+        raise ValueError(
+            "opportunity_mode must be public-exact or zero-ablation"
+        )
+    return {
+        "symbolicFeatureVersion": (
+            CAPTURABLE_OPPORTUNITY_SYMBOLIC_FEATURE_VERSION
+        ),
+        "opportunityFeatureVersion": CAPTURABLE_OPPORTUNITY_FEATURE_VERSION,
+        "opportunityRuleIds": list(CAPTURABLE_RULE_IDS),
+        "opportunityFields": list(CAPTURABLE_OPPORTUNITY_FIELDS),
+        "opportunityShape": list(CAPTURABLE_OPPORTUNITY_SHAPE),
+        "opportunityMode": opportunity_mode,
+    }
 
 
 def _jsonable(value: Any) -> Any:
@@ -1108,6 +1276,7 @@ def run_training(
     output_directory: Path,
     config: CapturableTrainingConfig,
     train_source_weights: Sequence[float] | None = None,
+    opportunity_mode: str | None = None,
 ) -> Mapping[str, Any]:
     report_path = output_directory / "evaluation.json"
     checkpoint_path = output_directory / "model.pt"
@@ -1119,11 +1288,14 @@ def run_training(
         train_paths,
         train_source_weights,
     )
-    train_sources = [
-        load_capturable_dataset(path) for path in train_paths
-    ]
-    validation_rows = load_capturable_dataset(validation_path)
-    test_rows = load_capturable_dataset(test_path)
+    dataset_loader = (
+        load_capturable_dataset
+        if opportunity_mode is None
+        else load_capturable_opportunity_dataset
+    )
+    train_sources = [dataset_loader(path) for path in train_paths]
+    validation_rows = dataset_loader(validation_path)
+    test_rows = dataset_loader(test_path)
     assert_disjoint_games(
         *train_sources,
         validation_rows,
@@ -1153,6 +1325,7 @@ def run_training(
         test_rows,
         config,
         train_game_source_weights=game_source_weights,
+        opportunity_mode=opportunity_mode,
     )
     input_identity = {
         "train": {
@@ -1216,9 +1389,15 @@ def run_training(
             "selectedPriorSmoothing": measured["selectedPriorSmoothing"],
             "ruleIds": list(CAPTURABLE_RULE_IDS),
             "featureDimension": CAPTURABLE_FEATURE_DIMENSION,
+            **_opportunity_contract(opportunity_mode),
             "config": _jsonable(config),
             "inputs": input_identity,
         },
+        artifact_version=(
+            CAPTURABLE_BASELINE_VERSION
+            if opportunity_mode is None
+            else CAPTURABLE_OPPORTUNITY_BASELINE_VERSION
+        ),
     )
     report = {
         **measured,
@@ -1291,6 +1470,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--hidden-dimension", type=int, default=128)
     parser.add_argument("--torch-threads", type=int, default=14)
     parser.add_argument(
+        "--opportunity-mode",
+        choices=CAPTURABLE_OPPORTUNITY_MODES,
+        help=(
+            "Enable strict schema-9 opportunities or its zero-input ablation."
+        ),
+    )
+    parser.add_argument(
         "--trigger-row-multiplier",
         type=float,
         default=1.0,
@@ -1315,6 +1501,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         options.output,
         config,
         options.train_source_weight,
+        options.opportunity_mode,
     )
     print(json.dumps(result, allow_nan=False, sort_keys=True))
     return 0

@@ -8,8 +8,13 @@ import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .capturable_baseline import _canonical_json, _publish_bytes
+from .capturable_baseline import (
+    _canonical_json,
+    _opportunity_contract,
+    _publish_bytes,
+)
 from .capturable_experiment import (
+    CAPTURABLE_OPPORTUNITY_SELECTION_VERSION,
     CAPTURABLE_SELECTION_FORMAT,
     CAPTURABLE_SELECTION_VERSION,
     _load_selection_checkpoint,
@@ -114,9 +119,15 @@ def _validated_candidate(
     path: Path,
 ) -> tuple[dict[str, Any], Mapping[str, Any]]:
     report, report_sha256 = _selection_report(path)
+    report_version = report.get("version")
     if (
         report.get("format") != CAPTURABLE_SELECTION_FORMAT
-        or report.get("version") != CAPTURABLE_SELECTION_VERSION
+        or type(report_version) is not int
+        or report_version
+        not in {
+            CAPTURABLE_SELECTION_VERSION,
+            CAPTURABLE_OPPORTUNITY_SELECTION_VERSION,
+        }
         or report.get("freshStart") is not True
         or report.get("sealedTestStatus") != "unopened"
         or report.get("ruleIds") != list(CAPTURABLE_RULE_IDS)
@@ -205,6 +216,44 @@ def _validated_candidate(
     _, checkpoint_metadata, measured_checkpoint_sha256 = (
         _load_selection_checkpoint(checkpoint_path)
     )
+    opportunity_keys = {
+        "symbolicFeatureVersion",
+        "opportunityFeatureVersion",
+        "opportunityRuleIds",
+        "opportunityFields",
+        "opportunityShape",
+        "opportunityMode",
+    }
+    opportunity_contract: Mapping[str, Any] = {}
+    if report_version == CAPTURABLE_OPPORTUNITY_SELECTION_VERSION:
+        try:
+            opportunity_contract = _opportunity_contract(
+                report.get("opportunityMode")
+            )
+        except ValueError as error:
+            raise CapturableDatasetError(
+                f"{path.name} opportunity contract is invalid"
+            ) from error
+        if (
+            any(
+                report.get(key) != value
+                for key, value in opportunity_contract.items()
+            )
+            or any(
+                checkpoint_metadata.get(key) != value
+                for key, value in opportunity_contract.items()
+            )
+        ):
+            raise CapturableDatasetError(
+                f"{path.name} opportunity contract is invalid"
+            )
+    elif (
+        any(key in report for key in opportunity_keys)
+        or any(key in checkpoint_metadata for key in opportunity_keys)
+    ):
+        raise CapturableDatasetError(
+            f"{path.name} legacy selection declares opportunities"
+        )
     if (
         measured_checkpoint_sha256 != checkpoint_sha256
         or checkpoint_metadata.get("validation") != validation
@@ -232,6 +281,11 @@ def _validated_candidate(
             "validationGameNormalizedTop1": top1,
             "validationGameNormalizedTop3": top3,
             "validationGameNormalizedNll": nll,
+            **(
+                {}
+                if not opportunity_contract
+                else {"opportunityContract": dict(opportunity_contract)}
+            ),
         },
         report,
     )
@@ -260,6 +314,58 @@ def _comparable_config(config: Mapping[str, Any]) -> Mapping[str, Any]:
     }
 
 
+def _opportunity_mode(candidate: Mapping[str, Any]) -> str | None:
+    contract = candidate.get("opportunityContract")
+    if not isinstance(contract, Mapping):
+        return None
+    mode = contract.get("opportunityMode")
+    return mode if isinstance(mode, str) else None
+
+
+def _validate_cross_mode_opportunity_ablation(
+    control: Mapping[str, Any],
+    control_report: Mapping[str, Any],
+    treatment: Mapping[str, Any],
+    treatment_report: Mapping[str, Any],
+    *,
+    label: str,
+) -> None:
+    control_mode = _opportunity_mode(control)
+    treatment_mode = _opportunity_mode(treatment)
+    if control_mode == treatment_mode:
+        return
+    if (
+        control_mode != "zero-ablation"
+        or treatment_mode != "public-exact"
+    ):
+        raise CapturableDatasetError(
+            f"{label} cross-mode opportunity comparison must use "
+            "zero-ablation control and public-exact treatment"
+        )
+    if control["seed"] != treatment["seed"]:
+        raise CapturableDatasetError(
+            f"{label} cross-mode opportunity comparison must use "
+            "the same seed"
+        )
+    if control_report["config"] != treatment_report["config"]:
+        raise CapturableDatasetError(
+            f"{label} cross-mode opportunity comparison must use "
+            "the same full training configuration"
+        )
+    control_inputs = control_report["inputs"]
+    treatment_inputs = treatment_report["inputs"]
+    if control_inputs["train"] != treatment_inputs["train"]:
+        raise CapturableDatasetError(
+            f"{label} cross-mode opportunity comparison must use "
+            "the same training input"
+        )
+    if control_inputs["validation"] != treatment_inputs["validation"]:
+        raise CapturableDatasetError(
+            f"{label} cross-mode opportunity comparison must use "
+            "the same validation input"
+        )
+
+
 def run_candidate_selection(
     report_paths: Sequence[Path],
     output_path: Path,
@@ -272,7 +378,7 @@ def run_candidate_selection(
         raise ValueError("candidate selection requires at least two reports")
     candidates: list[dict[str, Any]] = []
     common_inputs: Any = None
-    identities: set[tuple[int, float]] = set()
+    identities: set[tuple[int, float, str | None]] = set()
     for path in report_paths:
         candidate, report = _validated_candidate(path)
         inputs = report.get("inputs")
@@ -284,10 +390,17 @@ def run_candidate_selection(
             )
         seed = candidate["seed"]
         trigger = candidate["triggerRowMultiplier"]
-        identity = (seed, trigger)
+        opportunity_contract = candidate.get("opportunityContract")
+        opportunity_mode = (
+            opportunity_contract.get("opportunityMode")
+            if isinstance(opportunity_contract, Mapping)
+            else None
+        )
+        identity = (seed, trigger, opportunity_mode)
         if identity in identities:
             raise CapturableDatasetError(
-                "candidate seed and trigger multiplier must be unique"
+                "candidate seed, trigger multiplier, and opportunity mode "
+                "must be unique"
             )
         identities.add(identity)
         candidates.append(candidate)
@@ -349,6 +462,13 @@ def run_treatment_comparison(
     treatment_reports: dict[str, Mapping[str, Any]] = {}
     for path in treatment_report_paths:
         treatment, report = _validated_candidate(path)
+        _validate_cross_mode_opportunity_ablation(
+            control,
+            control_report,
+            treatment,
+            report,
+            label="control and treatment",
+        )
         identity = (
             treatment["selectionReportSha256"],
             treatment["checkpointSha256"],
@@ -549,7 +669,14 @@ def load_treatment_comparison(
         raise CapturableDatasetError(
             f"{path.name} validation identity is inconsistent"
         )
-    for _, report in treatments_with_reports:
+    for treatment, report in treatments_with_reports:
+        _validate_cross_mode_opportunity_ablation(
+            control,
+            control_report,
+            treatment,
+            report,
+            label=path.name,
+        )
         if report["inputs"]["validation"] != validation_input:
             raise CapturableDatasetError(
                 f"{path.name} candidates use different validation inputs"

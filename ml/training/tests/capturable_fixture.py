@@ -3,6 +3,9 @@ from __future__ import annotations
 from typing import Any
 
 from drawback_ml.capturable_records import (
+    CAPTURABLE_OPPORTUNITY_FEATURE_VERSION,
+    CAPTURABLE_OPPORTUNITY_FIELDS,
+    CAPTURABLE_OPPORTUNITY_SYMBOLIC_FEATURE_VERSION,
     CAPTURABLE_RULE_IDS,
     CAPTURABLE_SYMBOLIC_FEATURE_VERSION,
 )
@@ -83,4 +86,23 @@ def capturable_row(
         "botAgentId": "material-player-private-corpus/v1",
         "botStyle": "drawback-search",
         "botStrength": None,
+    }
+
+
+def capturable_opportunity_row(
+    **arguments: Any,
+) -> dict[str, Any]:
+    row = capturable_row(**arguments)
+    flattened = [
+        ((rule_index + field_index) % 11) / 10.0
+        for rule_index, _ in enumerate(CAPTURABLE_RULE_IDS)
+        for field_index, _ in enumerate(CAPTURABLE_OPPORTUNITY_FIELDS)
+    ]
+    return {
+        **row,
+        "symbolicFeatureVersion": (
+            CAPTURABLE_OPPORTUNITY_SYMBOLIC_FEATURE_VERSION
+        ),
+        "opportunityFeatureVersion": CAPTURABLE_OPPORTUNITY_FEATURE_VERSION,
+        "symbolicActiveRuleOpportunityFeatures": flattened,
     }

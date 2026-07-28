@@ -7,15 +7,21 @@ import unittest
 
 import _bootstrap  # noqa: F401
 
-from capturable_fixture import capturable_row
+from capturable_fixture import (
+    capturable_opportunity_row,
+    capturable_row,
+)
 from drawback_ml.capturable_records import (
     CAPTURABLE_FEATURE_DIMENSION,
+    CAPTURABLE_OPPORTUNITY_DIMENSION,
+    CAPTURABLE_OPPORTUNITY_SHAPE,
     CAPTURABLE_RULE_COUNT,
     CAPTURABLE_RULE_INDEX,
     CapturableDatasetError,
     assert_disjoint_games,
     capturable_feature_vector,
     parse_capturable_dataset_row,
+    parse_capturable_opportunity_dataset_row,
     read_capturable_dataset,
 )
 
@@ -70,6 +76,102 @@ class CapturableRecordTests(unittest.TestCase):
             f"must contain {CAPTURABLE_RULE_COUNT} probabilities",
         ):
             parse_capturable_dataset_row(legacy_vocabulary)
+
+    def test_schema_eight_and_nine_are_mutually_exclusive(self) -> None:
+        schema_eight = capturable_row()
+        schema_nine = capturable_opportunity_row()
+
+        with self.assertRaisesRegex(
+            CapturableDatasetError,
+            "unknown opportunityFeatureVersion",
+        ):
+            parse_capturable_dataset_row(schema_nine)
+        with self.assertRaisesRegex(
+            CapturableDatasetError,
+            "missing opportunityFeatureVersion",
+        ):
+            parse_capturable_opportunity_dataset_row(schema_eight)
+        with self.assertRaisesRegex(
+            CapturableDatasetError,
+            "capturable schema 9 does not accept evaluator constraints",
+        ):
+            parse_capturable_opportunity_dataset_row(
+                {
+                    **schema_nine,
+                    "publicEvaluatorConstraint": {},
+                }
+            )
+
+    def test_schema_nine_parses_exact_flat_rule_opportunities(self) -> None:
+        row = capturable_opportunity_row()
+        parsed = parse_capturable_opportunity_dataset_row(row)
+
+        self.assertIsNotNone(parsed.rule_opportunities)
+        self.assertEqual(
+            (
+                len(parsed.rule_opportunities or ()),
+                len((parsed.rule_opportunities or ())[0]),
+            ),
+            CAPTURABLE_OPPORTUNITY_SHAPE,
+        )
+        self.assertEqual(
+            tuple(
+                value
+                for rule in (parsed.rule_opportunities or ())
+                for value in rule
+            ),
+            tuple(row["symbolicActiveRuleOpportunityFeatures"]),
+        )
+        legacy = parse_capturable_dataset_row(capturable_row())
+        self.assertEqual(
+            capturable_feature_vector(parsed.features),
+            capturable_feature_vector(legacy.features),
+        )
+
+    def test_schema_nine_rejects_wrong_dimension_and_range(self) -> None:
+        valid = capturable_opportunity_row()
+        invalid_values = (
+            [0.0] * (CAPTURABLE_OPPORTUNITY_DIMENSION - 1),
+            [0.0] * (CAPTURABLE_OPPORTUNITY_DIMENSION + 1),
+            [0.0] * (CAPTURABLE_OPPORTUNITY_DIMENSION - 1) + [-0.01],
+            [0.0] * (CAPTURABLE_OPPORTUNITY_DIMENSION - 1) + [1.01],
+            [0.0] * (CAPTURABLE_OPPORTUNITY_DIMENSION - 1)
+            + [float("nan")],
+            [0.0] * (CAPTURABLE_OPPORTUNITY_DIMENSION - 1) + [True],
+        )
+
+        for values in invalid_values:
+            with self.subTest(last=values[-1], count=len(values)):
+                with self.assertRaisesRegex(
+                    CapturableDatasetError,
+                    f"exactly {CAPTURABLE_OPPORTUNITY_DIMENSION}",
+                ):
+                    parse_capturable_opportunity_dataset_row(
+                        {
+                            **valid,
+                            "symbolicActiveRuleOpportunityFeatures": values,
+                        }
+                    )
+
+        with self.assertRaisesRegex(
+            CapturableDatasetError,
+            "opportunityFeatureVersion must be 1",
+        ):
+            parse_capturable_opportunity_dataset_row(
+                {**valid, "opportunityFeatureVersion": 2}
+            )
+        for field, value, message in (
+            ("symbolicFeatureVersion", 9.0, "symbolicFeatureVersion"),
+            ("opportunityFeatureVersion", 1.0, "opportunityFeatureVersion"),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(
+                    CapturableDatasetError,
+                    message,
+                ):
+                    parse_capturable_opportunity_dataset_row(
+                        {**valid, field: value}
+                    )
 
     def test_same_length_histories_preserve_public_piece_behavior(self) -> None:
         pawn_history = capturable_row(color="black")
