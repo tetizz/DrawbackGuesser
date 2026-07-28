@@ -14,6 +14,12 @@ export {
   canonicalParameterValue,
   expandHypothesisSeeds,
 } from "./parameters.js";
+export {
+  aggregateRuleOpportunityFeatures,
+  RULE_OPPORTUNITY_FEATURE_FIELDS,
+  RULE_OPPORTUNITY_FEATURE_VERSION,
+  RULE_OPPORTUNITY_FEATURE_WIDTH,
+} from "./opportunity.js";
 export type {
   DrawbackHypothesis,
   ExternalConstraintHypothesisSeed,
@@ -38,6 +44,7 @@ export type {
   PredictorOptions,
   PredictionSeeds,
   PredictionState,
+  RuleOpportunityFeatureField,
   RulePosterior,
   UnavailableHypothesisMoveOpportunity,
 } from "./types.js";

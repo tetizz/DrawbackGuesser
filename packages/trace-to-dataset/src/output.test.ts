@@ -171,4 +171,45 @@ describe("private training dataset output", () => {
       code: "ENOENT",
     });
   });
+
+  it("preserves capturable schema-9 bytes across monolithic and sharded output", async () => {
+    const monolithic = temporaryDataset("capturable-monolithic");
+    const firstShard = temporaryDataset("capturable-first-shard");
+    const secondShard = temporaryDataset("capturable-second-shard");
+    const first = playerPrivateTraceFixture({
+      seed: 1,
+      parameterSeeds: { white: 11, black: 12 },
+    });
+    const second = playerPrivateTraceFixture({
+      seed: 2,
+      parameterSeeds: { white: 21, black: 22 },
+    });
+    const options = {
+      expectedAuthorityId: "capturable-king/v1" as const,
+      expectedEvaluatorCoverage: "none" as const,
+    };
+
+    await writeTrainingDatasetNdjsonFileAtomic(
+      monolithic,
+      [first, second],
+      options,
+    );
+    await writeTrainingDatasetNdjsonFileAtomic(firstShard, [first], options);
+    await writeTrainingDatasetNdjsonFileAtomic(secondShard, [second], options);
+
+    const monolithicBytes = await readFile(monolithic);
+    expect(monolithicBytes).toEqual(
+      Buffer.concat([
+        await readFile(firstShard),
+        await readFile(secondShard),
+      ]),
+    );
+    const firstRow = JSON.parse(
+      monolithicBytes.toString("utf8").split("\n")[0] ?? "{}",
+    ) as Readonly<Record<string, unknown>>;
+    expect(firstRow["opportunityFeatureVersion"]).toBe(1);
+    expect(firstRow["symbolicActiveRuleOpportunityFeatures"]).toHaveLength(
+      100,
+    );
+  });
 });

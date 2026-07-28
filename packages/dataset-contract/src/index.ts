@@ -44,6 +44,11 @@ export interface PublicFeatureRecord {
   readonly ordinaryLegalMoves: readonly string[];
   readonly clockMs: number | null;
   readonly symbolicFeatureVersion: number;
+  /**
+   * Present only in capturable symbolic schema 9.
+   */
+  readonly opportunityFeatureVersion?: 1;
+  readonly symbolicActiveRuleOpportunityFeatures?: readonly number[];
   readonly symbolicWhiteRuleProbabilities: readonly number[];
   readonly symbolicBlackRuleProbabilities: readonly number[];
   readonly symbolicWhiteEliminated: readonly boolean[];
@@ -104,6 +109,17 @@ export const CAPTURABLE_PUBLIC_FEATURE_KEYS = Object.freeze([
   ...PUBLIC_FEATURE_KEYS,
   "authorityId",
   "publicAuthorityPositionBefore",
+] as const);
+
+export const CAPTURABLE_OPPORTUNITY_FEATURE_VERSION = 1 as const;
+export const CAPTURABLE_LEGACY_SYMBOLIC_FEATURE_VERSION = 8 as const;
+export const CAPTURABLE_OPPORTUNITY_SYMBOLIC_FEATURE_VERSION = 9 as const;
+export const CAPTURABLE_RULE_OPPORTUNITY_FEATURE_WIDTH = 4 as const;
+
+export const CAPTURABLE_OPPORTUNITY_PUBLIC_FEATURE_KEYS = Object.freeze([
+  ...CAPTURABLE_PUBLIC_FEATURE_KEYS,
+  "opportunityFeatureVersion",
+  "symbolicActiveRuleOpportunityFeatures",
 ] as const);
 
 export const FORBIDDEN_FEATURE_KEYS = Object.freeze([
@@ -241,6 +257,38 @@ function probabilityArray(
   return Object.freeze([...probabilities]);
 }
 
+function unitIntervalArray(
+  value: unknown,
+  length: number,
+  label: string,
+): readonly number[] {
+  if (
+    !Array.isArray(value)
+    || value.length !== length
+    || value.some(
+      (item) =>
+        typeof item !== "number"
+        || !Number.isFinite(item)
+        || item < 0
+        || item > 1,
+    )
+  ) {
+    throw new DatasetContractError(
+      `${label} must contain ${String(length)} finite values between zero and one`,
+    );
+  }
+  return Object.freeze([...(value as number[])]);
+}
+
+function opportunityFeatureVersion(value: unknown): 1 {
+  if (value !== CAPTURABLE_OPPORTUNITY_FEATURE_VERSION) {
+    throw new DatasetContractError(
+      `opportunityFeatureVersion must be ${String(CAPTURABLE_OPPORTUNITY_FEATURE_VERSION)}`,
+    );
+  }
+  return CAPTURABLE_OPPORTUNITY_FEATURE_VERSION;
+}
+
 function booleanArray(
   value: unknown,
   ruleCount: number,
@@ -326,10 +374,33 @@ function checkedSchema(schema: DatasetSchema): DatasetSchema {
   ) {
     throw new DatasetContractError("dataset authorityId is unsupported");
   }
+  if (
+    authorityId === "capturable-king/v1"
+    && schema.symbolicFeatureVersion
+      !== CAPTURABLE_LEGACY_SYMBOLIC_FEATURE_VERSION
+    && schema.symbolicFeatureVersion
+      !== CAPTURABLE_OPPORTUNITY_SYMBOLIC_FEATURE_VERSION
+  ) {
+    throw new DatasetContractError(
+      `capturable symbolicFeatureVersion must be ${String(CAPTURABLE_LEGACY_SYMBOLIC_FEATURE_VERSION)} or ${String(CAPTURABLE_OPPORTUNITY_SYMBOLIC_FEATURE_VERSION)}`,
+    );
+  }
   return Object.freeze({
     ...schema,
     authorityId,
   });
+}
+
+function publicFeatureKeys(
+  schema: DatasetSchema,
+): readonly string[] {
+  if (schema.authorityId !== "capturable-king/v1") {
+    return PUBLIC_FEATURE_KEYS;
+  }
+  return schema.symbolicFeatureVersion
+      === CAPTURABLE_OPPORTUNITY_SYMBOLIC_FEATURE_VERSION
+    ? CAPTURABLE_OPPORTUNITY_PUBLIC_FEATURE_KEYS
+    : CAPTURABLE_PUBLIC_FEATURE_KEYS;
 }
 
 function hiddenParameters(value: unknown): unknown {
@@ -446,10 +517,7 @@ export function parsePublicFeatureRecord(
       ].join(", ")}`,
     );
   }
-  const featureKeys =
-    schema.authorityId === "capturable-king/v1"
-      ? CAPTURABLE_PUBLIC_FEATURE_KEYS
-      : PUBLIC_FEATURE_KEYS;
+  const featureKeys = publicFeatureKeys(schema);
   assertExactKeys(value, featureKeys, "public feature record");
 
   const playerColor = value["playerColor"];
@@ -487,6 +555,22 @@ export function parsePublicFeatureRecord(
           fenBefore,
         )
       : null;
+  const opportunity =
+    schema.authorityId === "capturable-king/v1"
+      && schema.symbolicFeatureVersion
+        === CAPTURABLE_OPPORTUNITY_SYMBOLIC_FEATURE_VERSION
+      ? {
+          opportunityFeatureVersion: opportunityFeatureVersion(
+            value["opportunityFeatureVersion"],
+          ),
+          symbolicActiveRuleOpportunityFeatures: unitIntervalArray(
+            value["symbolicActiveRuleOpportunityFeatures"],
+            schema.symbolicRuleCount
+              * CAPTURABLE_RULE_OPPORTUNITY_FEATURE_WIDTH,
+            "symbolicActiveRuleOpportunityFeatures",
+          ),
+        }
+      : null;
   return Object.freeze({
     ...(authority === null
       ? {}
@@ -494,6 +578,7 @@ export function parsePublicFeatureRecord(
           authorityId: "capturable-king/v1" as const,
           publicAuthorityPositionBefore: authority,
         }),
+    ...(opportunity === null ? {} : opportunity),
     fenBefore,
     move,
     moveNumber,
@@ -538,10 +623,7 @@ export function parseDatasetRow(
 ): ParsedDatasetRow {
   const checked = checkedSchema(schema);
   const row = record(input, "dataset row");
-  const featureKeys =
-    checked.authorityId === "capturable-king/v1"
-      ? CAPTURABLE_PUBLIC_FEATURE_KEYS
-      : PUBLIC_FEATURE_KEYS;
+  const featureKeys = publicFeatureKeys(checked);
   assertExactKeys(
     row,
     [

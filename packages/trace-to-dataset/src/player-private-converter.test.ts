@@ -27,7 +27,8 @@ describe("player-private Engine trace conversion", () => {
       playerColor: "white",
       historySan: [],
       ordinaryLegalMoves: trace.plies[0]?.authorityLegalMoves,
-      symbolicFeatureVersion: 8,
+      symbolicFeatureVersion: 9,
+      opportunityFeatureVersion: 1,
       trueDrawback: "vegan",
       hiddenParameters: {},
       drawbackInternalState: { movesApplied: 0 },
@@ -44,6 +45,14 @@ describe("player-private Engine trace conversion", () => {
     expect(CAPTURABLE_SYMBOLIC_RULE_COUNT).toBe(
       CAPTURABLE_HYPOTHESIS_RULE_IDS.length,
     );
+    expect(rows[0]?.symbolicActiveRuleOpportunityFeatures).toHaveLength(
+      CAPTURABLE_SYMBOLIC_RULE_COUNT * 4,
+    );
+    expect(
+      rows[0]?.symbolicActiveRuleOpportunityFeatures?.every(
+        (value) => Number.isFinite(value) && value >= 0 && value <= 1,
+      ),
+    ).toBe(true);
     expect(
       rows[0]?.symbolicWhiteRuleProbabilities.reduce(
         (sum, probability) => sum + probability,
@@ -62,9 +71,31 @@ describe("player-private Engine trace conversion", () => {
       blackRuleId: "spice-of-life",
     });
 
-    expect(deriveCapturablePublicDatasetRows(second)).toEqual(
-      deriveCapturablePublicDatasetRows(first),
+    const firstPublicRows = deriveCapturablePublicDatasetRows(first);
+    const secondPublicRows = deriveCapturablePublicDatasetRows(second);
+    expect(secondPublicRows).toEqual(firstPublicRows);
+    expect(
+      secondPublicRows[0]?.features
+        .symbolicActiveRuleOpportunityFeatures,
+    ).toEqual(
+      firstPublicRows[0]?.features
+        .symbolicActiveRuleOpportunityFeatures,
     );
+    const serializedPublicRows = JSON.stringify(firstPublicRows);
+    for (
+      const privateOpportunityKey of [
+        "hypothesisIndex",
+        "observedMoveLegal",
+        "allowedMoveCount",
+        "drawbackId",
+        "parameters",
+        "internalState",
+      ]
+    ) {
+      expect(serializedPublicRows).not.toContain(
+        `"${privateOpportunityKey}"`,
+      );
+    }
     expect(
       convertPlayerPrivateTraceToDatasetRows(first).map(
         (row) => row.trueDrawback,

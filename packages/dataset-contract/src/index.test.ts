@@ -10,8 +10,14 @@ const schema = {
   symbolicRuleCount: 2,
 } as const;
 
-const capturableSchema = {
-  symbolicFeatureVersion: 7,
+const capturableSchema8 = {
+  symbolicFeatureVersion: 8,
+  symbolicRuleCount: 2,
+  authorityId: "capturable-king/v1",
+} as const;
+
+const capturableSchema9 = {
+  symbolicFeatureVersion: 9,
   symbolicRuleCount: 2,
   authorityId: "capturable-king/v1",
 } as const;
@@ -57,7 +63,7 @@ function datasetRow(): Record<string, unknown> {
 function capturablePublicFeatures(): Record<string, unknown> {
   return {
     ...publicFeatures(),
-    symbolicFeatureVersion: 7,
+    symbolicFeatureVersion: 8,
     authorityId: "capturable-king/v1",
     publicAuthorityPositionBefore: {
       format: "drawbacktrainer-public-position",
@@ -72,6 +78,18 @@ function capturablePublicFeatures(): Record<string, unknown> {
       },
       terminal: null,
     },
+  };
+}
+
+function capturableOpportunityPublicFeatures(): Record<string, unknown> {
+  return {
+    ...capturablePublicFeatures(),
+    symbolicFeatureVersion: 9,
+    opportunityFeatureVersion: 1,
+    symbolicActiveRuleOpportunityFeatures: [
+      1, 0.5, 1, 0,
+      0.25, 0.125, 0, 0,
+    ],
   };
 }
 
@@ -125,7 +143,7 @@ describe("public feature boundary", () => {
   it("accepts only the complete public capturable authority snapshot", () => {
     const parsed = parsePublicFeatureRecord(
       capturablePublicFeatures(),
-      capturableSchema,
+      capturableSchema8,
     );
     expect(parsed.authorityId).toBe("capturable-king/v1");
     expect(parsed.publicAuthorityPositionBefore?.kingPassant).toEqual({
@@ -140,7 +158,7 @@ describe("public feature boundary", () => {
       hiddenParameters: { square: "e4" },
     };
     expect(() =>
-      parsePublicFeatureRecord(poisoned, capturableSchema)
+      parsePublicFeatureRecord(poisoned, capturableSchema8)
     ).toThrow(/unknown hiddenParameters/u);
   });
 
@@ -149,6 +167,93 @@ describe("public feature boundary", () => {
       parsePublicFeatureRecord(capturablePublicFeatures(), schema)
     ).toThrow(/unknown authorityId/u);
   });
+
+  it("requires the exact schema-9 opportunity contract", () => {
+    const parsed = parsePublicFeatureRecord(
+      capturableOpportunityPublicFeatures(),
+      capturableSchema9,
+    );
+
+    expect(parsed.opportunityFeatureVersion).toBe(1);
+    expect(parsed.symbolicActiveRuleOpportunityFeatures).toEqual([
+      1, 0.5, 1, 0,
+      0.25, 0.125, 0, 0,
+    ]);
+    expect(Object.isFrozen(
+      parsed.symbolicActiveRuleOpportunityFeatures,
+    )).toBe(true);
+
+    const missingVersion = capturableOpportunityPublicFeatures();
+    delete missingVersion["opportunityFeatureVersion"];
+    expect(() =>
+      parsePublicFeatureRecord(missingVersion, capturableSchema9)
+    ).toThrow(/missing opportunityFeatureVersion/u);
+
+    expect(() =>
+      parsePublicFeatureRecord(
+        {
+          ...capturableOpportunityPublicFeatures(),
+          opportunityFeatureVersion: 2,
+        },
+        capturableSchema9,
+      )
+    ).toThrow(/opportunityFeatureVersion must be 1/u);
+    expect(() =>
+      parsePublicFeatureRecord(
+        {
+          ...capturableOpportunityPublicFeatures(),
+          symbolicActiveRuleOpportunityFeatures: [
+            1, 0.5, 1, 0,
+            0.25, 0.125, Number.NaN, 0,
+          ],
+        },
+        capturableSchema9,
+      )
+    ).toThrow(/8 finite values/u);
+  });
+
+  it("keeps schema 8 frozen and rejects schema-9 opportunity fields", () => {
+    const legacy = capturablePublicFeatures();
+    legacy["symbolicFeatureVersion"] = 8;
+    expect(
+      parsePublicFeatureRecord(legacy, capturableSchema8),
+    ).not.toHaveProperty("opportunityFeatureVersion");
+    expect(() =>
+      parsePublicFeatureRecord(
+        capturableOpportunityPublicFeatures(),
+        capturableSchema8,
+      )
+    ).toThrow(/unknown opportunityFeatureVersion/u);
+  });
+
+  it.each([7, 10])(
+    "rejects unsupported capturable symbolic schema %i",
+    (symbolicFeatureVersion) => {
+      expect(() =>
+        parsePublicFeatureRecord(
+          {
+            ...capturablePublicFeatures(),
+            symbolicFeatureVersion,
+          },
+          {
+            ...capturableSchema8,
+            symbolicFeatureVersion,
+          },
+        )
+      ).toThrow(/capturable symbolicFeatureVersion must be 8 or 9/u);
+    },
+  );
+
+  it.each([7, 10])(
+    "keeps standard-authority symbolic schema %i generic",
+    (symbolicFeatureVersion) => {
+      const parsed = parsePublicFeatureRecord(
+        { ...publicFeatures(), symbolicFeatureVersion },
+        { ...schema, symbolicFeatureVersion },
+      );
+      expect(parsed.symbolicFeatureVersion).toBe(symbolicFeatureVersion);
+    },
+  );
 });
 
 describe("combined storage row", () => {
@@ -174,5 +279,22 @@ describe("combined storage row", () => {
       parseDatasetRow({ ...datasetRow(), hiddenParameters: null }, schema)
         .labels.hiddenParameters,
     ).toBeNull();
+  });
+
+  it("splits schema-9 opportunity features without exposing labels", () => {
+    const parsed = parseDatasetRow(
+      {
+        ...datasetRow(),
+        ...capturableOpportunityPublicFeatures(),
+      },
+      capturableSchema9,
+    );
+
+    expect(parsed.features.opportunityFeatureVersion).toBe(1);
+    expect(parsed.features.symbolicActiveRuleOpportunityFeatures).toHaveLength(
+      8,
+    );
+    expect(parsed.features).not.toHaveProperty("trueDrawback");
+    expect(parsed.labels.trueDrawback).toBe("vegan");
   });
 });

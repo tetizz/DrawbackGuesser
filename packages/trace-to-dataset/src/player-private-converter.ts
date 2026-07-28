@@ -19,10 +19,12 @@ import {
   type PublicFeatureRecord,
 } from "@drawbackguesser/dataset-contract";
 import {
+  aggregateRuleOpportunityFeatures,
   aggregateRulePosteriors,
   CAPTURABLE_HYPOTHESIS_RULE_IDS,
   createCapturableHypothesisSeeds,
   createPublicMoveObservation,
+  RULE_OPPORTUNITY_FEATURE_VERSION,
   SymbolicPredictor,
   type PredictionState,
 } from "@drawbackguesser/predictor";
@@ -31,7 +33,7 @@ import type {
   TrainingDatasetRow,
 } from "./converter.js";
 
-export const CAPTURABLE_SYMBOLIC_FEATURE_VERSION = 8 as const;
+export const CAPTURABLE_SYMBOLIC_FEATURE_VERSION = 9 as const;
 export const CAPTURABLE_SYMBOLIC_RULE_COUNT =
   CAPTURABLE_HYPOTHESIS_RULE_IDS.length;
 
@@ -186,16 +188,24 @@ function parsedPublicRows(
       ply: ply.ply + 1,
       history: nextHistory,
     };
-    const prediction = predictor.observe(createPublicMoveObservation({
-      authorityId: "capturable-king/v1",
-      authorityPositionBefore: ply.positionBefore,
-      color: ply.color,
-      positionBefore,
-      positionAfter,
-      move,
-    }));
-    const white = posteriorVector(prediction, "white");
-    const black = posteriorVector(prediction, "black");
+    const stateBefore = predictor.state;
+    const prediction = predictor.observeWithOpportunities(
+      createPublicMoveObservation({
+        authorityId: "capturable-king/v1",
+        authorityPositionBefore: ply.positionBefore,
+        color: ply.color,
+        positionBefore,
+        positionAfter,
+        move,
+      }),
+    );
+    const opportunityFeatures = aggregateRuleOpportunityFeatures(
+      stateBefore,
+      prediction.opportunity,
+      CAPTURABLE_HYPOTHESIS_RULE_IDS,
+    );
+    const white = posteriorVector(prediction.state, "white");
+    const black = posteriorVector(prediction.state, "black");
     const agent =
       ply.color === "white" ? source.agents.white : source.agents.black;
     const features: PublicFeatureRecord = {
@@ -212,6 +222,8 @@ function parsedPublicRows(
       ordinaryLegalMoves: [...ply.authorityLegalMoves],
       clockMs: null,
       symbolicFeatureVersion: CAPTURABLE_SYMBOLIC_FEATURE_VERSION,
+      opportunityFeatureVersion: RULE_OPPORTUNITY_FEATURE_VERSION,
+      symbolicActiveRuleOpportunityFeatures: opportunityFeatures,
       symbolicWhiteRuleProbabilities: white.probabilities,
       symbolicBlackRuleProbabilities: black.probabilities,
       symbolicWhiteEliminated: white.eliminated,

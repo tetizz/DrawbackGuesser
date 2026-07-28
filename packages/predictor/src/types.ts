@@ -109,6 +109,12 @@ export interface PredictionObservationResult {
   readonly opportunity: PredictionOpportunitySnapshot;
 }
 
+export type RuleOpportunityFeatureField =
+  | "knownMass"
+  | "allowedMoveFractionMass"
+  | "triggeredMass"
+  | "forcedMass";
+
 /**
  * Public move data available to a real predictor. It deliberately contains no
  * true drawback, secret parameters, or authoritative drawback state.
