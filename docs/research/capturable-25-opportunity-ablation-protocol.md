@@ -51,6 +51,16 @@ new disjoint streams and prove:
 - identical row sets for both ablation arms; and
 - no access to the test rows before one candidate is frozen.
 
+Before training, all four splits must be sealed in one canonical schema-9
+corpus ledger as defined in
+[`schema9-corpus-ledger.md`](../architecture/schema9-corpus-ledger.md). The
+ledger must authenticate the frozen seed roots, exact source and converted
+game-ID/seed arrays, zero-ply accounting, both-color label counts, generator
+receipt identities, producer and converter Engine commits, the pinned Guesser
+gitlink, and the exact `[25, 4]` opportunity contract. Training and evaluation
+must re-authenticate the ledger against the explicitly supplied files; a
+self-hash alone is not sufficient.
+
 The current material-search self-play shard can establish the feature
 pipeline, but cannot by itself prove real-player or strong-engine
 generalization. Stockfish/Fairy-backed self-play and a separately governed

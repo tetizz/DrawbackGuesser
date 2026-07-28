@@ -5,13 +5,15 @@
   "license": "MIT",
   "type": "module",
   "bin": {
-    "drawback-guesser-dataset": "./dist/cli.js"
+    "drawback-guesser-dataset": "./dist/cli.js",
+    "drawback-guesser-schema9-ledger": "./dist/schema9-ledger-cli.js"
   },
   "scripts": {
     "build": "pnpm --filter @drawbackguesser/trace-to-dataset build && tsc -p tsconfig.build.json",
     "typecheck": "pnpm --filter @drawbackguesser/trace-to-dataset build && tsc -p tsconfig.build.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "prestart": "pnpm --workspace-root engine:build",
-    "start": "pnpm --filter @drawbackguesser/trace-to-dataset build && tsx src/cli.ts"
+    "start": "pnpm --filter @drawbackguesser/trace-to-dataset build && tsx src/cli.ts",
+    "start:ledger": "pnpm --filter @drawbackguesser/trace-to-dataset build && tsx src/schema9-ledger-cli.ts"
   },
   "dependencies": {
     "@drawbackengine/simulation-trace": "workspace:*",

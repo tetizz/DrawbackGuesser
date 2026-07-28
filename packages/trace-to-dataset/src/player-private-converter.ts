@@ -255,7 +255,19 @@ export function deriveCapturablePublicDatasetRows(
 export function convertPlayerPrivateTraceToDatasetRows(
   traceInput: unknown,
 ): readonly TrainingDatasetRow[] {
-  const trace = parsePlayerPrivateSimulationTraceRecord(traceInput);
+  return convertParsedPlayerPrivateTraceToDatasetRows(
+    parsePlayerPrivateSimulationTraceRecord(traceInput),
+  );
+}
+
+/**
+ * Internal fast path for a record already returned by the Engine parser.
+ * Callers at trust boundaries must parse first; this avoids repeating full
+ * semantic replay while authenticating large corpora.
+ */
+export function convertParsedPlayerPrivateTraceToDatasetRows(
+  trace: PlayerPrivateSimulationTraceRecord,
+): readonly TrainingDatasetRow[] {
   const publicRows = parsedPublicRows(trace);
   return publicRows.map((publicRow, index) => {
     const ply = trace.plies[index];

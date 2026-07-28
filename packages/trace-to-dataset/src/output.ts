@@ -8,7 +8,7 @@ import {
   type TrainingDatasetRow,
 } from "./converter.js";
 import {
-  convertPlayerPrivateTraceToDatasetRows,
+  convertParsedPlayerPrivateTraceToDatasetRows,
 } from "./player-private-converter.js";
 import {
   parseTrustedSimulationTraceRecord,
@@ -126,7 +126,7 @@ function convertTrustedTrace(
   trace: TrustedSimulationTraceRecord,
 ): readonly TrainingDatasetRow[] {
   return trace.authorityId === "capturable-king/v1"
-    ? convertPlayerPrivateTraceToDatasetRows(trace)
+    ? convertParsedPlayerPrivateTraceToDatasetRows(trace)
     : convertTraceToDatasetRows(trace);
 }
 
