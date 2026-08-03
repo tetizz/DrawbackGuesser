@@ -247,6 +247,8 @@ const USER_DIRECTORY =
 const WINDOWS_RESERVED =
   /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu;
 const PRIVATE_TOKEN = /(?:password|passwd|secret|credential|api[-_.]?key|token)/iu;
+const IDENTITY_EMBEDDED_BEFORE = /[\p{L}\p{N}]$/u;
+const IDENTITY_EMBEDDED_AFTER = /^[\p{L}\p{N}]/u;
 
 export function checkedGitCommit(value: string, label: string): string {
   if (!FULL_GIT_COMMIT.test(value)) {
@@ -340,11 +342,37 @@ function looksLikePath(value: string): boolean {
   return false;
 }
 
+function containsDelimitedIdentity(
+  value: string,
+  rawToken: string,
+): boolean {
+  const token = rawToken.trim().toLocaleLowerCase("en-US");
+  if (token.length === 0) {
+    return false;
+  }
+  let offset = 0;
+  while (offset <= value.length - token.length) {
+    const index = value.indexOf(token, offset);
+    if (index === -1) {
+      return false;
+    }
+    if (
+      !IDENTITY_EMBEDDED_BEFORE.test(value.slice(0, index))
+      && !IDENTITY_EMBEDDED_AFTER.test(value.slice(index + token.length))
+    ) {
+      return true;
+    }
+    offset = index + 1;
+  }
+  return false;
+}
+
 /**
- * Reject filesystem locations and the current account identity anywhere in a
- * generator receipt. Receipt content is never copied to the ledger, but
- * path-free inputs prevent a future diagnostic or extension from publishing
- * private workstation metadata.
+ * Reject filesystem locations and delimited current-account identities in a
+ * generator receipt without treating an account name embedded inside a fixed
+ * schema word as private data. Receipt content is never copied to the ledger,
+ * but path-free inputs prevent a future diagnostic or extension from
+ * publishing private workstation metadata.
  */
 export function assertPathFreeJson(
   value: unknown,
@@ -361,7 +389,9 @@ export function assertPathFreeJson(
       if (
         current.length > 4096
         || looksLikePath(current)
-        || privateTokens.some((token) => lowered.includes(token))
+        || privateTokens.some((token) =>
+          containsDelimitedIdentity(lowered, token)
+        )
         || PRIVATE_TOKEN.test(current)
       ) {
         throw new TypeError(`${path} contains private path or user data.`);

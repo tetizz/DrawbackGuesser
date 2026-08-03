@@ -1118,6 +1118,35 @@ describe("schema-9 corpus ledger", () => {
     }).toThrow("lost scheduled zero-ply games");
   });
 
+  it("matches environment identities only at token boundaries", () => {
+    const rootIdentity = ["root"] as const;
+    expect(() => {
+      assertPathFreeJson(
+        {
+          seedRoots: [1, 2, 3],
+          deeplyRooted: true,
+          "𐐀root": true,
+          "root𐐀": true,
+          "𝟘root": true,
+          "root𝟘": true,
+        },
+        "receipt",
+        rootIdentity,
+      );
+    }).not.toThrow();
+    for (const value of [
+      { account: "root" },
+      { account: "run-root-v1" },
+      { root: true },
+      { "run-root-v1": true },
+      { account: "/home/root/corpus.ndjson" },
+    ]) {
+      expect(() => {
+        assertPathFreeJson(value, "receipt", rootIdentity);
+      }).toThrow("private path or user data");
+    }
+  });
+
   it("rejects false schedule assignments and typed receipt drift", async () => {
     const fixture = await splitFixture();
     const falseScheduler: Schema9AssignmentScheduler = Object.freeze({
