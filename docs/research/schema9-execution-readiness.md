@@ -145,10 +145,16 @@ configuration, and a non-submodule Engine path.
 
 The Engine owns the roots and complete generation configuration. The caller
 chooses only a ledger split, a complete 25-label game-cycle count, bounded
-worker concurrency, a shared path-free schedule ID, and an absent bundle path.
+worker concurrency, a split-specific path-free schedule ID, and an absent
+bundle path.
 
 ```powershell
-$scheduleId = 'schema9-smoke-v2'
+$scheduleIds = @{
+  'train' = 'schema9-smoke-v2-train'
+  'validation-a' = 'schema9-smoke-v2-validation-a'
+  'validation-b' = 'schema9-smoke-v2-validation-b'
+  'test' = 'schema9-smoke-v2-test'
+}
 $seedRoots = @{
   'train' = [uint32[]]@(1261462769, 242269024, 1837697911)
   'validation-a' = [uint32[]]@(2069246597, 1391196133, 2739675947)
@@ -172,10 +178,14 @@ function Invoke-Schema9Split {
   if (-not $seedRoots.ContainsKey($Name)) {
     throw "Unknown Schema 9 split $Name."
   }
+  if (-not $scheduleIds.ContainsKey($Name)) {
+    throw "Missing Schema 9 schedule ID for $Name."
+  }
 
   $bundle = Join-Path $runRoot "$Name.bundle"
   $trace = Join-Path $bundle 'trace.ndjson'
   $converted = Join-Path $runRoot "$Name.converted.ndjson"
+  $scheduleId = $scheduleIds[$Name]
 
   pnpm --dir $engine --filter '@drawbackengine/cli' player-private:schema9 -- `
     --ledger-split $Name `
@@ -201,13 +211,15 @@ function Invoke-Schema9Split {
     Converted = $converted
     LaunchReceipt = Join-Path $bundle 'launch.json'
     CompletionReceipt = Join-Path $bundle 'completion.json'
+    ScheduleId = $scheduleId
     LabelRoot = $roots[0]
     GameplayRoot = $roots[1]
     ParameterRoot = $roots[2]
   }
 }
 
-$workers = [Math]::Min(256, [Math]::Max(1, [Environment]::ProcessorCount - 1))
+$parallelism = [int](node -p "require('node:os').availableParallelism()")
+$workers = [Math]::Min(256, [Math]::Max(1, $parallelism - 1))
 $train = Invoke-Schema9Split train 25 $workers
 $validationA = Invoke-Schema9Split validation-a 25 $workers
 $validationB = Invoke-Schema9Split validation-b 25 $workers
@@ -216,7 +228,8 @@ $test = Invoke-Schema9Split test 25 $workers
 
 The four 25-game calls are the smallest contract-valid smoke corpus. Replace
 only the game counts for a larger run; do not change the roots or policy
-arguments. The producer requires an existing trusted parent directory, refuses
+arguments, and keep all four schedule IDs distinct. The producer requires an
+existing trusted parent directory, refuses
 output inside the Engine checkout, revalidates the same clean Engine commit
 before publication, hashes the closed trace again, and publishes the
 three-file bundle at one irreversible rename commit point.
@@ -250,7 +263,7 @@ function Get-LedgerArguments {
       "$prefix-converted", $split.Converted,
       "$prefix-launch-receipt", $split.LaunchReceipt,
       "$prefix-completion-receipt", $split.CompletionReceipt,
-      "$prefix-schedule-id", $scheduleId,
+      "$prefix-schedule-id", $split.ScheduleId,
       "$prefix-label-seed-root", [string]$split.LabelRoot,
       "$prefix-gameplay-seed-root", [string]$split.GameplayRoot,
       "$prefix-parameters-seed-root", [string]$split.ParameterRoot,
@@ -302,7 +315,8 @@ zero-ply games are possible; none is currently exposed by the batch CLI.
 
 Concurrency is bounded as follows:
 
-- default workers: `max(1, logical processors - 1)`;
+- the producer requires an explicit worker count; this helper selects
+  `max(1, available parallelism - 1)`, capped at 256;
 - default/current coordinator window: four times the worker count;
 - coordinator retains at most one window of assignments/results;
 - each worker policy configures a 16,384-entry leaf cache, but JavaScript entry
