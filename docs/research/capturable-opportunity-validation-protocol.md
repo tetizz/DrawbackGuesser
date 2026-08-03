@@ -28,12 +28,13 @@ to the workflow domain token `sealed-test`.
 
 ## Required corpus ledger
 
-Every command requires both an explicit corpus-ledger artifact and its
-caller-authenticated file SHA-256. A digest string without the artifact is
+Every command requires an explicit corpus-ledger artifact, its
+caller-authenticated file SHA-256, and the caller-authenticated SHA-256 of the
+TypeScript verification receipt. Digest strings without both artifacts are
 not sufficient.
 
 The accepted ledger is canonical
-`drawbackguesser-schema9-corpus-ledger` version 1 with:
+`drawbackguesser-schema9-corpus-ledger` version 2 with:
 
 - a valid self-hash over the canonical payload excluding `contentSha256`;
 - exact top-level and nested fields, with unknown fields rejected;
@@ -47,9 +48,22 @@ The accepted ledger is canonical
 - exact per-label game counts for both colors, including zero-ply games;
 - source/converted accounting in which converted games equal source games
   minus zero-ply games;
-- pairwise game-ID and simulation-seed disjointness across all four source
-  splits, with independently recomputed partition commitments; and
-- full Guesser, converter, and producer commit identities.
+- pairwise game-ID disjointness plus global uniqueness of simulation and both
+  player-parameter seed streams across all four source splits, with
+  independently recomputed partition commitments; and
+- full Guesser, converter, and producer commit identities;
+- a content-derived parser/converter/scheduler/verifier execution manifest;
+  and
+- exact Engine-scheduler replay of every game index, seed, parameter seed,
+  label pair, game ID, profile, and initial position.
+
+Every stage also requires the direct-sibling TypeScript verification receipt
+`schema9-ledger-verification-<ledger-file-sha256>.json`. Python verifies its
+actual file bytes against the caller-supplied receipt SHA-256, then verifies
+its canonical self-hash, ledger file/content binding, complete input-set
+commitment, repository policy, and execution identity before accepting the
+ledger. The authenticated receipt digest is bound into Stage A and therefore
+propagates through Stage B, consumption markers, and sealed reports.
 
 The Python workflow accepts `producerConverterPolicy: exact/v1` only and
 requires every producer commit to equal the converter commit. The ledger
@@ -91,24 +105,26 @@ also rejected when loading an existing sealed report.
 
 The consumption marker is a create-only durable artifact named:
 
-`sealed-test-consumption-<authenticated-stage-b-sha256>.json`
+`sealed-test-consumption-<sealed-corpus-identity-sha256>.json`
 
-Its location and name are independent of the requested final report name.
-Its content binds the authenticated Stage-B SHA-256, exact authorization,
-ledger, protocol, and frozen pair. The marker is published before the test
+Its identity hashes the protocol/version, authenticated ledger file/content
+hashes, test converted digest and set commitments, and test schedule identity.
+It is independent of Stage-A/Stage-B filenames, serializations, or the selected
+frozen pair. Its content records the authorizing Stage-B SHA-256, exact
+authorization, ledger, protocol, and frozen pair. The marker is published before the test
 path is resolved, opened, hashed, or inspected. Publication races are
 resolved by create-only filesystem semantics.
 
 Once marker publication succeeds, access is consumed even if inference or
-final-report publication fails. Changing `report-one.json` to
-`report-two.json`, or retrying under another report name after a failure,
-cannot create another marker and cannot reopen the test.
+final-report publication fails. Changing a report name, aliasing Stage A,
+serializing a second Stage B, or freezing another otherwise valid pair against
+the same ledger/test cannot create another marker and cannot reopen the test.
 
 The direct-sibling workflow directory is the trusted local consumption
 registry. The one-access guarantee assumes that this registry is not copied,
 deleted, or replaced and that all evaluators use the same filesystem. A
 cross-host or adversarial-copy guarantee requires an external append-only
-registry keyed by Stage-B SHA-256; this local workflow does not claim that
+registry keyed by sealed-corpus identity; this local workflow does not claim that
 stronger distributed guarantee.
 
 ## Final report authentication
@@ -134,12 +150,14 @@ python -m drawback_ml.capturable_opportunity_workflow stage-a \
   --comparison pair-1.json --comparison pair-2.json --comparison pair-3.json \
   --corpus-ledger schema9-corpus-ledger.json \
   --corpus-ledger-sha256 <ledger-sha256> \
+  --corpus-ledger-verification-receipt-sha256 <receipt-sha256> \
   --output stage-a.json
 
 python -m drawback_ml.capturable_opportunity_workflow stage-b \
   --stage-a stage-a.json --validation-b validation-b.ndjson \
   --corpus-ledger schema9-corpus-ledger.json \
   --corpus-ledger-sha256 <ledger-sha256> \
+  --corpus-ledger-verification-receipt-sha256 <receipt-sha256> \
   --output stage-b.json
 
 python -m drawback_ml.capturable_opportunity_workflow sealed-test \
@@ -147,13 +165,15 @@ python -m drawback_ml.capturable_opportunity_workflow sealed-test \
   --test sealed-test.ndjson \
   --corpus-ledger schema9-corpus-ledger.json \
   --corpus-ledger-sha256 <ledger-sha256> \
+  --corpus-ledger-verification-receipt-sha256 <receipt-sha256> \
   --output sealed-test-report.json
 
 python -m drawback_ml.capturable_opportunity_workflow verify-sealed-test \
   --report sealed-test-report.json --report-sha256 <report-sha256> \
   --stage-b stage-b.json --validation-b validation-b.ndjson \
   --corpus-ledger schema9-corpus-ledger.json \
-  --corpus-ledger-sha256 <ledger-sha256>
+  --corpus-ledger-sha256 <ledger-sha256> \
+  --corpus-ledger-verification-receipt-sha256 <receipt-sha256>
 ```
 
 CLI JSON emits basenames only. Published artifacts recursively reject

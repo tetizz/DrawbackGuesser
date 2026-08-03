@@ -37,17 +37,23 @@ import {
   parseJsonWithoutDuplicateKeys,
   SCHEMA9_CORPUS_LEDGER_FORMAT,
   SCHEMA9_CORPUS_LEDGER_VERSION,
+  SCHEMA9_EXECUTION_MANIFEST_ALGORITHM,
   SCHEMA9_LEDGER_SPLITS,
   SCHEMA9_PRODUCER_CONVERTER_POLICIES,
   SCHEMA9_SEED_STREAMS,
+  SCHEMA9_SCHEDULE_PROFILE,
   type Schema9CorpusLedger,
   type Schema9CorpusLedgerOptions,
   type Schema9LedgerSplit,
+  type Schema9ExecutionIdentity,
 } from "./schema9-ledger-types.js";
 
 export type {
   Schema9CorpusLedger,
   Schema9CorpusLedgerOptions,
+  Schema9AssignmentScheduler,
+  Schema9ExecutionIdentity,
+  Schema9ExpectedAssignment,
   Schema9LedgerSplit,
   Schema9ProducerConverterPolicy,
   Schema9RepositoryVerifier,
@@ -57,13 +63,18 @@ export type {
 export {
   SCHEMA9_CORPUS_LEDGER_FORMAT,
   SCHEMA9_CORPUS_LEDGER_VERSION,
+  SCHEMA9_EXECUTION_MANIFEST_ALGORITHM,
+  SCHEMA9_GENERATOR_COMPLETION_FORMAT,
+  SCHEMA9_GENERATOR_LAUNCH_FORMAT,
+  SCHEMA9_GENERATOR_RECEIPT_VERSION,
   SCHEMA9_LEDGER_SPLITS,
   SCHEMA9_PRODUCER_CONVERTER_POLICIES,
   SCHEMA9_SEED_STREAMS,
+  SCHEMA9_SCHEDULE_PROFILE,
   SCHEMA9_SPLIT_SEED_ROOTS,
 } from "./schema9-ledger-types.js";
 
-const MAX_LEDGER_BYTES = 8 * 1024 * 1024;
+export const SCHEMA9_CORPUS_LEDGER_MAX_BYTES = 8 * 1024 * 1024;
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
 
 export interface WrittenSchema9CorpusLedger {
@@ -105,6 +116,7 @@ export async function verifySchema9RepositoryIdentity(
 ): Promise<{
   readonly guesserCommit: string;
   readonly converterEngineCommit: string;
+  readonly execution: Schema9ExecutionIdentity;
 }> {
   const guesserCommit = checkedGitCommit(
     options.guesserCommit,
@@ -158,7 +170,109 @@ export async function verifySchema9RepositoryIdentity(
       }
     }
   }
-  return Object.freeze({ guesserCommit, converterEngineCommit });
+  const execution = checkedExecutionIdentity(
+    await options.repositoryVerifier.executingCodeIdentity(),
+  );
+  return Object.freeze({ guesserCommit, converterEngineCommit, execution });
+}
+
+function checkedExecutionIdentity(
+  value: Schema9ExecutionIdentity,
+): Schema9ExecutionIdentity {
+  const untrusted = value as unknown as Readonly<Record<string, unknown>>;
+  const expectedKeys = [
+    "algorithm",
+    "runtime",
+    "parser",
+    "converter",
+    "scheduler",
+    "verifier",
+    "aggregateSha256",
+  ];
+  const actualKeys = Object.keys(untrusted).sort();
+  if (
+    actualKeys.length !== expectedKeys.length
+    || [...expectedKeys].sort().some(
+      (key, index) => key !== actualKeys[index],
+    )
+  ) {
+    throw new TypeError("Execution manifest fields are inconsistent.");
+  }
+  if (untrusted["algorithm"] !== SCHEMA9_EXECUTION_MANIFEST_ALGORITHM) {
+    throw new TypeError("Execution manifest algorithm is unsupported.");
+  }
+  const runtime = untrusted["runtime"];
+  if (typeof runtime !== "object" || runtime === null || Array.isArray(runtime)) {
+    throw new TypeError("Execution runtime identity is invalid.");
+  }
+  const runtimeRecord = runtime as Readonly<Record<string, unknown>>;
+  const runtimeKeys = Object.keys(runtimeRecord).sort();
+  const expectedRuntimeKeys = [
+    "architecture",
+    "execArgv",
+    "nodeVersion",
+    "platform",
+  ];
+  if (
+    runtimeKeys.length !== expectedRuntimeKeys.length
+    || expectedRuntimeKeys.some((key, index) => key !== runtimeKeys[index])
+    || typeof runtimeRecord["nodeVersion"] !== "string"
+    || !/^v[0-9]+\.[0-9]+\.[0-9]+$/u.test(runtimeRecord["nodeVersion"])
+    || typeof runtimeRecord["platform"] !== "string"
+    || typeof runtimeRecord["architecture"] !== "string"
+    || !Array.isArray(runtimeRecord["execArgv"])
+    || runtimeRecord["execArgv"].length !== 0
+  ) {
+    throw new TypeError("Execution runtime identity is invalid.");
+  }
+  checkedScheduleId(runtimeRecord["platform"], "execution runtime platform");
+  checkedScheduleId(
+    runtimeRecord["architecture"],
+    "execution runtime architecture",
+  );
+  const componentNames = [
+    "parser",
+    "converter",
+    "scheduler",
+    "verifier",
+  ] as const;
+  for (const name of componentNames) {
+    const componentValue = untrusted[name];
+    if (
+      typeof componentValue !== "object"
+      || componentValue === null
+      || Array.isArray(componentValue)
+      || Object.keys(componentValue).sort().join(",")
+        !== "bytes,entrypoint,files,sha256"
+    ) {
+      throw new TypeError(`${name} execution identity is invalid.`);
+    }
+    const component = componentValue as Schema9ExecutionIdentity[typeof name];
+    checkedScheduleId(component.entrypoint, `${name} execution entrypoint`);
+    checkedSha256(component.sha256, `${name} execution SHA-256`);
+    if (
+      !Number.isSafeInteger(component.files)
+      || component.files <= 0
+      || !Number.isSafeInteger(component.bytes)
+      || component.bytes <= 0
+    ) {
+      throw new TypeError(`${name} execution size is invalid.`);
+    }
+  }
+  const payload = Object.freeze({
+    algorithm: value.algorithm,
+    runtime: value.runtime,
+    parser: value.parser,
+    converter: value.converter,
+    scheduler: value.scheduler,
+    verifier: value.verifier,
+  });
+  if (contentSha256(payload) !== value.aggregateSha256) {
+    throw new TypeError("Execution manifest aggregate is inconsistent.");
+  }
+  checkedSha256(value.aggregateSha256, "execution aggregate SHA-256");
+  assertPathFreeJson(value, "schema-9 execution manifest");
+  return Object.freeze({ ...value });
 }
 
 function assertUniqueSchedules(options: Schema9CorpusLedgerOptions): void {
@@ -185,6 +299,12 @@ export function assertSchema9SplitsDisjoint(
     for (const seed of split.simulationSeeds) {
       if (seeds.has(seed)) {
         throw new TypeError("Schema-9 splits overlap by simulation seed.");
+      }
+      seeds.add(seed);
+    }
+    for (const seed of split.parameterSeeds) {
+      if (seeds.has(seed)) {
+        throw new TypeError("Schema-9 splits or seed streams overlap.");
       }
       seeds.add(seed);
     }
@@ -231,6 +351,16 @@ function assertSplitLedgerIdentity(
   const { ledger } = authenticated;
   checkedScheduleId(ledger.scheduleId, `${ledger.split} scheduleId`);
   checkedSchema9SeedRoots(ledger.seedRoots, ledger.split);
+  const scheduleProfile = ledger.scheduleProfile as unknown as Readonly<{
+    id: string;
+    policyId: string;
+  }>;
+  if (
+    scheduleProfile.id !== SCHEMA9_SCHEDULE_PROFILE.id
+    || scheduleProfile.policyId !== SCHEMA9_SCHEDULE_PROFILE.policyId
+  ) {
+    throw new TypeError(`${ledger.split} schedule profile is inconsistent.`);
+  }
   checkedGitCommit(
     ledger.producerEngineCommit,
     `${ledger.split} producerEngineCommit`,
@@ -245,14 +375,23 @@ function assertSplitLedgerIdentity(
     authenticated.simulationSeeds,
     `${ledger.split} source simulationSeeds`,
   );
+  assertExactValues(
+    ledger.sourceTrace.parameterSeeds,
+    authenticated.parameterSeeds,
+    `${ledger.split} source parameterSeeds`,
+  );
   if (
     ledger.sourceTrace.games !== ledger.sourceTrace.gameIds.length
     || ledger.sourceTrace.games
       !== ledger.sourceTrace.simulationSeeds.length
+    || ledger.sourceTrace.parameterSeeds.length
+      !== ledger.sourceTrace.games * 2
     || ledger.sourceTrace.gameIdSetSha256
       !== contentSha256(ledger.sourceTrace.gameIds)
     || ledger.sourceTrace.simulationSeedSetSha256
       !== contentSha256(ledger.sourceTrace.simulationSeeds)
+    || ledger.sourceTrace.parameterSeedSetSha256
+      !== contentSha256(ledger.sourceTrace.parameterSeeds)
   ) {
     throw new TypeError(
       `${ledger.split} source identity or set digest is inconsistent.`,
@@ -310,17 +449,27 @@ export async function createSchema9CorpusLedger(
 ): Promise<Schema9CorpusLedger> {
   exactSplitRecord(options.splits);
   assertUniqueSchedules(options);
-  await assertDistinctExplicitFiles(inputPaths(options));
   const identity = await verifySchema9RepositoryIdentity(options);
+  await assertDistinctExplicitFiles(inputPaths(options));
   const authenticated: AuthenticatedSchema9Split[] = [];
   for (const split of SCHEMA9_LEDGER_SPLITS) {
     authenticated.push(
-      await authenticateSchema9Split(split, options.splits[split]),
+      await authenticateSchema9Split(
+        split,
+        options.splits[split],
+        options.assignmentScheduler,
+      ),
     );
   }
   assertSchema9SplitsDisjoint(authenticated);
+  const finalIdentity = await verifySchema9RepositoryIdentity(options);
+  if (!canonicalJsonBytes(finalIdentity).equals(canonicalJsonBytes(identity))) {
+    throw new TypeError(
+      "Repository or executing code changed during corpus authentication.",
+    );
+  }
   return assembleSchema9CorpusLedger(
-    identity,
+    finalIdentity,
     options.producerConverterPolicy,
     authenticated,
   );
@@ -330,6 +479,7 @@ export function assembleSchema9CorpusLedger(
   identity: Readonly<{
     readonly guesserCommit: string;
     readonly converterEngineCommit: string;
+    readonly execution: Schema9ExecutionIdentity;
   }>,
   producerConverterPolicy:
     Schema9CorpusLedgerOptions["producerConverterPolicy"],
@@ -337,6 +487,7 @@ export function assembleSchema9CorpusLedger(
 ): Schema9CorpusLedger {
   checkedGitCommit(identity.guesserCommit, "guesserCommit");
   checkedGitCommit(identity.converterEngineCommit, "converterEngineCommit");
+  checkedExecutionIdentity(identity.execution);
   if (
     !SCHEMA9_PRODUCER_CONVERTER_POLICIES.includes(
       producerConverterPolicy,
@@ -391,6 +542,10 @@ export function assembleSchema9CorpusLedger(
       simulationSeedAssignmentsSha256: digestPartitionAssignments(
         authenticated,
         "simulationSeeds",
+      ),
+      parameterSeedAssignmentsSha256: digestPartitionAssignments(
+        authenticated,
+        "parameterSeeds",
       ),
     }),
   });
@@ -462,6 +617,19 @@ async function publishAtomicNoClobber(
   }
 }
 
+export function assertSchema9CorpusLedgerByteLength(bytes: Buffer): void {
+  if (
+    bytes.byteLength <= 0
+    || bytes.byteLength > SCHEMA9_CORPUS_LEDGER_MAX_BYTES
+  ) {
+    throw new RangeError(
+      `Schema-9 ledger must be from 1 through ${String(
+        SCHEMA9_CORPUS_LEDGER_MAX_BYTES,
+      )} bytes.`,
+    );
+  }
+}
+
 export async function writeSchema9CorpusLedgerAtomic(
   outputPath: string,
   options: Schema9CorpusLedgerOptions,
@@ -469,6 +637,7 @@ export async function writeSchema9CorpusLedgerAtomic(
   const destination = await outputDestination(outputPath);
   const artifact = await createSchema9CorpusLedger(options);
   const bytes = canonicalJsonBytes(artifact);
+  assertSchema9CorpusLedgerByteLength(bytes);
   await publishAtomicNoClobber(destination, bytes);
   return writtenIdentity(artifact, bytes);
 }
@@ -490,6 +659,7 @@ export async function publishSchema9CorpusLedgerArtifactAtomic(
 ): Promise<WrittenSchema9CorpusLedger> {
   const destination = await outputDestination(outputPath);
   const bytes = canonicalJsonBytes(artifact);
+  assertSchema9CorpusLedgerByteLength(bytes);
   verifySchema9CorpusLedgerReconstruction(bytes, artifact);
   await publishAtomicNoClobber(destination, bytes);
   return writtenIdentity(artifact, bytes);
@@ -510,12 +680,16 @@ async function readStableLedger(path: string): Promise<Buffer> {
   if (linkInfo.isSymbolicLink() || !linkInfo.isFile()) {
     throw new TypeError("Schema-9 ledger must be a regular non-symlink file.");
   }
-  if (linkInfo.size <= 0n || linkInfo.size > BigInt(MAX_LEDGER_BYTES)) {
+  if (
+    linkInfo.size <= 0n
+    || linkInfo.size > BigInt(SCHEMA9_CORPUS_LEDGER_MAX_BYTES)
+  ) {
     throw new RangeError("Schema-9 ledger byte length is invalid.");
   }
   const resolved = await realpath(path);
   const before = await stat(resolved, { bigint: true });
   const bytes = await readFile(resolved);
+  assertSchema9CorpusLedgerByteLength(bytes);
   const after = await stat(resolved, { bigint: true });
   if (
     statSignature(before).some(

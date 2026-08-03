@@ -141,6 +141,31 @@ importers:
 
   engine/packages/shared: {}
 
+  engine/packages/simulation-arena:
+    dependencies:
+      '@drawbackengine/chess-core':
+        specifier: workspace:*
+        version: link:../chess-core
+      '@drawbackengine/chess-evaluator':
+        specifier: workspace:*
+        version: link:../chess-evaluator
+      '@drawbackengine/drawback-engine':
+        specifier: workspace:*
+        version: link:../drawback-engine
+      '@drawbackengine/drawback-search':
+        specifier: workspace:*
+        version: link:../drawback-search
+      '@drawbackengine/shared':
+        specifier: workspace:*
+        version: link:../shared
+      '@drawbackengine/simulation-trace':
+        specifier: workspace:*
+        version: link:../simulation-trace
+    devDependencies:
+      tsx:
+        specifier: ^4.20.3
+        version: 4.23.1
+
   engine/packages/simulation-trace:
     dependencies:
       '@drawbackengine/chess-core':
@@ -178,6 +203,9 @@ importers:
       '@drawbackengine/shared':
         specifier: workspace:*
         version: link:../../engine/packages/shared
+      '@drawbackengine/simulation-arena':
+        specifier: workspace:*
+        version: link:../../engine/packages/simulation-arena
       '@drawbackengine/simulation-trace':
         specifier: workspace:*
         version: link:../../engine/packages/simulation-trace

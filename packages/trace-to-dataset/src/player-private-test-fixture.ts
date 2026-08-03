@@ -23,12 +23,15 @@ export interface PlayerPrivateTraceFixtureOptions {
   readonly whiteRuleId?: AuditedCapturableKingRuleId;
   readonly blackRuleId?: AuditedCapturableKingRuleId;
   readonly seed?: number;
+  readonly gameIndex?: number;
+  readonly policyId?: string;
   readonly parameterSeeds?: {
     readonly white: number;
     readonly black: number;
   };
   readonly initialFen?: string;
   readonly moves?: readonly string[];
+  readonly autoLegalPlies?: number;
 }
 
 const AGENT = Object.freeze({
@@ -58,8 +61,26 @@ export function playerPrivateTraceFixture(
     white: 0x1111_1111,
     black: 0x2222_2222,
   };
-  const moves = options.moves ?? ["e2e4", "e7e5"];
-  const gameIndex = 0;
+  if (options.moves !== undefined && options.autoLegalPlies !== undefined) {
+    throw new TypeError("Fixture moves and autoLegalPlies are mutually exclusive.");
+  }
+  const moves = options.moves ?? (
+    options.autoLegalPlies === undefined ? ["e2e4", "e7e5"] : []
+  );
+  const plyLimit = options.autoLegalPlies ?? Math.max(1, moves.length);
+  if (!Number.isSafeInteger(plyLimit) || plyLimit <= 0) {
+    throw new RangeError("Fixture ply limit must be a positive safe integer.");
+  }
+  const gameIndex = options.gameIndex ?? 0;
+  const agent = options.policyId === undefined
+    ? AGENT
+    : Object.freeze({
+        ...AGENT,
+        searchPolicy: Object.freeze({
+          ...AGENT.searchPolicy,
+          policyId: options.policyId,
+        }),
+      });
   const session = DrawbackGameSession.create(
     {
       white: resolveAuditedCapturableKingRule(whiteRuleId),
@@ -73,7 +94,7 @@ export function playerPrivateTraceFixture(
   );
   const initialPosition = session.publicPositionSnapshot();
   const initialSecrets = session.exportSecretSnapshot();
-  const plies = moves.map((uci, ply) => {
+  const plies = Array.from({ length: plyLimit }, (_, ply) => {
     const positionBefore = session.publicPositionSnapshot();
     const color = session.turn;
     const authorityLegalMoves =
@@ -83,6 +104,12 @@ export function playerPrivateTraceFixture(
       session.turn === "white"
         ? session.exportSecretSnapshot().white
         : session.exportSecretSnapshot().black;
+    const configured = moves[ply];
+    const uci = configured ?? canonicalMoveUci(
+      session.legalMoves()[0] ?? (() => {
+        throw new Error("Fixture position has no legal move.");
+      })(),
+    );
     const outcome = session.move(commandFromUci(uci));
     if (!outcome.ok) {
       throw new Error(`Fixture move ${uci} was rejected: ${outcome.reason}.`);
@@ -125,7 +152,7 @@ export function playerPrivateTraceFixture(
     ),
     seed,
     parameterSeeds,
-    plyLimit: moves.length,
+    plyLimit,
     initialPosition,
     finalPosition: session.publicPositionSnapshot(),
     result: session.result,
@@ -139,8 +166,8 @@ export function playerPrivateTraceFixture(
       final: secretPair(finalSecrets),
     },
     agents: {
-      white: AGENT,
-      black: AGENT,
+      white: agent,
+      black: agent,
     },
     plies,
   });

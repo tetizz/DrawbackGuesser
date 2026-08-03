@@ -58,8 +58,11 @@ ledger must authenticate the frozen seed roots, exact source and converted
 game-ID/seed arrays, zero-ply accounting, both-color label counts, generator
 receipt identities, producer and converter Engine commits, the pinned Guesser
 gitlink, and the exact `[25, 4]` opportunity contract. Training and evaluation
-must re-authenticate the ledger against the explicitly supplied files; a
-self-hash alone is not sufficient.
+must require the canonical direct-sibling TypeScript verification receipt and
+the caller-authenticated SHA-256 of that receipt's exact file bytes, then
+reauthenticate its ledger, complete input-set, repository-policy, and executing
+code-content commitments. The receipt digest is carried through every workflow
+artifact; a self-hash alone is not sufficient.
 
 The current material-search self-play shard can establish the feature
 pipeline, but cannot by itself prove real-player or strong-engine

@@ -32,8 +32,17 @@ class CapturableRecordTests(unittest.TestCase):
         second = {
             **first,
             "trueDrawback": "lame-duck",
+            "hiddenParameters": {},
             "drawbackInternalState": {"different": 7},
+            "drawbackLegalMoves": list(first["ordinaryLegalMoves"]),
+            "ruleTriggered": False,
+            "forced": False,
             "result": {"kind": "drawback-loss"},
+            "gameId": "different-evaluation-game",
+            "seed": 4_294_967_295,
+            "botAgentId": "different-agent",
+            "botStyle": "different-style",
+            "botStrength": 9_999,
         }
 
         parsed_first = parse_capturable_dataset_row(first)
@@ -45,6 +54,7 @@ class CapturableRecordTests(unittest.TestCase):
             capturable_feature_vector(parsed_second.features),
         )
         self.assertNotEqual(parsed_first.labels, parsed_second.labels)
+        self.assertNotEqual(parsed_first.evaluation, parsed_second.evaluation)
         self.assertNotIn("label-only", repr(parsed_first.features))
 
     def test_has_the_declared_exact_feature_dimension(self) -> None:

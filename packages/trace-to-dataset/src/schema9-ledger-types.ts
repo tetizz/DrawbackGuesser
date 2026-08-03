@@ -1,6 +1,17 @@
 export const SCHEMA9_CORPUS_LEDGER_FORMAT =
   "drawbackguesser-schema9-corpus-ledger" as const;
-export const SCHEMA9_CORPUS_LEDGER_VERSION = 1 as const;
+export const SCHEMA9_CORPUS_LEDGER_VERSION = 2 as const;
+export const SCHEMA9_EXECUTION_MANIFEST_ALGORITHM =
+  "sha256-loaded-module-graph-v2" as const;
+export const SCHEMA9_GENERATOR_LAUNCH_FORMAT =
+  "drawbackengine-player-private-schedule-launch" as const;
+export const SCHEMA9_GENERATOR_COMPLETION_FORMAT =
+  "drawbackengine-player-private-schedule-completion" as const;
+export const SCHEMA9_GENERATOR_RECEIPT_VERSION = 1 as const;
+export const SCHEMA9_SCHEDULE_PROFILE = Object.freeze({
+  id: "standard",
+  policyId: "material-player-private-corpus/v1",
+} as const);
 export const SCHEMA9_LEDGER_SPLITS = Object.freeze([
   "train",
   "validation-a",
@@ -59,6 +70,58 @@ export interface Schema9RepositoryVerifier {
     (guesserCommit: string) => Promise<string>;
   readonly isEngineAncestor:
     (ancestorCommit: string, descendantCommit: string) => Promise<boolean>;
+  /**
+   * Returns a content-derived identity for the modules executing the parser,
+   * converter, scheduler, and ledger verifier. Callers cannot supply these
+   * hashes as commit-shaped assertions.
+   */
+  readonly executingCodeIdentity: () => Promise<Schema9ExecutionIdentity>;
+}
+
+export interface Schema9ExpectedAssignment {
+  readonly gameIndex: number;
+  readonly gameId: string;
+  readonly seed: number;
+  readonly parameterSeeds: {
+    readonly white: number;
+    readonly black: number;
+  };
+  readonly whiteRuleId: string;
+  readonly blackRuleId: string;
+  readonly initialFen?: string;
+  readonly initialReplaySha256: string;
+}
+
+export interface Schema9AssignmentScheduler {
+  readonly assignments: (
+    split: Schema9LedgerSplit,
+    gameCount: number,
+    seedRoots: Schema9SeedRoots,
+  ) => Iterable<Schema9ExpectedAssignment>;
+}
+
+export interface Schema9ExecutionComponentIdentity {
+  readonly entrypoint: string;
+  readonly files: number;
+  readonly bytes: number;
+  readonly sha256: string;
+}
+
+export interface Schema9ExecutionRuntimeIdentity {
+  readonly nodeVersion: string;
+  readonly platform: string;
+  readonly architecture: string;
+  readonly execArgv: readonly string[];
+}
+
+export interface Schema9ExecutionIdentity {
+  readonly algorithm: typeof SCHEMA9_EXECUTION_MANIFEST_ALGORITHM;
+  readonly runtime: Schema9ExecutionRuntimeIdentity;
+  readonly parser: Schema9ExecutionComponentIdentity;
+  readonly converter: Schema9ExecutionComponentIdentity;
+  readonly scheduler: Schema9ExecutionComponentIdentity;
+  readonly verifier: Schema9ExecutionComponentIdentity;
+  readonly aggregateSha256: string;
 }
 
 export interface Schema9CorpusLedgerOptions {
@@ -66,6 +129,7 @@ export interface Schema9CorpusLedgerOptions {
   readonly converterEngineCommit: string;
   readonly producerConverterPolicy: Schema9ProducerConverterPolicy;
   readonly repositoryVerifier: Schema9RepositoryVerifier;
+  readonly assignmentScheduler: Schema9AssignmentScheduler;
   readonly splits: Readonly<Record<Schema9LedgerSplit, Schema9SplitFiles>>;
 }
 
@@ -86,8 +150,10 @@ export interface Schema9SourceTraceIdentity {
   readonly zeroPlyGames: number;
   readonly gameIds: readonly string[];
   readonly simulationSeeds: readonly number[];
+  readonly parameterSeeds: readonly number[];
   readonly gameIdSetSha256: string;
   readonly simulationSeedSetSha256: string;
+  readonly parameterSeedSetSha256: string;
   readonly labelCountsByColor: Schema9LabelCounts;
 }
 
@@ -111,6 +177,7 @@ export interface Schema9SplitLedger {
     readonly launch: Schema9ReceiptIdentity;
     readonly completion: Schema9ReceiptIdentity;
   };
+  readonly scheduleProfile: typeof SCHEMA9_SCHEDULE_PROFILE;
   readonly sourceTrace: Schema9SourceTraceIdentity;
   readonly converted: Schema9ConvertedIdentity;
 }
@@ -131,6 +198,7 @@ export interface Schema9CorpusLedger {
     readonly guesserCommit: string;
     readonly converterEngineCommit: string;
     readonly producerConverterPolicy: Schema9ProducerConverterPolicy;
+    readonly execution: Schema9ExecutionIdentity;
   };
   readonly scheduleContract: {
     readonly authorityId: "capturable25-schema9-opportunity/v1";
@@ -142,19 +210,23 @@ export interface Schema9CorpusLedger {
     readonly games: number;
     readonly gameIdAssignmentsSha256: string;
     readonly simulationSeedAssignmentsSha256: string;
+    readonly parameterSeedAssignmentsSha256: string;
   };
   readonly contentSha256: string;
 }
 
 const FULL_GIT_COMMIT = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 const LOWER_SHA256 = /^[0-9a-f]{64}$/u;
-const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:+/-]{0,199}$/u;
-const URL_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//u;
+const IDENTIFIER = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$/u;
+const URL_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/u;
 const VERSIONED_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*\/v[0-9]+$/u;
 const WINDOWS_ABSOLUTE = /^[A-Za-z]:[\\/]/u;
 const WINDOWS_UNC = /^(?:\\\\|\/\/)[^/\\]/u;
 const USER_DIRECTORY =
   /(?:^|[/\\])(?:Users|home)[/\\][^/\\]+(?:[/\\]|$)/iu;
+const WINDOWS_RESERVED =
+  /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/iu;
+const PRIVATE_TOKEN = /(?:password|passwd|secret|credential|api[-_.]?key|token)/iu;
 
 export function checkedGitCommit(value: string, label: string): string {
   if (!FULL_GIT_COMMIT.test(value)) {
@@ -175,6 +247,8 @@ export function checkedScheduleId(value: string, label: string): string {
     !IDENTIFIER.test(value)
     || value.includes("..")
     || value.includes("\\")
+    || WINDOWS_RESERVED.test(value)
+    || PRIVATE_TOKEN.test(value)
   ) {
     throw new TypeError(
       `${label} must be a canonical path-free schedule identifier.`,
@@ -231,6 +305,7 @@ function looksLikePath(value: string): boolean {
     || WINDOWS_UNC.test(value)
     || USER_DIRECTORY.test(value)
     || value.toLocaleLowerCase("en-US").startsWith("file:")
+    || URL_SCHEME.test(value)
     || value.includes("\\")
     || /(?:^|\/)\.\.?($|\/)/u.test(value)
   ) {
@@ -238,7 +313,6 @@ function looksLikePath(value: string): boolean {
   }
   if (
     value.includes("/")
-    && !URL_SCHEME.test(value)
     && !VERSIONED_ID.test(value)
   ) {
     return true;
@@ -265,8 +339,10 @@ export function assertPathFreeJson(
     if (typeof current === "string") {
       const lowered = current.toLocaleLowerCase("en-US");
       if (
-        looksLikePath(current)
-        || privateTokens.some((token) => lowered === token)
+        current.length > 4096
+        || looksLikePath(current)
+        || privateTokens.some((token) => lowered.includes(token))
+        || PRIVATE_TOKEN.test(current)
       ) {
         throw new TypeError(`${path} contains private path or user data.`);
       }
@@ -275,8 +351,13 @@ export function assertPathFreeJson(
     if (
       current === null
       || typeof current === "boolean"
-      || typeof current === "number"
     ) {
+      return;
+    }
+    if (typeof current === "number") {
+      if (!Number.isFinite(current) || Object.is(current, -0)) {
+        throw new TypeError(`${path} contains a non-canonical JSON number.`);
+      }
       return;
     }
     if (Array.isArray(current)) {

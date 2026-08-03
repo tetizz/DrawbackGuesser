@@ -14,6 +14,7 @@ import {
   parsePlayerPrivateSimulationTraceLine,
   type PlayerPrivateSimulationTraceRecord,
 } from "@drawbackengine/simulation-trace";
+import { CapturableKingPosition } from "@drawbackengine/chess-core";
 import {
   CAPTURABLE_HYPOTHESIS_RULE_IDS,
 } from "@drawbackguesser/predictor";
@@ -26,10 +27,17 @@ import {
   checkedGitCommit,
   checkedSchema9SeedRoots,
   checkedScheduleId,
+  checkedSha256,
   parseJsonWithoutDuplicateKeys,
+  SCHEMA9_GENERATOR_COMPLETION_FORMAT,
+  SCHEMA9_GENERATOR_LAUNCH_FORMAT,
+  SCHEMA9_GENERATOR_RECEIPT_VERSION,
+  SCHEMA9_SCHEDULE_PROFILE,
+  type Schema9AssignmentScheduler,
   type Schema9ConvertedIdentity,
   type Schema9LedgerSplit,
   type Schema9ReceiptIdentity,
+  type Schema9SeedRoots,
   type Schema9SourceTraceIdentity,
   type Schema9SplitFiles,
   type Schema9SplitLedger,
@@ -42,6 +50,7 @@ const UTF8 = new TextDecoder("utf-8", { fatal: true });
 const CAPTURABLE_RULE_ID_SET: ReadonlySet<string> = new Set(
   CAPTURABLE_HYPOTHESIS_RULE_IDS,
 );
+const DEFAULT_INITIAL_FEN = CapturableKingPosition.fromFen().fen;
 
 interface StableFile {
   readonly requestedPath: string;
@@ -53,15 +62,28 @@ interface SourceGame {
   readonly gameId: string;
   readonly seed: number;
   readonly gameIndex: number;
+  readonly parameterSeeds: {
+    readonly white: number;
+    readonly black: number;
+  };
   readonly plies: number;
   readonly whiteRuleId: string;
   readonly blackRuleId: string;
+  readonly initialFen: string;
+  readonly policyId: string;
+  readonly initialReplaySha256: string;
+}
+
+interface AuthenticatedReceipt {
+  readonly identity: Schema9ReceiptIdentity;
+  readonly value: Readonly<Record<string, unknown>>;
 }
 
 export interface AuthenticatedSchema9Split {
   readonly ledger: Schema9SplitLedger;
   readonly gameIds: ReadonlySet<string>;
   readonly simulationSeeds: ReadonlySet<number>;
+  readonly parameterSeeds: ReadonlySet<number>;
 }
 
 function fileSignature(value: BigIntStats): readonly bigint[] {
@@ -144,7 +166,7 @@ export async function assertDistinctExplicitFiles(
 async function authenticateReceipt(
   path: string,
   label: string,
-): Promise<Schema9ReceiptIdentity> {
+): Promise<AuthenticatedReceipt> {
   const file = await openStableFile(path, label);
   if (file.before.size <= 0n || file.before.size > BigInt(MAX_RECEIPT_BYTES)) {
     throw new RangeError(
@@ -172,9 +194,172 @@ async function authenticateReceipt(
   }
   assertPathFreeJson(value, label);
   return Object.freeze({
-    sha256: createHash("sha256").update(bytes).digest("hex"),
-    bytes: bytes.byteLength,
+    identity: Object.freeze({
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      bytes: bytes.byteLength,
+    }),
+    value: value as Readonly<Record<string, unknown>>,
   });
+}
+
+function receiptObject(value: unknown, label: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object.`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function exactReceiptKeys(
+  value: object,
+  expected: readonly string[],
+  label: string,
+): void {
+  const actual = Object.keys(value).sort();
+  const canonical = [...expected].sort();
+  if (
+    actual.length !== canonical.length
+    || actual.some((key, index) => key !== canonical[index])
+  ) {
+    throw new TypeError(`${label} has invalid fields.`);
+  }
+}
+
+function receiptInteger(
+  value: unknown,
+  label: string,
+  minimum = 0,
+): number {
+  if (
+    typeof value !== "number"
+    || !Number.isSafeInteger(value)
+    || Object.is(value, -0)
+    || value < minimum
+  ) {
+    throw new TypeError(`${label} must be a canonical safe integer.`);
+  }
+  return value;
+}
+
+function validateLaunchReceipt(
+  receipt: AuthenticatedReceipt,
+  split: Schema9LedgerSplit,
+  scheduleId: string,
+  seedRoots: readonly number[],
+  producerEngineCommit: string,
+): Readonly<Record<string, unknown>> {
+  const value = receipt.value;
+  exactReceiptKeys(value, [
+    "format",
+    "version",
+    "scheduleAuthorityId",
+    "scheduleId",
+    "ledgerSplit",
+    "engineSplit",
+    "splitCounts",
+    "seedRoots",
+    "scheduleProfile",
+    "producerEngineCommit",
+  ], `${split} launch receipt`);
+  if (
+    value["format"] !== SCHEMA9_GENERATOR_LAUNCH_FORMAT
+    || value["version"] !== SCHEMA9_GENERATOR_RECEIPT_VERSION
+    || value["scheduleAuthorityId"]
+      !== "capturable25-schema9-opportunity/v1"
+    || value["scheduleId"] !== scheduleId
+    || value["ledgerSplit"] !== split
+    || value["engineSplit"] !== "train"
+    || value["producerEngineCommit"] !== producerEngineCommit
+  ) {
+    throw new TypeError(`${split} launch receipt identity is inconsistent.`);
+  }
+  const declaredRoots = value["seedRoots"];
+  if (
+    !Array.isArray(declaredRoots)
+    || declaredRoots.length !== seedRoots.length
+    || declaredRoots.some((root, index) => root !== seedRoots[index])
+  ) {
+    throw new TypeError(`${split} launch receipt seed roots are inconsistent.`);
+  }
+  const profile = receiptObject(
+    value["scheduleProfile"],
+    `${split} launch schedule profile`,
+  );
+  exactReceiptKeys(profile, ["id", "policyId"], `${split} schedule profile`);
+  if (
+    profile["id"] !== SCHEMA9_SCHEDULE_PROFILE.id
+    || profile["policyId"] !== SCHEMA9_SCHEDULE_PROFILE.policyId
+  ) {
+    throw new TypeError(`${split} launch receipt profile is unsupported.`);
+  }
+  const counts = receiptObject(
+    value["splitCounts"],
+    `${split} launch split counts`,
+  );
+  exactReceiptKeys(counts, ["train", "validation", "test"], `${split} split counts`);
+  receiptInteger(counts["train"], `${split} train count`, 1);
+  receiptInteger(counts["validation"], `${split} validation count`);
+  receiptInteger(counts["test"], `${split} test count`);
+  if (counts["validation"] !== 0 || counts["test"] !== 0) {
+    throw new TypeError(
+      `${split} launch receipt must use an isolated Engine train schedule.`,
+    );
+  }
+  return counts;
+}
+
+function validateCompletionReceipt(
+  receipt: AuthenticatedReceipt,
+  split: Schema9LedgerSplit,
+  scheduleId: string,
+  producerEngineCommit: string,
+  launchSha256: string,
+  trace: Readonly<{ sha256: string; bytes: number; games: number }>,
+): void {
+  const value = receipt.value;
+  exactReceiptKeys(value, [
+    "format",
+    "version",
+    "scheduleId",
+    "ledgerSplit",
+    "state",
+    "producerEngineCommit",
+    "launchReceiptSha256",
+    "output",
+  ], `${split} completion receipt`);
+  if (
+    value["format"] !== SCHEMA9_GENERATOR_COMPLETION_FORMAT
+    || value["version"] !== SCHEMA9_GENERATOR_RECEIPT_VERSION
+    || value["scheduleId"] !== scheduleId
+    || value["ledgerSplit"] !== split
+    || value["state"] !== "completed"
+    || value["producerEngineCommit"] !== producerEngineCommit
+    || checkedSha256(
+      String(value["launchReceiptSha256"]),
+      `${split} completion launchReceiptSha256`,
+    ) !== launchSha256
+  ) {
+    throw new TypeError(`${split} completion receipt identity is inconsistent.`);
+  }
+  const output = receiptObject(value["output"], `${split} completion output`);
+  exactReceiptKeys(
+    output,
+    ["sha256", "bytes", "games", "firstGameIndex", "lastGameIndex"],
+    `${split} completion output`,
+  );
+  if (
+    checkedSha256(String(output["sha256"]), `${split} output SHA-256`)
+      !== trace.sha256
+    || receiptInteger(output["bytes"], `${split} output bytes`, 1)
+      !== trace.bytes
+    || receiptInteger(output["games"], `${split} output games`, 1)
+      !== trace.games
+    || receiptInteger(output["firstGameIndex"], `${split} first game index`)
+      !== 0
+    || receiptInteger(output["lastGameIndex"], `${split} last game index`)
+      !== trace.games - 1
+  ) {
+    throw new TypeError(`${split} completion receipt output is inconsistent.`);
+  }
 }
 
 async function* lfLines(
@@ -303,10 +488,20 @@ function sourceGame(
       "Schema-9 corpus source traces must use player-private schema 2.",
     );
   }
+  if (
+    trace.agents.white.searchPolicy.policyId
+      !== trace.agents.black.searchPolicy.policyId
+    || trace.hypothesisPolicy.kind !== "unrestricted-baseline"
+  ) {
+    throw new TypeError(
+      "Schema-9 source traces must use the frozen standard profile.",
+    );
+  }
   return Object.freeze({
     gameId: trace.gameId,
     seed: trace.seed,
     gameIndex: trace.gameIndex,
+    parameterSeeds: Object.freeze({ ...trace.parameterSeeds }),
     plies: trace.plies.length,
     whiteRuleId: checkedSourceRuleId(
       trace.secrets.initial.white.drawbackId,
@@ -318,7 +513,57 @@ function sourceGame(
       `source game ${trace.gameId} Black drawback`,
       expectedRuleIds,
     ),
+    initialFen: trace.initialPosition.fen,
+    policyId: trace.agents.white.searchPolicy.policyId,
+    initialReplaySha256: createHash("sha256")
+      .update(canonicalJsonBytes({
+        initialPosition: trace.initialPosition,
+        initialSecrets: trace.secrets.initial,
+      }))
+      .digest("hex"),
   });
+}
+
+function assertExpectedSchedule(
+  split: Schema9LedgerSplit,
+  sourceGames: readonly SourceGame[],
+  seedRoots: Schema9SeedRoots,
+  scheduler: Schema9AssignmentScheduler,
+): void {
+  const expected = scheduler.assignments(
+    split,
+    sourceGames.length,
+    seedRoots,
+  )[Symbol.iterator]();
+  for (const [index, source] of sourceGames.entries()) {
+    const nextAssignment = expected.next();
+    const assignment = nextAssignment.done ? undefined : nextAssignment.value;
+    if (
+      assignment === undefined
+      || source.gameIndex !== index
+      || assignment.gameIndex !== index
+      || source.gameId !== assignment.gameId
+      || source.seed !== assignment.seed
+      || source.parameterSeeds.white !== assignment.parameterSeeds.white
+      || source.parameterSeeds.black !== assignment.parameterSeeds.black
+      || source.whiteRuleId !== assignment.whiteRuleId
+      || source.blackRuleId !== assignment.blackRuleId
+      || source.policyId !== SCHEMA9_SCHEDULE_PROFILE.policyId
+      || source.initialFen !== (assignment.initialFen ?? DEFAULT_INITIAL_FEN)
+      || source.initialReplaySha256
+        !== checkedSha256(
+          assignment.initialReplaySha256,
+          `${split} expected initial replay SHA-256`,
+        )
+    ) {
+      throw new TypeError(
+        `${split} source game ${String(index)} differs from the frozen schedule.`,
+      );
+    }
+  }
+  if (!expected.next().done) {
+    throw new TypeError(`${split} scheduler returned the wrong game count.`);
+  }
 }
 
 export function assertExactSchema9LabelBalance(
@@ -391,11 +636,13 @@ export function assertScheduledConversionAccounting(
 export async function authenticateSchema9Split(
   split: Schema9LedgerSplit,
   files: Schema9SplitFiles,
+  scheduler: Schema9AssignmentScheduler,
 ): Promise<AuthenticatedSchema9Split> {
   return authenticateSchema9SplitWithRuleContract(
     split,
     files,
     CAPTURABLE_HYPOTHESIS_RULE_IDS,
+    scheduler,
   );
 }
 
@@ -408,6 +655,7 @@ export async function authenticateSchema9SplitWithRuleContract(
   split: Schema9LedgerSplit,
   files: Schema9SplitFiles,
   ruleIds: readonly string[],
+  scheduler: Schema9AssignmentScheduler,
 ): Promise<AuthenticatedSchema9Split> {
   const checkedRuleIds = checkedRuleContract(ruleIds);
   const expectedRuleIds = new Set(checkedRuleIds);
@@ -433,6 +681,13 @@ export async function authenticateSchema9SplitWithRuleContract(
     files.completionReceiptPath,
     `${split} completion receipt`,
   );
+  const launchCounts = validateLaunchReceipt(
+    launch,
+    split,
+    scheduleId,
+    seedRoots,
+    producerEngineCommit,
+  );
 
   const traceHash = createHash("sha256");
   const datasetHash = createHash("sha256");
@@ -449,6 +704,8 @@ export async function authenticateSchema9SplitWithRuleContract(
   const sourceGames: SourceGame[] = [];
   const gameIds = new Set<string>();
   const simulationSeeds = new Set<number>();
+  const parameterSeeds = new Set<number>();
+  const allSeeds = new Set<number>();
   const gameIndexes = new Set<number>();
   const convertedGameIds = new Set<string>();
   const convertedSeeds = new Set<number>();
@@ -480,6 +737,20 @@ export async function authenticateSchema9SplitWithRuleContract(
       throw new TypeError(
         `${split} source contains a duplicate simulation seed.`,
       );
+    }
+    if (allSeeds.has(source.seed)) {
+      throw new TypeError(`${split} reuses a seed across streams.`);
+    }
+    allSeeds.add(source.seed);
+    for (const parameterSeed of [
+      source.parameterSeeds.white,
+      source.parameterSeeds.black,
+    ]) {
+      if (allSeeds.has(parameterSeed)) {
+        throw new TypeError(`${split} reuses a seed across streams.`);
+      }
+      allSeeds.add(parameterSeed);
+      parameterSeeds.add(parameterSeed);
     }
     if (gameIndexes.has(source.gameIndex)) {
       throw new TypeError(`${split} source contains a duplicate game index.`);
@@ -543,6 +814,10 @@ export async function authenticateSchema9SplitWithRuleContract(
       `${split} converted dataset must contain at least one observed move.`,
     );
   }
+  if (launchCounts["train"] !== sourceGames.length) {
+    throw new TypeError(`${split} launch receipt game count is inconsistent.`);
+  }
+  assertExpectedSchedule(split, sourceGames, seedRoots, scheduler);
   assertExactSchema9LabelBalance(
     sourceGames.length,
     whiteCounts,
@@ -551,6 +826,7 @@ export async function authenticateSchema9SplitWithRuleContract(
   );
   const sourceGameIds = sortedCanonicalSet([...gameIds]);
   const sourceSimulationSeeds = sortedCanonicalSet([...simulationSeeds]);
+  const sourceParameterSeeds = sortedCanonicalSet([...parameterSeeds]);
   const convertedGameIdValues = sortedCanonicalSet([...convertedGameIds]);
   const convertedSeedValues = sortedCanonicalSet([...convertedSeeds]);
   const sourceTrace: Schema9SourceTraceIdentity = Object.freeze({
@@ -560,8 +836,10 @@ export async function authenticateSchema9SplitWithRuleContract(
     zeroPlyGames,
     gameIds: sourceGameIds,
     simulationSeeds: sourceSimulationSeeds,
+    parameterSeeds: sourceParameterSeeds,
     gameIdSetSha256: sha256CanonicalSet(sourceGameIds),
     simulationSeedSetSha256: sha256CanonicalSet(sourceSimulationSeeds),
+    parameterSeedSetSha256: sha256CanonicalSet(sourceParameterSeeds),
     labelCountsByColor: Object.freeze({
       white: Object.freeze({ ...whiteCounts }),
       black: Object.freeze({ ...blackCounts }),
@@ -587,6 +865,14 @@ export async function authenticateSchema9SplitWithRuleContract(
       `${split} converted game and seed accounting disagrees.`,
     );
   }
+  validateCompletionReceipt(
+    completion,
+    split,
+    scheduleId,
+    producerEngineCommit,
+    launch.identity.sha256,
+    sourceTrace,
+  );
   return Object.freeze({
     ledger: Object.freeze({
       split,
@@ -594,20 +880,22 @@ export async function authenticateSchema9SplitWithRuleContract(
       seedRoots,
       producerEngineCommit,
       generatorReceipts: Object.freeze({
-        launch,
-        completion,
+        launch: launch.identity,
+        completion: completion.identity,
       }),
+      scheduleProfile: SCHEMA9_SCHEDULE_PROFILE,
       sourceTrace,
       converted,
     }),
     gameIds,
     simulationSeeds,
+    parameterSeeds,
   });
 }
 
 export function digestPartitionAssignments(
   splits: readonly AuthenticatedSchema9Split[],
-  selector: "gameIds" | "simulationSeeds",
+  selector: "gameIds" | "simulationSeeds" | "parameterSeeds",
 ): string {
   const value = splits.map((split) => ({
     split: split.ledger.split,

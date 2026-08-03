@@ -20,6 +20,7 @@
   "dependencies": {
     "@drawbackengine/chess-core": "workspace:*",
     "@drawbackengine/drawback-engine": "workspace:*",
+    "@drawbackengine/simulation-arena": "workspace:*",
     "@drawbackengine/shared": "workspace:*",
     "@drawbackengine/simulation-trace": "workspace:*",
     "@drawbackguesser/dataset-contract": "workspace:*",

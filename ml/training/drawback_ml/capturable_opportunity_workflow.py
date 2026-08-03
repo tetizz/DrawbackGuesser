@@ -16,6 +16,7 @@ import argparse
 from dataclasses import dataclass
 import hashlib
 import math
+import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 from typing import Any, Mapping, Sequence
@@ -54,7 +55,9 @@ CONSUMPTION_FORMAT = (
     "drawbackguesser-schema9-opportunity-sealed-test-consumption"
 )
 CORPUS_LEDGER_FORMAT = "drawbackguesser-schema9-corpus-ledger"
-CORPUS_LEDGER_VERSION = 1
+CORPUS_LEDGER_VERSION = 2
+LEDGER_VERIFICATION_FORMAT = "drawbackguesser-schema9-ledger-verification"
+LEDGER_VERIFICATION_VERSION = 1
 CORPUS_LEDGER_SPLITS = (
     "train",
     "validation-a",
@@ -80,7 +83,14 @@ FROZEN_CONFIG = {
 }
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _FULL_GIT_COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
-_SCHEDULE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+/-]{0,199}\Z")
+_SCHEDULE_ID = re.compile(
+    r"[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?\Z"
+)
+_SAFE_BASENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
+_PRIVATE_TOKEN = re.compile(
+    r"(?:password|passwd|secret|credential|api[-_.]?key|token)",
+    re.IGNORECASE,
+)
 _REFERENCE_KEYS = frozenset(
     {
         "artifactpath",
@@ -131,6 +141,7 @@ class _CorpusLedger:
     path: Path
     artifact: Mapping[str, Any]
     sha256: str
+    verification_receipt_sha256: str
     splits: Mapping[str, Mapping[str, Any]]
 
 
@@ -239,14 +250,11 @@ def _assert_path_free_artifact(value: Any, label: str = "artifact") -> None:
                 isinstance(key, str)
                 and (
                     key.casefold() in _REFERENCE_KEYS
-                    or key.casefold().endswith(
-                        (
-                            "path",
-                            "file",
-                            "directory",
-                            "report",
-                            "marker",
+                    or (
+                        key.casefold().endswith(
+                            ("path", "file", "directory", "report", "marker")
                         )
+                        and not key.casefold().endswith("profile")
                     )
                 )
             ):
@@ -259,9 +267,21 @@ def _assert_path_free_artifact(value: Any, label: str = "artifact") -> None:
 
 
 def _safe_basename(value: Any, label: str) -> str:
+    lowered = value.casefold() if isinstance(value, str) else ""
+    environment_tokens = {
+        token.strip().casefold()
+        for token in (
+            os.environ.get("USERNAME"),
+            os.environ.get("USER"),
+            os.environ.get("LOGNAME"),
+            os.environ.get("COMPUTERNAME"),
+        )
+        if token is not None and len(token.strip()) >= 3
+    }
     if (
         not isinstance(value, str)
         or not value
+        or _SAFE_BASENAME.fullmatch(value) is None
         or PureWindowsPath(value).name != value
         or PurePosixPath(value).name != value
         or PureWindowsPath(value).drive
@@ -270,6 +290,8 @@ def _safe_basename(value: Any, label: str) -> str:
         or any(ord(character) < 32 for character in value)
         or _WINDOWS_RESERVED_BASENAME.fullmatch(value) is not None
         or value in {".", ".."}
+        or _PRIVATE_TOKEN.search(value) is not None
+        or any(token in lowered for token in environment_tokens)
     ):
         raise CapturableDatasetError(f"{label} must be a path-free basename")
     return value
@@ -384,6 +406,7 @@ def _ledger_split(
             "seedRoots",
             "producerEngineCommit",
             "generatorReceipts",
+            "scheduleProfile",
             "sourceTrace",
             "converted",
         },
@@ -399,6 +422,8 @@ def _ledger_split(
         or _SCHEDULE_ID.fullmatch(schedule_id) is None
         or ".." in schedule_id
         or "\\" in schedule_id
+        or _PRIVATE_TOKEN.search(schedule_id) is not None
+        or _WINDOWS_RESERVED_BASENAME.fullmatch(schedule_id) is not None
         or PurePosixPath(schedule_id).is_absolute()
         or PureWindowsPath(schedule_id).is_absolute()
     ):
@@ -446,6 +471,13 @@ def _ledger_split(
         receipts.get("completion"),
         f"{label} completion receipt",
     )
+    profile = _mapping(split.get("scheduleProfile"), f"{label} profile")
+    _exact_keys(profile, {"id", "policyId"}, f"{label} profile")
+    if profile != {
+        "id": "standard",
+        "policyId": "material-player-private-corpus/v1",
+    }:
+        raise CapturableDatasetError(f"{label} profile is unsupported")
 
     source = _mapping(split.get("sourceTrace"), f"{label} sourceTrace")
     _exact_keys(
@@ -457,8 +489,10 @@ def _ledger_split(
             "zeroPlyGames",
             "gameIds",
             "simulationSeeds",
+            "parameterSeeds",
             "gameIdSetSha256",
             "simulationSeedSetSha256",
+            "parameterSeedSetSha256",
             "labelCountsByColor",
         },
         f"{label} sourceTrace",
@@ -481,14 +515,22 @@ def _ledger_split(
         source.get("simulationSeeds"),
         f"{label} source simulation seeds",
     )
+    parameter_seeds = _ledger_seed_set(
+        source.get("parameterSeeds"),
+        f"{label} source parameter seeds",
+    )
     if (
         len(source_game_ids) != source_games
         or len(source_seeds) != source_games
+        or len(parameter_seeds) != source_games * 2
+        or set(source_seeds) & set(parameter_seeds)
         or zero_ply_games > source_games
         or source.get("gameIdSetSha256")
         != _canonical_set_sha256(source_game_ids)
         or source.get("simulationSeedSetSha256")
         != _canonical_set_sha256(source_seeds)
+        or source.get("parameterSeedSetSha256")
+        != _canonical_set_sha256(parameter_seeds)
     ):
         raise CapturableDatasetError(
             f"{label} source set commitments are inconsistent"
@@ -500,6 +542,10 @@ def _ledger_split(
     _sha256(
         source.get("simulationSeedSetSha256"),
         f"{label} source seed set SHA-256",
+    )
+    _sha256(
+        source.get("parameterSeedSetSha256"),
+        f"{label} source parameter-seed set SHA-256",
     )
     counts = _mapping(
         source.get("labelCountsByColor"),
@@ -616,9 +662,219 @@ def _partition_assignment_sha256(
     ).hexdigest()
 
 
+def _ledger_execution_identity(value: Any, label: str) -> Mapping[str, Any]:
+    execution = _mapping(value, label)
+    _exact_keys(
+        execution,
+        {
+            "algorithm",
+            "runtime",
+            "parser",
+            "converter",
+            "scheduler",
+            "verifier",
+            "aggregateSha256",
+        },
+        label,
+    )
+    if execution.get("algorithm") != "sha256-loaded-module-graph-v2":
+        raise CapturableDatasetError(f"{label} algorithm is unsupported")
+    runtime = _mapping(execution.get("runtime"), f"{label} runtime")
+    _exact_keys(
+        runtime,
+        {"nodeVersion", "platform", "architecture", "execArgv"},
+        f"{label} runtime",
+    )
+    node_version = runtime.get("nodeVersion")
+    runtime_platform = runtime.get("platform")
+    runtime_architecture = runtime.get("architecture")
+    if (
+        not isinstance(node_version, str)
+        or re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", node_version) is None
+        or not isinstance(runtime_platform, str)
+        or _SCHEDULE_ID.fullmatch(runtime_platform) is None
+        or not isinstance(runtime_architecture, str)
+        or _SCHEDULE_ID.fullmatch(runtime_architecture) is None
+        or runtime.get("execArgv") != []
+    ):
+        raise CapturableDatasetError(f"{label} runtime is invalid")
+    for component_name in ("parser", "converter", "scheduler", "verifier"):
+        component = _mapping(
+            execution.get(component_name),
+            f"{label} {component_name}",
+        )
+        _exact_keys(
+            component,
+            {"entrypoint", "files", "bytes", "sha256"},
+            f"{label} {component_name}",
+        )
+        entrypoint = component.get("entrypoint")
+        if (
+            not isinstance(entrypoint, str)
+            or _SCHEDULE_ID.fullmatch(entrypoint) is None
+        ):
+            raise CapturableDatasetError(
+                f"{label} {component_name} entrypoint is invalid"
+            )
+        _positive_count(component.get("files"), f"{label} files")
+        _positive_count(component.get("bytes"), f"{label} bytes")
+        _sha256(component.get("sha256"), f"{label} SHA-256")
+    declared = _sha256(
+        execution.get("aggregateSha256"),
+        f"{label} aggregate SHA-256",
+    )
+    payload = {
+        key: value
+        for key, value in execution.items()
+        if key != "aggregateSha256"
+    }
+    if hashlib.sha256(_canonical_json(payload)).hexdigest() != declared:
+        raise CapturableDatasetError(f"{label} aggregate is inconsistent")
+    return execution
+
+
+def _ledger_verification_input_set(
+    ledger: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    result: list[Mapping[str, Any]] = []
+    raw_splits = ledger.get("splits")
+    if not isinstance(raw_splits, list):
+        raise CapturableDatasetError("corpus ledger split list is invalid")
+    for split_value in raw_splits:
+        split = _mapping(split_value, "corpus ledger split")
+        source = _mapping(split.get("sourceTrace"), "source trace")
+        converted = _mapping(split.get("converted"), "converted dataset")
+        result.append(
+            {
+                "split": split.get("split"),
+                "scheduleId": split.get("scheduleId"),
+                "seedRoots": split.get("seedRoots"),
+                "producerEngineCommit": split.get("producerEngineCommit"),
+                "generatorReceipts": split.get("generatorReceipts"),
+                "sourceTrace": {
+                    "sha256": source.get("sha256"),
+                    "bytes": source.get("bytes"),
+                    "games": source.get("games"),
+                    "gameIdSetSha256": source.get("gameIdSetSha256"),
+                    "simulationSeedSetSha256": source.get(
+                        "simulationSeedSetSha256"
+                    ),
+                    "parameterSeedSetSha256": source.get(
+                        "parameterSeedSetSha256"
+                    ),
+                },
+                "converted": {
+                    "sha256": converted.get("sha256"),
+                    "bytes": converted.get("bytes"),
+                    "rows": converted.get("rows"),
+                    "games": converted.get("games"),
+                    "gameIdSetSha256": converted.get("gameIdSetSha256"),
+                    "simulationSeedSetSha256": converted.get(
+                        "simulationSeedSetSha256"
+                    ),
+                },
+            }
+        )
+    return result
+
+
+def ledger_verification_receipt_path(
+    ledger_path: Path,
+    ledger_sha256: str,
+) -> Path:
+    digest = _sha256(ledger_sha256, "corpus ledger SHA-256")
+    return ledger_path.parent / f"schema9-ledger-verification-{digest}.json"
+
+
+def _authenticate_ledger_verification_receipt(
+    ledger_path: Path,
+    ledger: Mapping[str, Any],
+    ledger_sha256: str,
+    expected_receipt_sha256: str,
+) -> str:
+    expected_receipt_digest = _sha256(
+        expected_receipt_sha256,
+        "expected corpus ledger verification receipt SHA-256",
+    )
+    receipt_path = ledger_verification_receipt_path(
+        ledger_path,
+        ledger_sha256,
+    )
+    if not receipt_path.is_file():
+        raise CapturableDatasetError(
+            "corpus ledger requires a TypeScript verification receipt"
+        )
+    if receipt_path.is_symlink():
+        raise CapturableDatasetError(
+            "corpus ledger verification receipt must not be a symbolic link"
+        )
+    receipt, receipt_sha256 = _selection_report(receipt_path)
+    if receipt_sha256 != expected_receipt_digest:
+        raise CapturableDatasetError(
+            "corpus ledger verification receipt SHA-256 is inconsistent"
+        )
+    _assert_path_free_artifact(receipt, "ledger verification receipt")
+    _exact_keys(
+        receipt,
+        {
+            "format",
+            "version",
+            "ledger",
+            "repository",
+            "inputSetSha256",
+            "verificationPolicy",
+            "contentSha256",
+        },
+        "ledger verification receipt",
+    )
+    declared_content = _sha256(
+        receipt.get("contentSha256"),
+        "ledger verification receipt content SHA-256",
+    )
+    payload = {
+        key: value
+        for key, value in receipt.items()
+        if key != "contentSha256"
+    }
+    if hashlib.sha256(_canonical_json(payload)).hexdigest() != declared_content:
+        raise CapturableDatasetError(
+            "ledger verification receipt self-hash is inconsistent"
+        )
+    ledger_reference = _mapping(receipt.get("ledger"), "verified ledger")
+    _exact_keys(
+        ledger_reference,
+        {"sha256", "contentSha256"},
+        "verified ledger",
+    )
+    expected_input_set = hashlib.sha256(
+        _canonical_json(_ledger_verification_input_set(ledger))
+    ).hexdigest()
+    if (
+        receipt.get("format") != LEDGER_VERIFICATION_FORMAT
+        or receipt.get("version") != LEDGER_VERIFICATION_VERSION
+        or ledger_reference.get("sha256") != ledger_sha256
+        or ledger_reference.get("contentSha256")
+        != ledger.get("contentSha256")
+        or receipt.get("repository") != ledger.get("identity")
+        or receipt.get("inputSetSha256") != expected_input_set
+        or receipt.get("verificationPolicy")
+        != {
+            "repository": "head-clean-content-manifest/v1",
+            "schedule": "engine-scheduler-replay/v1",
+            "corpus": "full-byte-reauthentication/v1",
+        }
+    ):
+        raise CapturableDatasetError(
+            "ledger verification receipt does not bind the authenticated ledger"
+        )
+    _sha256(receipt.get("inputSetSha256"), "verified input set SHA-256")
+    return receipt_sha256
+
+
 def _load_corpus_ledger(
     path: Path,
     expected_sha256: str,
+    expected_verification_receipt_sha256: str,
 ) -> _CorpusLedger:
     expected_digest = _sha256(
         expected_sha256,
@@ -682,6 +938,7 @@ def _load_corpus_ledger(
             "guesserCommit",
             "converterEngineCommit",
             "producerConverterPolicy",
+            "execution",
         },
         f"{path.name} corpus ledger identity",
     )
@@ -698,6 +955,10 @@ def _load_corpus_ledger(
             f"{path.name} corpus ledger identity is not independently "
             "verifiable under exact/v1"
         )
+    _ledger_execution_identity(
+        identity.get("execution"),
+        f"{path.name} corpus ledger execution identity",
+    )
 
     schedule_contract = _mapping(
         artifact.get("scheduleContract"),
@@ -792,11 +1053,14 @@ def _load_corpus_ledger(
         raise CapturableDatasetError(
             f"{path.name} exact/v1 producer identity is inconsistent"
         )
+    seen_game_ids: set[Any] = set()
+    seen_seed_values: set[Any] = set()
     for field, description in (
         ("gameIds", "game ID"),
         ("simulationSeeds", "simulation seed"),
+        ("parameterSeeds", "parameter seed"),
     ):
-        seen: set[Any] = set()
+        seen = seen_game_ids if field == "gameIds" else seen_seed_values
         for split_name in CORPUS_LEDGER_SPLITS:
             values = set(
                 _mapping(
@@ -807,7 +1071,7 @@ def _load_corpus_ledger(
             if seen & values:
                 raise CapturableDatasetError(
                     f"{path.name} corpus ledger {description} sets overlap "
-                    "across splits"
+                    "across splits or streams"
                 )
             seen.update(values)
 
@@ -821,6 +1085,7 @@ def _load_corpus_ledger(
             "games",
             "gameIdAssignmentsSha256",
             "simulationSeedAssignmentsSha256",
+            "parameterSeedAssignmentsSha256",
         },
         f"{path.name} corpus partition",
     )
@@ -838,6 +1103,8 @@ def _load_corpus_ledger(
         != _partition_assignment_sha256(splits, "gameIds")
         or partition.get("simulationSeedAssignmentsSha256")
         != _partition_assignment_sha256(splits, "simulationSeeds")
+        or partition.get("parameterSeedAssignmentsSha256")
+        != _partition_assignment_sha256(splits, "parameterSeeds")
     ):
         raise CapturableDatasetError(
             f"{path.name} corpus partition commitments are inconsistent"
@@ -850,10 +1117,21 @@ def _load_corpus_ledger(
         partition.get("simulationSeedAssignmentsSha256"),
         "corpus seed assignment SHA-256",
     )
+    _sha256(
+        partition.get("parameterSeedAssignmentsSha256"),
+        "corpus parameter-seed assignment SHA-256",
+    )
+    verification_receipt_sha256 = _authenticate_ledger_verification_receipt(
+        path,
+        artifact,
+        artifact_sha256,
+        expected_verification_receipt_sha256,
+    )
     return _CorpusLedger(
         path=path.resolve(),
         artifact=artifact,
         sha256=artifact_sha256,
+        verification_receipt_sha256=verification_receipt_sha256,
         splits=splits,
     )
 
@@ -865,13 +1143,39 @@ def _corpus_ledger_reference(
         ledger.artifact.get("identity"),
         "corpus ledger identity",
     )
+    test_split = ledger.splits["test"]
+    converted = _mapping(test_split.get("converted"), "test converted identity")
+    sealed_identity = hashlib.sha256(
+        _canonical_json(
+            {
+                "domain": EXPERIMENT_DOMAIN,
+                "workflowVersion": OPPORTUNITY_WORKFLOW_VERSION,
+                "ledgerSha256": ledger.sha256,
+                "ledgerContentSha256": ledger.artifact["contentSha256"],
+                "testConvertedSha256": converted["sha256"],
+                "testGameIdSetSha256": converted["gameIdSetSha256"],
+                "testSimulationSeedSetSha256": converted[
+                    "simulationSeedSetSha256"
+                ],
+                "testParameterSeedSetSha256": test_split["sourceTrace"][
+                    "parameterSeedSetSha256"
+                ],
+                "scheduleId": test_split["scheduleId"],
+                "seedRoots": test_split["seedRoots"],
+            }
+        )
+    ).hexdigest()
     return {
-        "file": _safe_basename(ledger.path.name, "corpus ledger file"),
         "sha256": ledger.sha256,
         "contentSha256": ledger.artifact["contentSha256"],
+        "verificationReceiptSha256": ledger.verification_receipt_sha256,
         "guesserCommit": identity["guesserCommit"],
         "converterEngineCommit": identity["converterEngineCommit"],
         "producerConverterPolicy": identity["producerConverterPolicy"],
+        "executionAggregateSha256": identity["execution"][
+            "aggregateSha256"
+        ],
+        "sealedCorpusIdentitySha256": sealed_identity,
     }
 
 
@@ -1419,9 +1723,14 @@ def run_stage_a(
     *,
     corpus_ledger_path: Path,
     corpus_ledger_sha256: str,
+    corpus_ledger_verification_receipt_sha256: str,
 ) -> Mapping[str, Any]:
     """Authenticate three validation-A comparisons and freeze one pair."""
 
+    _safe_basename(output_path.name, "Stage A output filename")
+    _safe_basename(corpus_ledger_path.name, "corpus ledger filename")
+    for comparison_path in comparison_paths:
+        _safe_basename(comparison_path.name, "comparison filename")
     if output_path.exists():
         raise FileExistsError("Stage A output already exists")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1433,6 +1742,7 @@ def run_stage_a(
     corpus_ledger = _load_corpus_ledger(
         corpus_ledger_path,
         corpus_ledger_sha256,
+        corpus_ledger_verification_receipt_sha256,
     )
     artifact = _build_stage_a(
         comparison_paths,
@@ -1458,6 +1768,7 @@ def load_stage_a(
     *,
     corpus_ledger_path: Path,
     corpus_ledger_sha256: str,
+    corpus_ledger_verification_receipt_sha256: str,
 ) -> tuple[Mapping[str, Any], str]:
     """Replay-authenticate Stage A and all three comparison artifacts."""
 
@@ -1512,6 +1823,7 @@ def load_stage_a(
     corpus_ledger = _load_corpus_ledger(
         corpus_ledger_path,
         corpus_ledger_sha256,
+        corpus_ledger_verification_receipt_sha256,
     )
     if not _json_equal(
         artifact.get("corpusLedger"),
@@ -1766,11 +2078,15 @@ def _build_stage_b(
     validation_b_path: Path,
     corpus_ledger_path: Path,
     corpus_ledger_sha256: str,
+    corpus_ledger_verification_receipt_sha256: str,
 ) -> tuple[Mapping[str, Any], tuple[CapturableDatasetRow, ...]]:
     stage_a, stage_a_sha256 = load_stage_a(
         stage_a_path,
         corpus_ledger_path=corpus_ledger_path,
         corpus_ledger_sha256=corpus_ledger_sha256,
+        corpus_ledger_verification_receipt_sha256=(
+            corpus_ledger_verification_receipt_sha256
+        ),
     )
     if stage_a.get("decision") != "promote-treatment":
         raise CapturableDatasetError(
@@ -1779,6 +2095,7 @@ def _build_stage_b(
     corpus_ledger = _load_corpus_ledger(
         corpus_ledger_path,
         corpus_ledger_sha256,
+        corpus_ledger_verification_receipt_sha256,
     )
     pair = _load_frozen_pair(
         stage_a_path,
@@ -1836,9 +2153,14 @@ def run_stage_b(
     *,
     corpus_ledger_path: Path,
     corpus_ledger_sha256: str,
+    corpus_ledger_verification_receipt_sha256: str,
 ) -> Mapping[str, Any]:
     """Evaluate only the Stage-A-frozen pair on validation B."""
 
+    _safe_basename(output_path.name, "Stage B output filename")
+    _safe_basename(stage_a_path.name, "Stage A filename")
+    _safe_basename(validation_b_path.name, "validation-B filename")
+    _safe_basename(corpus_ledger_path.name, "corpus ledger filename")
     if output_path.exists():
         raise FileExistsError("Stage B output already exists")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1857,6 +2179,7 @@ def run_stage_b(
         validation_b_path,
         corpus_ledger_path,
         corpus_ledger_sha256,
+        corpus_ledger_verification_receipt_sha256,
     )
     payload = _canonical_json(artifact)
     publish_bytes_durable(output_path, payload)
@@ -1873,6 +2196,7 @@ def _load_stage_b_context(
     validation_b_path: Path,
     corpus_ledger_path: Path,
     corpus_ledger_sha256: str,
+    corpus_ledger_verification_receipt_sha256: str,
 ) -> tuple[
     Mapping[str, Any],
     str,
@@ -1919,6 +2243,7 @@ def _load_stage_b_context(
         validation_b_path,
         corpus_ledger_path,
         corpus_ledger_sha256,
+        corpus_ledger_verification_receipt_sha256,
     )
     if not _json_equal(artifact, expected):
         raise CapturableDatasetError(
@@ -1933,6 +2258,7 @@ def load_stage_b(
     *,
     corpus_ledger_path: Path,
     corpus_ledger_sha256: str,
+    corpus_ledger_verification_receipt_sha256: str,
 ) -> tuple[Mapping[str, Any], str]:
     """Replay Stage B from Stage A, checkpoints, and validation-B bytes."""
 
@@ -1941,6 +2267,7 @@ def load_stage_b(
         validation_b_path,
         corpus_ledger_path,
         corpus_ledger_sha256,
+        corpus_ledger_verification_receipt_sha256,
     )
     return artifact, artifact_sha256
 
@@ -1953,6 +2280,7 @@ def _build_sealed_result(
     test_path: Path,
     corpus_ledger_path: Path,
     corpus_ledger_sha256: str,
+    corpus_ledger_verification_receipt_sha256: str,
 ) -> Mapping[str, Any]:
     stage_a_name = _mapping(stage_b["stageA"], "Stage A reference")["file"]
     stage_a_path = stage_b_path.resolve().parent / str(stage_a_name)
@@ -1960,10 +2288,14 @@ def _build_sealed_result(
         stage_a_path,
         corpus_ledger_path=corpus_ledger_path,
         corpus_ledger_sha256=corpus_ledger_sha256,
+        corpus_ledger_verification_receipt_sha256=(
+            corpus_ledger_verification_receipt_sha256
+        ),
     )
     corpus_ledger = _load_corpus_ledger(
         corpus_ledger_path,
         corpus_ledger_sha256,
+        corpus_ledger_verification_receipt_sha256,
     )
     pair = _load_frozen_pair(
         stage_a_path,
@@ -2020,11 +2352,14 @@ def _build_sealed_result(
 
 def consumption_marker_path(
     stage_b_path: Path,
-    stage_b_sha256: str,
+    sealed_corpus_identity_sha256: str,
 ) -> Path:
-    """Return the one marker name canonically keyed by Stage-B bytes."""
+    """Return the one marker canonically keyed by the sealed corpus."""
 
-    digest = _sha256(stage_b_sha256, "Stage B SHA-256")
+    digest = _sha256(
+        sealed_corpus_identity_sha256,
+        "sealed corpus identity SHA-256",
+    )
     return stage_b_path.with_name(
         f"sealed-test-consumption-{digest}.json"
     )
@@ -2035,6 +2370,14 @@ def _consumption_artifact(
     stage_b: Mapping[str, Any],
     stage_b_sha256: str,
 ) -> Mapping[str, Any]:
+    ledger_reference = _mapping(
+        stage_b.get("corpusLedger"),
+        "Stage B corpus ledger reference",
+    )
+    sealed_identity = _sha256(
+        ledger_reference.get("sealedCorpusIdentitySha256"),
+        "sealed corpus identity SHA-256",
+    )
     artifact = {
         "format": CONSUMPTION_FORMAT,
         "version": OPPORTUNITY_WORKFLOW_VERSION,
@@ -2044,6 +2387,7 @@ def _consumption_artifact(
             "sha256": stage_b_sha256,
             "authorization": stage_b["authorization"],
         },
+        "sealedCorpusIdentitySha256": sealed_identity,
         "frozenPair": stage_b["frozenPair"],
         "sealedTestStatus": "consumed",
     }
@@ -2059,9 +2403,14 @@ def run_sealed_test(
     *,
     corpus_ledger_path: Path,
     corpus_ledger_sha256: str,
+    corpus_ledger_verification_receipt_sha256: str,
 ) -> Mapping[str, Any]:
     """Consume the sealed test once after replaying Stage-B authorization."""
 
+    _safe_basename(output_path.name, "sealed-test output filename")
+    _safe_basename(stage_b_path.name, "Stage B filename")
+    _safe_basename(validation_b_path.name, "validation-B filename")
+    _safe_basename(corpus_ledger_path.name, "corpus ledger filename")
     if output_path.exists():
         raise FileExistsError("sealed test is already consumed")
     # Do not move any operation involving test_path above this authorization
@@ -2071,6 +2420,7 @@ def run_sealed_test(
         validation_b_path,
         corpus_ledger_path,
         corpus_ledger_sha256,
+        corpus_ledger_verification_receipt_sha256,
     )
     if stage_b.get("authorization") != "sealed-test-authorized":
         raise CapturableDatasetError(
@@ -2087,9 +2437,17 @@ def run_sealed_test(
         output_path.parent,
         "corpus ledger",
     )
+    ledger_reference = _mapping(
+        stage_b.get("corpusLedger"),
+        "Stage B corpus ledger reference",
+    )
+    sealed_identity = _sha256(
+        ledger_reference.get("sealedCorpusIdentitySha256"),
+        "sealed corpus identity SHA-256",
+    )
     marker_path = consumption_marker_path(
         stage_b_path,
-        stage_b_sha256,
+        sealed_identity,
     )
     marker = _consumption_artifact(
         stage_b_path,
@@ -2099,6 +2457,9 @@ def run_sealed_test(
     marker_payload = _canonical_json(marker)
     publish_bytes_durable(marker_path, marker_payload)
     marker_sha256 = hashlib.sha256(marker_payload).hexdigest()
+    # The test filename is validated only after authorization is durably
+    # consumed, but before any resolution, stat, hash, or open of the test.
+    _safe_basename(test_path.name, "sealed-test input filename")
     artifact = _build_sealed_result(
         stage_b_path,
         stage_b,
@@ -2107,6 +2468,7 @@ def run_sealed_test(
         test_path,
         corpus_ledger_path,
         corpus_ledger_sha256,
+        corpus_ledger_verification_receipt_sha256,
     )
     _, current_stage_b_sha256 = _selection_report(stage_b_path)
     current_marker, current_marker_sha256 = _selection_report(marker_path)
@@ -2145,6 +2507,7 @@ def load_sealed_test(
     report_sha256: str,
     corpus_ledger_path: Path,
     corpus_ledger_sha256: str,
+    corpus_ledger_verification_receipt_sha256: str,
 ) -> tuple[Mapping[str, Any], str]:
     """Authenticate a consumed report without reopening the sealed test."""
 
@@ -2197,6 +2560,9 @@ def load_sealed_test(
         validation_b_path,
         corpus_ledger_path=corpus_ledger_path,
         corpus_ledger_sha256=corpus_ledger_sha256,
+        corpus_ledger_verification_receipt_sha256=(
+            corpus_ledger_verification_receipt_sha256
+        ),
     )
     if stage_b.get("authorization") != "sealed-test-authorized":
         raise CapturableDatasetError(
@@ -2220,10 +2586,11 @@ def load_sealed_test(
         consumption.get("file"),
         "consumption marker filename",
     )
-    canonical_marker = consumption_marker_path(
-        stage_b_path,
-        stage_b_sha256,
+    marker_identity = _sha256(
+        expected_marker.get("sealedCorpusIdentitySha256"),
+        "sealed corpus identity SHA-256",
     )
+    canonical_marker = consumption_marker_path(stage_b_path, marker_identity)
     if marker_name != canonical_marker.name:
         raise CapturableDatasetError(
             f"{path.name} consumption marker filename is invalid"
@@ -2374,6 +2741,7 @@ def load_sealed_test(
     corpus_ledger = _load_corpus_ledger(
         corpus_ledger_path,
         corpus_ledger_sha256,
+        corpus_ledger_verification_receipt_sha256,
     )
     test_split = corpus_ledger.splits["test"]
     test_converted = _mapping(
@@ -2415,12 +2783,20 @@ def _parser() -> argparse.ArgumentParser:
     )
     stage_a.add_argument("--corpus-ledger", type=Path, required=True)
     stage_a.add_argument("--corpus-ledger-sha256", required=True)
+    stage_a.add_argument(
+        "--corpus-ledger-verification-receipt-sha256",
+        required=True,
+    )
     stage_a.add_argument("--output", type=Path, required=True)
     stage_b = commands.add_parser("stage-b")
     stage_b.add_argument("--stage-a", type=Path, required=True)
     stage_b.add_argument("--validation-b", type=Path, required=True)
     stage_b.add_argument("--corpus-ledger", type=Path, required=True)
     stage_b.add_argument("--corpus-ledger-sha256", required=True)
+    stage_b.add_argument(
+        "--corpus-ledger-verification-receipt-sha256",
+        required=True,
+    )
     stage_b.add_argument("--output", type=Path, required=True)
     sealed = commands.add_parser("sealed-test")
     sealed.add_argument("--stage-b", type=Path, required=True)
@@ -2428,16 +2804,28 @@ def _parser() -> argparse.ArgumentParser:
     sealed.add_argument("--test", type=Path, required=True)
     sealed.add_argument("--corpus-ledger", type=Path, required=True)
     sealed.add_argument("--corpus-ledger-sha256", required=True)
+    sealed.add_argument(
+        "--corpus-ledger-verification-receipt-sha256",
+        required=True,
+    )
     sealed.add_argument("--output", type=Path, required=True)
     verify_a = commands.add_parser("verify-stage-a")
     verify_a.add_argument("--stage-a", type=Path, required=True)
     verify_a.add_argument("--corpus-ledger", type=Path, required=True)
     verify_a.add_argument("--corpus-ledger-sha256", required=True)
+    verify_a.add_argument(
+        "--corpus-ledger-verification-receipt-sha256",
+        required=True,
+    )
     verify_b = commands.add_parser("verify-stage-b")
     verify_b.add_argument("--stage-b", type=Path, required=True)
     verify_b.add_argument("--validation-b", type=Path, required=True)
     verify_b.add_argument("--corpus-ledger", type=Path, required=True)
     verify_b.add_argument("--corpus-ledger-sha256", required=True)
+    verify_b.add_argument(
+        "--corpus-ledger-verification-receipt-sha256",
+        required=True,
+    )
     verify_test = commands.add_parser("verify-sealed-test")
     verify_test.add_argument("--report", type=Path, required=True)
     verify_test.add_argument("--report-sha256", required=True)
@@ -2445,6 +2833,10 @@ def _parser() -> argparse.ArgumentParser:
     verify_test.add_argument("--validation-b", type=Path, required=True)
     verify_test.add_argument("--corpus-ledger", type=Path, required=True)
     verify_test.add_argument("--corpus-ledger-sha256", required=True)
+    verify_test.add_argument(
+        "--corpus-ledger-verification-receipt-sha256",
+        required=True,
+    )
     return parser
 
 
@@ -2456,6 +2848,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             options.output,
             corpus_ledger_path=options.corpus_ledger,
             corpus_ledger_sha256=options.corpus_ledger_sha256,
+            corpus_ledger_verification_receipt_sha256=(
+                options.corpus_ledger_verification_receipt_sha256
+            ),
         )
     elif options.command == "stage-b":
         result = run_stage_b(
@@ -2464,6 +2859,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             options.output,
             corpus_ledger_path=options.corpus_ledger,
             corpus_ledger_sha256=options.corpus_ledger_sha256,
+            corpus_ledger_verification_receipt_sha256=(
+                options.corpus_ledger_verification_receipt_sha256
+            ),
         )
     elif options.command == "sealed-test":
         result = run_sealed_test(
@@ -2473,12 +2871,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             options.output,
             corpus_ledger_path=options.corpus_ledger,
             corpus_ledger_sha256=options.corpus_ledger_sha256,
+            corpus_ledger_verification_receipt_sha256=(
+                options.corpus_ledger_verification_receipt_sha256
+            ),
         )
     elif options.command == "verify-stage-a":
         artifact, digest = load_stage_a(
             options.stage_a,
             corpus_ledger_path=options.corpus_ledger,
             corpus_ledger_sha256=options.corpus_ledger_sha256,
+            corpus_ledger_verification_receipt_sha256=(
+                options.corpus_ledger_verification_receipt_sha256
+            ),
         )
         result = {"artifactSha256": digest, "decision": artifact["decision"]}
     elif options.command == "verify-stage-b":
@@ -2487,6 +2891,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             options.validation_b,
             corpus_ledger_path=options.corpus_ledger,
             corpus_ledger_sha256=options.corpus_ledger_sha256,
+            corpus_ledger_verification_receipt_sha256=(
+                options.corpus_ledger_verification_receipt_sha256
+            ),
         )
         result = {
             "artifactSha256": digest,
@@ -2500,6 +2907,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             report_sha256=options.report_sha256,
             corpus_ledger_path=options.corpus_ledger,
             corpus_ledger_sha256=options.corpus_ledger_sha256,
+            corpus_ledger_verification_receipt_sha256=(
+                options.corpus_ledger_verification_receipt_sha256
+            ),
         )
         result = {
             "artifactSha256": digest,

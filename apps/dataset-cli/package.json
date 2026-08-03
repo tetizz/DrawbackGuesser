@@ -13,7 +13,7 @@
     "typecheck": "pnpm --filter @drawbackguesser/trace-to-dataset build && tsc -p tsconfig.build.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "prestart": "pnpm --workspace-root engine:build",
     "start": "pnpm --filter @drawbackguesser/trace-to-dataset build && tsx src/cli.ts",
-    "start:ledger": "pnpm --filter @drawbackguesser/trace-to-dataset build && tsx src/schema9-ledger-cli.ts"
+    "start:ledger": "pnpm run build && node dist/schema9-ledger-cli.js"
   },
   "dependencies": {
     "@drawbackengine/simulation-trace": "workspace:*",
