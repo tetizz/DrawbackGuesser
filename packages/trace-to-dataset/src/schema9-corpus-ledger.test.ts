@@ -44,6 +44,7 @@ import {
   schema9CorpusLedgerFileSha256,
   SCHEMA9_LEDGER_SPLITS,
   SCHEMA9_EXECUTION_MANIFEST_ALGORITHM,
+  SCHEMA9_GENERATION_CONFIG,
   SCHEMA9_GENERATOR_COMPLETION_FORMAT,
   SCHEMA9_GENERATOR_LAUNCH_FORMAT,
   SCHEMA9_GENERATOR_RECEIPT_VERSION,
@@ -116,14 +117,15 @@ interface FixtureTrace {
   readonly seed: number;
   readonly gameIndex: number;
   readonly parameterSeeds: { readonly white: number; readonly black: number };
+  readonly plyLimit: number;
   readonly initialPosition: { readonly fen: string };
   readonly hypothesisPolicy: {
     readonly kind: "unrestricted-baseline";
     readonly version: 1;
   };
   readonly agents: {
-    readonly white: { readonly searchPolicy: { readonly policyId: string } };
-    readonly black: { readonly searchPolicy: { readonly policyId: string } };
+    readonly white: { readonly searchPolicy: FixtureSearchPolicy };
+    readonly black: { readonly searchPolicy: FixtureSearchPolicy };
   };
   readonly secrets: {
     readonly initial: {
@@ -133,6 +135,144 @@ interface FixtureTrace {
   };
   readonly plies: readonly { readonly ply: number }[];
 }
+
+interface FixtureSearchPolicy {
+  readonly policyId: string;
+  readonly evaluatorId: string;
+  readonly maxDepth: number;
+  readonly maxNodes: number;
+  readonly temperatureCp: number;
+  readonly topK: number;
+  readonly leafCacheEntries: number;
+  readonly leafCacheHistoryMode: string;
+  readonly opponentAggregation: string;
+}
+
+interface ReceiptMutationCase {
+  readonly name: string;
+  readonly expectedError: string;
+  readonly mutate: (receipt: Record<string, unknown>) => void;
+}
+
+interface GenerationConfigValueMutation {
+  readonly name: string;
+  readonly path: readonly string[];
+  readonly replacement: unknown;
+}
+
+const GENERATION_CONFIG_VALUE_MUTATIONS = Object.freeze([
+  { name: "maxPlies", path: ["maxPlies"], replacement: 121 },
+  { name: "maxDepth", path: ["maxDepth"], replacement: 3 },
+  { name: "maxNodes", path: ["maxNodes"], replacement: 49_999 },
+  { name: "temperatureCp", path: ["temperatureCp"], replacement: 36 },
+  { name: "topK", path: ["topK"], replacement: 9 },
+  {
+    name: "leafCacheEntries",
+    path: ["leafCacheEntries"],
+    replacement: 16_385,
+  },
+  {
+    name: "leafCacheHistoryMode",
+    path: ["leafCacheHistoryMode"],
+    replacement: "fen-only",
+  },
+  {
+    name: "opponentAggregation",
+    path: ["opponentAggregation"],
+    replacement: "average",
+  },
+  {
+    name: "evaluator.kind",
+    path: ["evaluator", "kind"],
+    replacement: "stockfish",
+  },
+  {
+    name: "evaluator.version",
+    path: ["evaluator", "version"],
+    replacement: 2,
+  },
+  {
+    name: "evaluator.evaluatorId",
+    path: ["evaluator", "evaluatorId"],
+    replacement: "alternate-material/v1",
+  },
+  {
+    name: "opponentHypotheses.kind",
+    path: ["opponentHypotheses", "kind"],
+    replacement: "catalog",
+  },
+  {
+    name: "opponentHypotheses.version",
+    path: ["opponentHypotheses", "version"],
+    replacement: 2,
+  },
+] satisfies readonly GenerationConfigValueMutation[]);
+
+const SEARCH_POLICY_VALUE_MUTATIONS = Object.freeze([
+  {
+    name: "policyId",
+    path: ["policyId"],
+    replacement: "alternate-policy/v1",
+  },
+  {
+    name: "evaluatorId",
+    path: ["evaluatorId"],
+    replacement: "alternate-material/v1",
+  },
+  { name: "maxDepth", path: ["maxDepth"], replacement: 3 },
+  { name: "maxNodes", path: ["maxNodes"], replacement: 49_999 },
+  {
+    name: "temperatureCp",
+    path: ["temperatureCp"],
+    replacement: 36,
+  },
+  { name: "topK", path: ["topK"], replacement: 9 },
+  {
+    name: "leafCacheEntries",
+    path: ["leafCacheEntries"],
+    replacement: 16_385,
+  },
+  {
+    name: "leafCacheHistoryMode",
+    path: ["leafCacheHistoryMode"],
+    replacement: "ignore",
+  },
+  {
+    name: "opponentAggregation",
+    path: ["opponentAggregation"],
+    replacement: "posterior-expected",
+  },
+] satisfies readonly GenerationConfigValueMutation[]);
+
+const SOURCE_TRACE_CONFIG_MUTATIONS = Object.freeze([
+  {
+    name: "plyLimit",
+    path: ["plyLimit"],
+    replacement: 119,
+  },
+  ...(["white", "black"] as const).flatMap((color) => [
+    ...SEARCH_POLICY_VALUE_MUTATIONS.map((mutation) => ({
+      name: `${color}.${mutation.name}`,
+      path: ["agents", color, "searchPolicy", ...mutation.path],
+      replacement: mutation.replacement,
+    })),
+    {
+      name: `${color}.missing-opponentAggregation`,
+      path: ["agents", color, "searchPolicy", "opponentAggregation"],
+      replacement: undefined,
+    },
+  ]),
+  {
+    name: "hypothesisPolicy.kind",
+    path: ["hypothesisPolicy", "kind"],
+    replacement: "audited-uniform",
+  },
+  {
+    name: "hypothesisPolicy.version",
+    path: ["hypothesisPolicy", "version"],
+    replacement: 2,
+  },
+] satisfies readonly GenerationConfigValueMutation[]);
 
 afterEach(async () => {
   await Promise.all(
@@ -161,6 +301,17 @@ async function splitFixture(): Promise<{
     join(tmpdir(), "drawback-guesser-schema9-split-"),
   );
   cleanupDirectories.push(root);
+  const searchPolicy: FixtureSearchPolicy = Object.freeze({
+    policyId: SCHEMA9_SCHEDULE_PROFILE.policyId,
+    evaluatorId: SCHEMA9_GENERATION_CONFIG.evaluator.evaluatorId,
+    maxDepth: SCHEMA9_GENERATION_CONFIG.maxDepth,
+    maxNodes: SCHEMA9_GENERATION_CONFIG.maxNodes,
+    temperatureCp: SCHEMA9_GENERATION_CONFIG.temperatureCp,
+    topK: SCHEMA9_GENERATION_CONFIG.topK,
+    leafCacheEntries: SCHEMA9_GENERATION_CONFIG.leafCacheEntries,
+    leafCacheHistoryMode: SCHEMA9_GENERATION_CONFIG.leafCacheHistoryMode,
+    opponentAggregation: SCHEMA9_GENERATION_CONFIG.opponentAggregation,
+  });
   const trace: FixtureTrace = Object.freeze({
     schemaVersion: 2,
     ruleset: Object.freeze({ version: 2 }),
@@ -168,6 +319,7 @@ async function splitFixture(): Promise<{
     seed: 3_145_926,
     gameIndex: 0,
     parameterSeeds: Object.freeze({ white: 101, black: 102 }),
+    plyLimit: SCHEMA9_GENERATION_CONFIG.maxPlies,
     initialPosition: Object.freeze({ fen: "fixture-fen" }),
     hypothesisPolicy: Object.freeze({
       kind: "unrestricted-baseline",
@@ -175,14 +327,10 @@ async function splitFixture(): Promise<{
     }),
     agents: Object.freeze({
       white: Object.freeze({
-        searchPolicy: Object.freeze({
-          policyId: SCHEMA9_SCHEDULE_PROFILE.policyId,
-        }),
+        searchPolicy,
       }),
       black: Object.freeze({
-        searchPolicy: Object.freeze({
-          policyId: SCHEMA9_SCHEDULE_PROFILE.policyId,
-        }),
+        searchPolicy,
       }),
     }),
     secrets: Object.freeze({
@@ -220,6 +368,7 @@ async function splitFixture(): Promise<{
     splitCounts: { train: 1, validation: 0, test: 0 },
     seedRoots: SCHEMA9_SPLIT_SEED_ROOTS.train,
     scheduleProfile: SCHEMA9_SCHEDULE_PROFILE,
+    generationConfig: SCHEMA9_GENERATION_CONFIG,
     producerEngineCommit: CONVERTER_ENGINE_COMMIT,
   })}\n`, "utf8");
   await writeFile(launchReceiptPath, launchPayload);
@@ -259,6 +408,163 @@ async function splitFixture(): Promise<{
     }),
   };
 }
+
+function mutableFixtureObject(
+  value: unknown,
+  label: string,
+): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError(`${label} fixture must be an object.`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function generationConfigOf(
+  receipt: Record<string, unknown>,
+): Record<string, unknown> {
+  return mutableFixtureObject(
+    receipt["generationConfig"],
+    "generationConfig",
+  );
+}
+
+function setFixturePath(
+  root: Record<string, unknown>,
+  path: readonly string[],
+  replacement: unknown,
+): void {
+  if (path.length === 0) {
+    throw new TypeError("Fixture mutation path must not be empty.");
+  }
+  let parent = root;
+  for (const key of path.slice(0, -1)) {
+    parent = mutableFixtureObject(parent[key], key);
+  }
+  const leaf = path.at(-1);
+  if (leaf === undefined) {
+    throw new TypeError("Fixture mutation path must contain a leaf.");
+  }
+  parent[leaf] = replacement;
+}
+
+async function mutateLaunchReceipt(
+  files: Schema9SplitFiles,
+  mutate: (receipt: Record<string, unknown>) => void,
+): Promise<void> {
+  const receipt = mutableFixtureObject(
+    JSON.parse(await readFile(files.launchReceiptPath, "utf8")) as unknown,
+    "launch receipt",
+  );
+  mutate(receipt);
+  await writeFile(
+    files.launchReceiptPath,
+    `${JSON.stringify(receipt)}\n`,
+    "utf8",
+  );
+}
+
+async function mutateSourceTrace(
+  files: Schema9SplitFiles,
+  mutate: (trace: Record<string, unknown>) => void,
+): Promise<void> {
+  const trace = mutableFixtureObject(
+    JSON.parse(await readFile(files.tracePath, "utf8")) as unknown,
+    "source trace",
+  );
+  mutate(trace);
+  await writeFile(files.tracePath, `${JSON.stringify(trace)}\n`, "utf8");
+}
+
+const GENERATION_CONFIG_FIELD_MUTATIONS = Object.freeze([
+  {
+    name: "legacy receipt version",
+    expectedError: "launch receipt identity is inconsistent",
+    mutate: (receipt) => {
+      receipt["version"] = 1;
+    },
+  },
+  {
+    name: "missing generationConfig",
+    expectedError: "launch receipt has invalid fields",
+    mutate: (receipt) => {
+      delete receipt["generationConfig"];
+    },
+  },
+  {
+    name: "extra launch field",
+    expectedError: "launch receipt has invalid fields",
+    mutate: (receipt) => {
+      receipt["unexpectedConfig"] = true;
+    },
+  },
+  {
+    name: "non-object generationConfig",
+    expectedError: "launch generation config must be an object",
+    mutate: (receipt) => {
+      receipt["generationConfig"] = null;
+    },
+  },
+  {
+    name: "missing generationConfig field",
+    expectedError: "launch generation config has invalid fields",
+    mutate: (receipt) => {
+      delete generationConfigOf(receipt)["maxPlies"];
+    },
+  },
+  {
+    name: "extra generationConfig field",
+    expectedError: "launch generation config has invalid fields",
+    mutate: (receipt) => {
+      generationConfigOf(receipt)["unexpected"] = true;
+    },
+  },
+  {
+    name: "missing evaluator field",
+    expectedError: "launch generation evaluator has invalid fields",
+    mutate: (receipt) => {
+      const evaluator = mutableFixtureObject(
+        generationConfigOf(receipt)["evaluator"],
+        "evaluator",
+      );
+      delete evaluator["evaluatorId"];
+    },
+  },
+  {
+    name: "extra evaluator field",
+    expectedError: "launch generation evaluator has invalid fields",
+    mutate: (receipt) => {
+      const evaluator = mutableFixtureObject(
+        generationConfigOf(receipt)["evaluator"],
+        "evaluator",
+      );
+      evaluator["unexpected"] = true;
+    },
+  },
+  {
+    name: "missing opponentHypotheses field",
+    expectedError:
+      "launch generation opponent hypotheses has invalid fields",
+    mutate: (receipt) => {
+      const hypotheses = mutableFixtureObject(
+        generationConfigOf(receipt)["opponentHypotheses"],
+        "opponentHypotheses",
+      );
+      delete hypotheses["version"];
+    },
+  },
+  {
+    name: "extra opponentHypotheses field",
+    expectedError:
+      "launch generation opponent hypotheses has invalid fields",
+    mutate: (receipt) => {
+      const hypotheses = mutableFixtureObject(
+        generationConfigOf(receipt)["opponentHypotheses"],
+        "opponentHypotheses",
+      );
+      hypotheses["unexpected"] = true;
+    },
+  },
+] satisfies readonly ReceiptMutationCase[]);
 
 function fixtureScheduler(trace: FixtureTrace): Schema9AssignmentScheduler {
   return Object.freeze({
@@ -455,6 +761,101 @@ function metadataOptions(
 }
 
 describe("schema-9 corpus ledger", () => {
+  it("freezes the public generator receipt v2 configuration", () => {
+    expect(SCHEMA9_GENERATOR_RECEIPT_VERSION).toBe(2);
+    expect(SCHEMA9_GENERATION_CONFIG).toStrictEqual({
+      maxPlies: 120,
+      maxDepth: 2,
+      maxNodes: 50_000,
+      temperatureCp: 35,
+      topK: 8,
+      leafCacheEntries: 16_384,
+      leafCacheHistoryMode: "full",
+      opponentAggregation: "worst-case",
+      evaluator: {
+        kind: "material",
+        version: 1,
+        evaluatorId: "drawback-material/v1",
+      },
+      opponentHypotheses: {
+        kind: "unrestricted-baseline",
+        version: 1,
+      },
+    });
+  });
+
+  it.each(GENERATION_CONFIG_VALUE_MUTATIONS)(
+    "rejects generationConfig value mutation: $name",
+    async ({ path, replacement }) => {
+      const fixture = await splitFixture();
+      await mutateLaunchReceipt(fixture.files, (receipt) => {
+        setFixturePath(generationConfigOf(receipt), path, replacement);
+      });
+      await expect(authenticateSchema9SplitWithRuleContract(
+        "train",
+        fixture.files,
+        ["vegan"],
+        fixtureScheduler(fixture.trace),
+      )).rejects.toThrow(
+        "launch receipt generation config is unsupported",
+      );
+    },
+  );
+
+  it.each(GENERATION_CONFIG_FIELD_MUTATIONS)(
+    "rejects receipt field drift: $name",
+    async ({ expectedError, mutate }) => {
+      const fixture = await splitFixture();
+      await mutateLaunchReceipt(fixture.files, mutate);
+      await expect(authenticateSchema9SplitWithRuleContract(
+        "train",
+        fixture.files,
+        ["vegan"],
+        fixtureScheduler(fixture.trace),
+      )).rejects.toThrow(expectedError);
+    },
+  );
+
+  it.each(SOURCE_TRACE_CONFIG_MUTATIONS)(
+    "rejects realized source config mutation: $name",
+    async ({ path, replacement }) => {
+      const fixture = await splitFixture();
+      await mutateSourceTrace(fixture.files, (trace) => {
+        setFixturePath(trace, path, replacement);
+      });
+      await expect(authenticateSchema9SplitWithRuleContract(
+        "train",
+        fixture.files,
+        ["vegan"],
+        fixtureScheduler(fixture.trace),
+      )).rejects.toThrow(
+        "source trace differs from the authenticated generation config",
+      );
+    },
+  );
+
+  it("rejects a version-1 completion receipt", async () => {
+    const fixture = await splitFixture();
+    const completion = mutableFixtureObject(
+      JSON.parse(
+        await readFile(fixture.files.completionReceiptPath, "utf8"),
+      ) as unknown,
+      "completion receipt",
+    );
+    completion["version"] = 1;
+    await writeFile(
+      fixture.files.completionReceiptPath,
+      `${JSON.stringify(completion)}\n`,
+      "utf8",
+    );
+    await expect(authenticateSchema9SplitWithRuleContract(
+      "train",
+      fixture.files,
+      ["vegan"],
+      fixtureScheduler(fixture.trace),
+    )).rejects.toThrow("completion receipt identity is inconsistent");
+  });
+
   it("authenticates exact converter bytes and rejects file or receipt tampering", async () => {
     const fixture = await splitFixture();
     const authenticated = await authenticateSchema9SplitWithRuleContract(

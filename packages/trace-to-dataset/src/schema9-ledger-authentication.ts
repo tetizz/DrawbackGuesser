@@ -30,6 +30,7 @@ import {
   checkedSha256,
   parseJsonWithoutDuplicateKeys,
   SCHEMA9_GENERATOR_COMPLETION_FORMAT,
+  SCHEMA9_GENERATION_CONFIG,
   SCHEMA9_GENERATOR_LAUNCH_FORMAT,
   SCHEMA9_GENERATOR_RECEIPT_VERSION,
   SCHEMA9_SCHEDULE_PROFILE,
@@ -240,6 +241,46 @@ function receiptInteger(
   return value;
 }
 
+function validateGenerationConfig(
+  value: unknown,
+  split: Schema9LedgerSplit,
+): void {
+  const config = receiptObject(
+    value,
+    `${split} launch generation config`,
+  );
+  exactReceiptKeys(
+    config,
+    Object.keys(SCHEMA9_GENERATION_CONFIG),
+    `${split} launch generation config`,
+  );
+  const evaluator = receiptObject(
+    config["evaluator"],
+    `${split} launch generation evaluator`,
+  );
+  exactReceiptKeys(
+    evaluator,
+    Object.keys(SCHEMA9_GENERATION_CONFIG.evaluator),
+    `${split} launch generation evaluator`,
+  );
+  const opponentHypotheses = receiptObject(
+    config["opponentHypotheses"],
+    `${split} launch generation opponent hypotheses`,
+  );
+  exactReceiptKeys(
+    opponentHypotheses,
+    Object.keys(SCHEMA9_GENERATION_CONFIG.opponentHypotheses),
+    `${split} launch generation opponent hypotheses`,
+  );
+  if (!canonicalJsonBytes(config).equals(
+    canonicalJsonBytes(SCHEMA9_GENERATION_CONFIG),
+  )) {
+    throw new TypeError(
+      `${split} launch receipt generation config is unsupported.`,
+    );
+  }
+}
+
 function validateLaunchReceipt(
   receipt: AuthenticatedReceipt,
   split: Schema9LedgerSplit,
@@ -258,6 +299,7 @@ function validateLaunchReceipt(
     "splitCounts",
     "seedRoots",
     "scheduleProfile",
+    "generationConfig",
     "producerEngineCommit",
   ], `${split} launch receipt`);
   if (
@@ -291,6 +333,7 @@ function validateLaunchReceipt(
   ) {
     throw new TypeError(`${split} launch receipt profile is unsupported.`);
   }
+  validateGenerationConfig(value["generationConfig"], split);
   const counts = receiptObject(
     value["splitCounts"],
     `${split} launch split counts`,
@@ -479,6 +522,59 @@ function checkedSourceRuleId(
   return value;
 }
 
+function sourceSearchPolicyMatchesGenerationConfig(
+  policy: PlayerPrivateSimulationTraceRecord["agents"]["white"]["searchPolicy"],
+): boolean {
+  return policy.policyId === SCHEMA9_SCHEDULE_PROFILE.policyId
+    && policy.evaluatorId === SCHEMA9_GENERATION_CONFIG.evaluator.evaluatorId
+    && policy.maxDepth === SCHEMA9_GENERATION_CONFIG.maxDepth
+    && policy.maxNodes === SCHEMA9_GENERATION_CONFIG.maxNodes
+    && policy.temperatureCp === SCHEMA9_GENERATION_CONFIG.temperatureCp
+    && policy.topK === SCHEMA9_GENERATION_CONFIG.topK
+    && policy.leafCacheEntries === SCHEMA9_GENERATION_CONFIG.leafCacheEntries
+    && policy.leafCacheHistoryMode
+      === SCHEMA9_GENERATION_CONFIG.leafCacheHistoryMode
+    && policy.opponentAggregation
+      === SCHEMA9_GENERATION_CONFIG.opponentAggregation;
+}
+
+function sourceHypothesisPolicyMatchesGenerationConfig(
+  policy: unknown,
+): boolean {
+  if (typeof policy !== "object" || policy === null || Array.isArray(policy)) {
+    return false;
+  }
+  const value = policy as Readonly<Record<string, unknown>>;
+  const keys = Object.keys(value).sort();
+  return keys.length === 2
+    && keys[0] === "kind"
+    && keys[1] === "version"
+    && value["kind"] === SCHEMA9_GENERATION_CONFIG.opponentHypotheses.kind
+    && value["version"]
+      === SCHEMA9_GENERATION_CONFIG.opponentHypotheses.version;
+}
+
+function assertSourceGenerationConfig(
+  trace: PlayerPrivateSimulationTraceRecord,
+): void {
+  if (
+    trace.plyLimit !== SCHEMA9_GENERATION_CONFIG.maxPlies
+    || !sourceSearchPolicyMatchesGenerationConfig(
+      trace.agents.white.searchPolicy,
+    )
+    || !sourceSearchPolicyMatchesGenerationConfig(
+      trace.agents.black.searchPolicy,
+    )
+    || !sourceHypothesisPolicyMatchesGenerationConfig(
+      trace.hypothesisPolicy,
+    )
+  ) {
+    throw new TypeError(
+      "Schema-9 source trace differs from the authenticated generation config.",
+    );
+  }
+}
+
 function sourceGame(
   trace: PlayerPrivateSimulationTraceRecord,
   expectedRuleIds: ReadonlySet<string>,
@@ -488,15 +584,7 @@ function sourceGame(
       "Schema-9 corpus source traces must use player-private schema 2.",
     );
   }
-  if (
-    trace.agents.white.searchPolicy.policyId
-      !== trace.agents.black.searchPolicy.policyId
-    || trace.hypothesisPolicy.kind !== "unrestricted-baseline"
-  ) {
-    throw new TypeError(
-      "Schema-9 source traces must use the frozen standard profile.",
-    );
-  }
+  assertSourceGenerationConfig(trace);
   return Object.freeze({
     gameId: trace.gameId,
     seed: trace.seed,

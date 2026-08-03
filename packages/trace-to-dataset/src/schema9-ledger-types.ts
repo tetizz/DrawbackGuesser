@@ -7,7 +7,26 @@ export const SCHEMA9_GENERATOR_LAUNCH_FORMAT =
   "drawbackengine-player-private-schedule-launch" as const;
 export const SCHEMA9_GENERATOR_COMPLETION_FORMAT =
   "drawbackengine-player-private-schedule-completion" as const;
-export const SCHEMA9_GENERATOR_RECEIPT_VERSION = 1 as const;
+export const SCHEMA9_GENERATOR_RECEIPT_VERSION = 2 as const;
+export const SCHEMA9_GENERATION_CONFIG = Object.freeze({
+  maxPlies: 120,
+  maxDepth: 2,
+  maxNodes: 50_000,
+  temperatureCp: 35,
+  topK: 8,
+  leafCacheEntries: 16_384,
+  leafCacheHistoryMode: "full",
+  opponentAggregation: "worst-case",
+  evaluator: Object.freeze({
+    kind: "material",
+    version: 1,
+    evaluatorId: "drawback-material/v1",
+  } as const),
+  opponentHypotheses: Object.freeze({
+    kind: "unrestricted-baseline",
+    version: 1,
+  } as const),
+} as const);
 export const SCHEMA9_SCHEDULE_PROFILE = Object.freeze({
   id: "standard",
   policyId: "material-player-private-corpus/v1",
@@ -51,6 +70,7 @@ export const SCHEMA9_SPLIT_SEED_ROOTS = Object.freeze({
 });
 
 export type Schema9LedgerSplit = (typeof SCHEMA9_LEDGER_SPLITS)[number];
+export type Schema9GenerationConfig = typeof SCHEMA9_GENERATION_CONFIG;
 export type Schema9ProducerConverterPolicy =
   (typeof SCHEMA9_PRODUCER_CONVERTER_POLICIES)[number];
 export type Schema9SeedRoots = readonly [number, number, number];

@@ -21,6 +21,7 @@ import {
   authenticateSchema9SplitWithRuleContract,
 } from "./schema9-ledger-authentication.js";
 import {
+  SCHEMA9_GENERATION_CONFIG,
   SCHEMA9_GENERATOR_COMPLETION_FORMAT,
   SCHEMA9_GENERATOR_LAUNCH_FORMAT,
   SCHEMA9_GENERATOR_RECEIPT_VERSION,
@@ -31,6 +32,17 @@ import {
 import { schema9AssignmentScheduler } from "./schema9-schedule-replay.js";
 
 const ENGINE_COMMIT = "b".repeat(40);
+const GENERATION_SEARCH_POLICY = Object.freeze({
+  policyId: SCHEMA9_SCHEDULE_PROFILE.policyId,
+  evaluatorId: SCHEMA9_GENERATION_CONFIG.evaluator.evaluatorId,
+  maxDepth: SCHEMA9_GENERATION_CONFIG.maxDepth,
+  maxNodes: SCHEMA9_GENERATION_CONFIG.maxNodes,
+  temperatureCp: SCHEMA9_GENERATION_CONFIG.temperatureCp,
+  topK: SCHEMA9_GENERATION_CONFIG.topK,
+  leafCacheEntries: SCHEMA9_GENERATION_CONFIG.leafCacheEntries,
+  leafCacheHistoryMode: SCHEMA9_GENERATION_CONFIG.leafCacheHistoryMode,
+  opponentAggregation: SCHEMA9_GENERATION_CONFIG.opponentAggregation,
+});
 const cleanup: string[] = [];
 
 afterEach(async () => {
@@ -55,8 +67,8 @@ describe("schema-9 real parser/converter integration", () => {
         seed: assignment.seed,
         gameIndex: assignment.gameIndex,
         parameterSeeds: assignment.parameterSeeds,
-        policyId: SCHEMA9_SCHEDULE_PROFILE.policyId,
-        autoLegalPlies: 1,
+        searchPolicy: GENERATION_SEARCH_POLICY,
+        autoLegalUntilPlyLimit: SCHEMA9_GENERATION_CONFIG.maxPlies,
       })
     );
     const tracePayload = Buffer.from(
@@ -86,6 +98,7 @@ describe("schema-9 real parser/converter integration", () => {
       splitCounts: { train: traces.length, validation: 0, test: 0 },
       seedRoots: SCHEMA9_SPLIT_SEED_ROOTS.train,
       scheduleProfile: SCHEMA9_SCHEDULE_PROFILE,
+      generationConfig: SCHEMA9_GENERATION_CONFIG,
       producerEngineCommit: ENGINE_COMMIT,
     })}\n`, "utf8");
     await writeFile(launchReceiptPath, launchPayload);
@@ -127,5 +140,5 @@ describe("schema-9 real parser/converter integration", () => {
       zeroPlyGames: 0,
     });
     expect(authenticated.ledger.converted.games).toBe(25);
-  }, 60_000);
+  }, 120_000);
 });

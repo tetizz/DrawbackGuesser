@@ -69,13 +69,47 @@ The four source game-ID sets must be pairwise disjoint. Simulation and
 parameter seed values must be globally unique across every stream and split.
 
 Launch receipts use
-`drawbackengine-player-private-schedule-launch` version 1 and bind the schedule
+`drawbackengine-player-private-schedule-launch` version 2 and bind the schedule
 authority, ledger split, isolated Engine split counts, roots, profile, schedule
-ID, and producer commit. Completion receipts use
-`drawbackengine-player-private-schedule-completion` version 1 and bind the
+ID, producer commit, and exact `generationConfig`. The generation configuration
+is recursively exact-key checked and must equal:
+
+```json
+{
+  "maxPlies": 120,
+  "maxDepth": 2,
+  "maxNodes": 50000,
+  "temperatureCp": 35,
+  "topK": 8,
+  "leafCacheEntries": 16384,
+  "leafCacheHistoryMode": "full",
+  "opponentAggregation": "worst-case",
+  "evaluator": {
+    "kind": "material",
+    "version": 1,
+    "evaluatorId": "drawback-material/v1"
+  },
+  "opponentHypotheses": {
+    "kind": "unrestricted-baseline",
+    "version": 1
+  }
+}
+```
+
+Completion receipts use
+`drawbackengine-player-private-schedule-completion` version 2 and bind the
 launch digest, completed state, producer, and exact trace digest, bytes, game
-count, and index bounds. Unknown fields, unsafe integers, negative zero,
-overflowing numbers, and non-object receipt roots are rejected.
+count, and index bounds. Version-1 receipts, unknown fields, missing fields,
+mutated generation values, unsafe integers, negative zero, overflowing numbers,
+and non-object receipt roots are rejected.
+
+The declaration is also bound to realized source semantics for every game.
+Each schema-2 trace must use `plyLimit: 120`; both White and Black search
+policies must independently match the frozen profile ID, evaluator ID, depth,
+node budget, temperature, top-K, cache size, cache-history mode, and worst-case
+opponent aggregation. The trace hypothesis policy must contain exactly
+`{"kind":"unrestricted-baseline","version":1}`. Any mismatch rejects the
+split before its trace or converted identities can enter the ledger.
 
 ## Converter and repository binding
 

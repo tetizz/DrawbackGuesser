@@ -25,6 +25,8 @@ export interface PlayerPrivateTraceFixtureOptions {
   readonly seed?: number;
   readonly gameIndex?: number;
   readonly policyId?: string;
+  readonly searchPolicy?:
+    PlayerPrivateSimulationTraceRecord["agents"]["white"]["searchPolicy"];
   readonly parameterSeeds?: {
     readonly white: number;
     readonly black: number;
@@ -32,6 +34,7 @@ export interface PlayerPrivateTraceFixtureOptions {
   readonly initialFen?: string;
   readonly moves?: readonly string[];
   readonly autoLegalPlies?: number;
+  readonly autoLegalUntilPlyLimit?: number;
 }
 
 const AGENT = Object.freeze({
@@ -61,26 +64,46 @@ export function playerPrivateTraceFixture(
     white: 0x1111_1111,
     black: 0x2222_2222,
   };
-  if (options.moves !== undefined && options.autoLegalPlies !== undefined) {
-    throw new TypeError("Fixture moves and autoLegalPlies are mutually exclusive.");
+  const moveModes = [
+    options.moves,
+    options.autoLegalPlies,
+    options.autoLegalUntilPlyLimit,
+  ].filter((value) => value !== undefined).length;
+  if (moveModes > 1) {
+    throw new TypeError(
+      "Fixture moves, autoLegalPlies, and autoLegalUntilPlyLimit are mutually exclusive.",
+    );
+  }
+  if (options.policyId !== undefined && options.searchPolicy !== undefined) {
+    throw new TypeError(
+      "Fixture policyId and searchPolicy are mutually exclusive.",
+    );
   }
   const moves = options.moves ?? (
-    options.autoLegalPlies === undefined ? ["e2e4", "e7e5"] : []
+    options.autoLegalPlies === undefined
+      && options.autoLegalUntilPlyLimit === undefined
+      ? ["e2e4", "e7e5"]
+      : []
   );
-  const plyLimit = options.autoLegalPlies ?? Math.max(1, moves.length);
+  const plyLimit = options.autoLegalUntilPlyLimit
+    ?? options.autoLegalPlies
+    ?? Math.max(1, moves.length);
   if (!Number.isSafeInteger(plyLimit) || plyLimit <= 0) {
     throw new RangeError("Fixture ply limit must be a positive safe integer.");
   }
   const gameIndex = options.gameIndex ?? 0;
-  const agent = options.policyId === undefined
-    ? AGENT
-    : Object.freeze({
-        ...AGENT,
-        searchPolicy: Object.freeze({
+  const searchPolicy = options.searchPolicy ?? (
+    options.policyId === undefined
+      ? AGENT.searchPolicy
+      : Object.freeze({
           ...AGENT.searchPolicy,
           policyId: options.policyId,
-        }),
-      });
+        })
+  );
+  const agent = Object.freeze({
+    ...AGENT,
+    searchPolicy: Object.freeze({ ...searchPolicy }),
+  });
   const session = DrawbackGameSession.create(
     {
       white: resolveAuditedCapturableKingRule(whiteRuleId),
@@ -94,7 +117,14 @@ export function playerPrivateTraceFixture(
   );
   const initialPosition = session.publicPositionSnapshot();
   const initialSecrets = session.exportSecretSnapshot();
-  const plies = Array.from({ length: plyLimit }, (_, ply) => {
+  const plies: Array<Record<string, unknown>> = [];
+  for (let ply = 0; ply < plyLimit; ply += 1) {
+    if (
+      options.autoLegalUntilPlyLimit !== undefined
+      && session.result.kind !== "active"
+    ) {
+      break;
+    }
     const positionBefore = session.publicPositionSnapshot();
     const color = session.turn;
     const authorityLegalMoves =
@@ -114,7 +144,7 @@ export function playerPrivateTraceFixture(
     if (!outcome.ok) {
       throw new Error(`Fixture move ${uci} was rejected: ${outcome.reason}.`);
     }
-    return {
+    plies.push({
       ply,
       color,
       positionBefore,
@@ -132,8 +162,8 @@ export function playerPrivateTraceFixture(
         hiddenParameters: activeSecret.parameters,
         drawbackInternalState: activeSecret.state,
       },
-    };
-  });
+    });
+  }
   const finalSecrets = session.exportSecretSnapshot();
   return parsePlayerPrivateSimulationTraceRecord({
     format: PLAYER_PRIVATE_SIMULATION_TRACE_FORMAT,
