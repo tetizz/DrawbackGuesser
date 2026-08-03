@@ -37,6 +37,27 @@ class ReleaseWorkflowError(ValueError):
     pass
 
 
+class _SelectionWaveCancelled(ReleaseWorkflowError):
+    pass
+
+
+class _SelectionWave:
+    def __init__(self) -> None:
+        self.stop = threading.Event()
+        self._failure_lock = threading.Lock()
+        self._primary_failure: BaseException | None = None
+
+    def record_failure(self, error: BaseException) -> None:
+        with self._failure_lock:
+            if self._primary_failure is None:
+                self._primary_failure = error
+        self.stop.set()
+
+    def primary_failure(self) -> BaseException | None:
+        with self._failure_lock:
+            return self._primary_failure
+
+
 @dataclass(frozen=True)
 class Step:
     stage: str
@@ -751,11 +772,12 @@ def run(
             ],
             tuple[int, int],
         ] = {}
-        stop = threading.Event()
+        wave = _SelectionWave()
         executor = ThreadPoolExecutor(
             max_workers=SELECTION_EVALUATION_WORKERS,
             thread_name_prefix="selection-evaluation",
         )
+        failure_from_future = False
         try:
             for step in selection_steps:
                 assert step.seed is not None
@@ -766,16 +788,31 @@ def run(
                     workflow,
                     root,
                     environment,
-                    stop,
+                    wave,
                 )
                 futures[future] = (step.seed, step.epoch)
             for future in as_completed(futures):
-                parallel_selection[futures[future]] = future.result()
-        except BaseException:
-            stop.set()
+                try:
+                    result = future.result()
+                except BaseException as error:
+                    failure_from_future = (
+                        not future.cancelled()
+                        and future.exception() is error
+                    )
+                    raise
+                parallel_selection[futures[future]] = result
+        except BaseException as error:
+            wave.stop.set()
             for future in futures:
                 future.cancel()
             executor.shutdown(wait=True, cancel_futures=True)
+            primary_failure = wave.primary_failure()
+            if (
+                failure_from_future
+                and primary_failure is not None
+                and primary_failure is not error
+            ):
+                raise primary_failure
             raise
         else:
             executor.shutdown(wait=True)
@@ -855,10 +892,10 @@ def _execute_selection_step(
     workflow: Mapping[str, object],
     root: Path,
     environment: Mapping[str, str],
-    stop: threading.Event,
+    wave: _SelectionWave,
 ) -> tuple[tuple[str, ...], dict[Path, str], list[dict[str, str]]]:
-    if stop.is_set():
-        raise ReleaseWorkflowError(
+    if wave.stop.is_set():
+        raise _SelectionWaveCancelled(
             "selection evaluation wave was cancelled"
         )
     try:
@@ -868,8 +905,8 @@ def _execute_selection_step(
             root,
             environment,
         )
-    except BaseException:
-        stop.set()
+    except BaseException as error:
+        wave.record_failure(error)
         raise
 
 

@@ -15,6 +15,7 @@ from unittest.mock import patch
 from ml.evaluation.release_workflow import (
     FORMAT,
     ReleaseWorkflowError,
+    _SelectionWave,
     build_plan,
     _confined,
     _closed_environment,
@@ -427,6 +428,17 @@ class ReleaseWorkflowTests(unittest.TestCase):
                     ],
                 )
 
+            def cancellation_first(futures):
+                pending = tuple(futures)
+                while not all(future.done() for future in pending):
+                    time.sleep(0.001)
+                return iter(sorted(
+                    pending,
+                    key=lambda future: not isinstance(
+                        future.exception(), ReleaseWorkflowError
+                    ),
+                ))
+
             external = {
                 name: Path(value["path"]).resolve()
                 for name, value in workflow["tools"].items()
@@ -464,6 +476,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
                     "ml.evaluation.release_workflow._execute_step",
                     side_effect=execute_step,
                 ),
+                patch(
+                    "ml.evaluation.release_workflow.as_completed",
+                    side_effect=cancellation_first,
+                ),
             ):
                 with self.assertRaisesRegex(
                     RuntimeError,
@@ -485,6 +501,143 @@ class ReleaseWorkflowTests(unittest.TestCase):
                     (20260811, 4),
                 },
             )
+
+    def test_first_worker_failure_outranks_a_second_real_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "release").mkdir()
+            workflow_path = root / "workflow.json"
+            digest = _write(workflow_path, _workflow())
+            workflow, _ = load_workflow(workflow_path)
+            primary_recorded = threading.Event()
+            original_record_failure = _SelectionWave.record_failure
+
+            def record_failure(wave, error):
+                original_record_failure(wave, error)
+                if str(error) == "primary plan failure":
+                    primary_recorded.set()
+
+            def execute_step(step, *_args):
+                if (
+                    step.stage == "selection-fit-evaluation"
+                    and step.seed == 20260811
+                    and step.epoch == 1
+                ):
+                    raise RuntimeError("primary plan failure")
+                if (
+                    step.stage == "selection-fit-evaluation"
+                    and step.seed == 20260811
+                    and step.epoch == 2
+                ):
+                    if not primary_recorded.wait(timeout=1):
+                        raise AssertionError("primary failure was not recorded")
+                    raise RuntimeError("second plan failure")
+                time.sleep(0.05)
+                return (
+                    step.argv,
+                    {},
+                    [
+                        {
+                            "path": path.as_posix(),
+                            "sha256": "1" * 64,
+                        }
+                        for path in step.outputs
+                    ],
+                )
+
+            def second_failure_first(futures):
+                pending = tuple(futures)
+                while not all(future.done() for future in pending):
+                    time.sleep(0.001)
+                return iter(sorted(
+                    pending,
+                    key=lambda future: str(future.exception())
+                    != "second plan failure",
+                ))
+
+            def interrupt_after_primary(_futures):
+                if not primary_recorded.wait(timeout=1):
+                    raise AssertionError("primary failure was not recorded")
+                raise KeyboardInterrupt("main-thread interruption")
+
+            external = {
+                name: Path(value["path"]).resolve()
+                for name, value in workflow["tools"].items()
+            }
+
+            def process(args, **_kwargs):
+                if args[1:3] == ["rev-parse", "HEAD"]:
+                    return SimpleNamespace(
+                        stdout=workflow["sourceRevision"] + "\n"
+                    )
+                return SimpleNamespace(stdout="")
+
+            with (
+                patch(
+                    "ml.evaluation.release_workflow._authenticate_external",
+                    side_effect=lambda reference, _label: reference.path.resolve(),
+                ),
+                patch(
+                    "ml.evaluation.release_workflow._closed_environment",
+                    return_value={"PATH": "closed"},
+                ),
+                patch(
+                    "ml.evaluation.release_workflow.shutil.which",
+                    side_effect=lambda name, **_kwargs: str(external[name]),
+                ),
+                patch(
+                    "ml.evaluation.release_workflow._input_references",
+                    return_value=(),
+                ),
+                patch(
+                    "ml.evaluation.release_workflow.subprocess.run",
+                    side_effect=process,
+                ),
+                patch(
+                    "ml.evaluation.release_workflow._SelectionWave.record_failure",
+                    autospec=True,
+                    side_effect=record_failure,
+                ),
+                patch(
+                    "ml.evaluation.release_workflow._execute_step",
+                    side_effect=execute_step,
+                ),
+            ):
+                with (
+                    patch(
+                        "ml.evaluation.release_workflow.as_completed",
+                        side_effect=second_failure_first,
+                    ),
+                    self.assertRaisesRegex(
+                        RuntimeError,
+                        "primary plan failure",
+                    ),
+                ):
+                    run(
+                        workflow,
+                        digest,
+                        root,
+                        execute=True,
+                    )
+                primary_recorded.clear()
+                with (
+                    patch(
+                        "ml.evaluation.release_workflow.as_completed",
+                        side_effect=interrupt_after_primary,
+                    ),
+                    self.assertRaisesRegex(
+                        KeyboardInterrupt,
+                        "main-thread interruption",
+                    ),
+                ):
+                    run(
+                        workflow,
+                        digest,
+                        root,
+                        execute=True,
+                    )
 
     def test_isolated_python_bootstrap_ignores_sitecustomize(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
