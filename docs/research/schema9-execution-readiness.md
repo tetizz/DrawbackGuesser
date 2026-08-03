@@ -1,11 +1,11 @@
 # Schema 9 execution readiness
 
-Status: **HOLD for corpus execution**. The deterministic scheduler, trace
-converter, corpus authenticator, and ledger verifier are executable and have
-focused test coverage. The public command path does not yet produce the two
-receipts that the authenticator requires for each split, so an authenticated
-schema 9 corpus cannot currently be created end to end without inventing an
-out-of-contract step.
+Status: **READY for an authenticated contract smoke; HOLD for accuracy-scale
+claims**. The Engine now publishes each frozen split as an atomic trace,
+launch-receipt, and completion-receipt bundle. The deterministic scheduler,
+trace converter, corpus authenticator, and ledger verifier consume that bundle
+without a hand-written provenance step. A 25-game-per-split run proves the
+boundary only; it is too small for a trustworthy model-accuracy claim.
 
 This document is derived from public source and tests. It deliberately does
 not depend on, inspect, or describe any pre-existing non-public artifact.
@@ -15,12 +15,13 @@ not depend on, inspect, or describe any pre-existing non-public artifact.
 The intended data path is:
 
 1. Pin a clean Guesser commit and its exact `engine` gitlink commit.
-2. For each ledger split, use the Engine player-private batch CLI to create a
-   canonical NDJSON simulation trace.
+2. For each ledger split, use the Engine Schema 9 bundle CLI to create a
+   canonical NDJSON simulation trace and both authenticated receipts.
 3. Convert each trace with the Guesser dataset CLI under
    `capturable-king/v1` authority and evaluator `none`.
-4. Supply the Engine launch and completion receipts that authenticate the
-   declared schedule and the exact trace bytes.
+4. Supply the Engine-owned launch and completion receipts that authenticate
+   the declared schedule, complete generation configuration, producer commit,
+   and exact trace bytes.
 5. Create the four-split ledger. Its verifier reconstructs the schedule,
    reparses every source game, reconverts every represented game, checks exact
    converted bytes, checks split disjointness, and reproduces the executing
@@ -28,8 +29,8 @@ The intended data path is:
 6. Preserve the ledger SHA-256 and the TypeScript verification-receipt SHA-256
    printed by the CLI as the public handoff to downstream training.
 
-Steps 1-3 and 5 are implemented. Step 4 has validators but no Engine-owned
-producer command, which blocks the complete path.
+All six steps have checked-in command paths. Corpus scale and downstream model
+claims remain separately gated by measured held-out runs.
 
 ## Authenticated inputs and outputs
 
@@ -54,12 +55,13 @@ Per-split values:
 - producer Engine commit.
 
 All sixteen artifact paths must be distinct across the four splits. Receipts
-are authenticated by raw byte identity, not only parsed values. The launch
-receipt must declare schema 2, ruleset 2, authority
+are authenticated by raw byte identity, not only parsed values. The version-2
+launch receipt must declare authority
 `capturable25-schema9-opportunity/v1`, Engine split `train`, a positive train
-count, and zero validation/test counts. The completion receipt must bind the
-launch receipt hash plus the exact output trace hash, byte count, game count,
-and contiguous index range.
+count, zero validation/test counts, and the exact frozen generation config.
+Every schema-2/ruleset-2 source trace must realize that config for both
+players. The completion receipt binds the launch receipt hash plus the exact
+output trace hash, byte count, game count, and contiguous index range.
 
 The public validators impose these per-file limits:
 
@@ -141,35 +143,47 @@ configuration, and a non-submodule Engine path.
 
 ### 2. Generate one split deterministically
 
-The Engine CLI positional contract after the split and three counts is:
-workers, three roots, output, maximum plies, coordinator window, search depth,
-search nodes, temperature, and profile. This helper supplies the current
-standard values exactly.
+The Engine owns the roots and complete generation configuration. The caller
+chooses only a ledger split, a complete 25-label game-cycle count, bounded
+worker concurrency, a shared path-free schedule ID, and an absent bundle path.
 
 ```powershell
+$scheduleId = 'schema9-smoke-v2'
+$seedRoots = @{
+  'train' = [uint32[]]@(1261462769, 242269024, 1837697911)
+  'validation-a' = [uint32[]]@(2069246597, 1391196133, 2739675947)
+  'validation-b' = [uint32[]]@(3786384219, 3547865132, 2689552677)
+  'test' = [uint32[]]@(2033321041, 1354035545, 4189758462)
+}
+
 function Invoke-Schema9Split {
   param(
     [Parameter(Mandatory)] [string] $Name,
     [Parameter(Mandatory)] [int] $Games,
-    [Parameter(Mandatory)] [uint32] $LabelRoot,
-    [Parameter(Mandatory)] [uint32] $GameplayRoot,
-    [Parameter(Mandatory)] [uint32] $ParameterRoot,
     [Parameter(Mandatory)] [int] $Workers
   )
 
   if ($Games -lt 25 -or ($Games % 25) -ne 0) {
     throw 'Games must be a positive multiple of 25.'
   }
-  if ($Workers -lt 1) { throw 'Workers must be positive.' }
+  if ($Workers -lt 1 -or $Workers -gt 256) {
+    throw 'Workers must be between 1 and 256.'
+  }
+  if (-not $seedRoots.ContainsKey($Name)) {
+    throw "Unknown Schema 9 split $Name."
+  }
 
-  $trace = Join-Path $runRoot "$Name.trace.ndjson"
+  $bundle = Join-Path $runRoot "$Name.bundle"
+  $trace = Join-Path $bundle 'trace.ndjson'
   $converted = Join-Path $runRoot "$Name.converted.ndjson"
-  $window = 4 * $Workers
 
-  pnpm --dir $engine --filter '@drawbackengine/cli' player-private:batch -- `
-    train $Games 0 0 $Workers `
-    $LabelRoot $GameplayRoot $ParameterRoot `
-    $trace 120 $window 2 50000 35 standard
+  pnpm --dir $engine --filter '@drawbackengine/cli' player-private:schema9 -- `
+    --ledger-split $Name `
+    --games $Games `
+    --workers $Workers `
+    --schedule-id $scheduleId `
+    --bundle $bundle `
+    --engine-repository $engine
   if ($LASTEXITCODE -ne 0) { throw "Simulation failed for $Name." }
 
   pnpm --filter '@drawbackguesser/dataset-cli' start -- `
@@ -179,44 +193,40 @@ function Invoke-Schema9Split {
     --require-evaluator none
   if ($LASTEXITCODE -ne 0) { throw "Conversion failed for $Name." }
 
+  $roots = $seedRoots[$Name]
   [pscustomobject]@{
     Name = $Name
     Games = $Games
     Trace = $trace
     Converted = $converted
-    LaunchReceipt = Join-Path $runRoot "$Name.launch-receipt.json"
-    CompletionReceipt = Join-Path $runRoot "$Name.completion-receipt.json"
-    LabelRoot = $LabelRoot
-    GameplayRoot = $GameplayRoot
-    ParameterRoot = $ParameterRoot
+    LaunchReceipt = Join-Path $bundle 'launch.json'
+    CompletionReceipt = Join-Path $bundle 'completion.json'
+    LabelRoot = $roots[0]
+    GameplayRoot = $roots[1]
+    ParameterRoot = $roots[2]
   }
 }
 
-$workers = [Math]::Max(1, [Environment]::ProcessorCount - 1)
-$train = Invoke-Schema9Split train 25 1261462769 242269024 1837697911 $workers
-$validationA = Invoke-Schema9Split validation-a 25 2069246597 1391196133 2739675947 $workers
-$validationB = Invoke-Schema9Split validation-b 25 3786384219 3547865132 2689552677 $workers
-$test = Invoke-Schema9Split test 25 2033321041 1354035545 4189758462 $workers
+$workers = [Math]::Min(256, [Math]::Max(1, [Environment]::ProcessorCount - 1))
+$train = Invoke-Schema9Split train 25 $workers
+$validationA = Invoke-Schema9Split validation-a 25 $workers
+$validationB = Invoke-Schema9Split validation-b 25 $workers
+$test = Invoke-Schema9Split test 25 $workers
 ```
 
 The four 25-game calls are the smallest contract-valid smoke corpus. Replace
 only the game counts for a larger run; do not change the roots or policy
-arguments.
+arguments. The producer requires an existing trusted parent directory, refuses
+output inside the Engine checkout, revalidates the same clean Engine commit
+before publication, hashes the closed trace again, and publishes the
+three-file bundle at one irreversible rename commit point.
 
-**Stop here today.** The paths returned for the launch and completion receipts
-are intentionally only destinations. There is no checked-in command that
-creates those receipts from the actual child-process lifecycle. Hand-writing
-them would defeat the provenance boundary and is not an acceptable workaround.
+### 3. Create and verify the ledger
 
-### 3. Create or verify the ledger after receipt production exists
-
-Once an Engine-owned receipt command exists, the following argument assembly
-matches every required CLI flag. It is included so the remaining boundary is
-precise; it is not runnable until all eight receipts have been produced by the
-trusted execution path.
+The following argument assembly matches every required CLI flag and consumes
+the Engine-owned receipts directly.
 
 ```powershell
-$scheduleId = 'material-player-private-corpus/v1'
 $splits = @($train, $validationA, $validationB, $test)
 $ledger = Join-Path $runRoot 'schema9-corpus-ledger.json'
 
@@ -311,46 +321,37 @@ a 625-game run because search positions and game lengths are not uniform.
 
 ## Release blockers
 
-1. **No trusted receipt producer.** Engine simulation writes the trace and a
-   stdout summary only. The required launch/completion receipt formats exist in
-   the Guesser authenticator, but no production command records the real child
-   process launch, exit, cancellation, output hash, byte count, and game range.
-2. **No actual CLI-to-ledger integration gate.** The focused schema 9
+1. **No permanent CLI-to-ledger integration gate.** The focused schema 9
    integration test builds traces from an in-memory fixture and constructs
    receipts in the test. It does not execute the Engine batch CLI, streaming
-   trace writer, conversion CLI, or a receipt-producing supervisor.
-3. **Simulation policy is under-authenticated.** Authentication checks the
-   shared policy ID and unrestricted-hypothesis kind, but it does not freeze or
-   compare maximum plies, search depth, node budget, temperature, top-K, cache
-   size, or the complete evaluator configuration. Two materially different
-   runs can currently present the same accepted policy ID.
-4. **Full train size is not frozen.** Validation/test represented counts are
+   trace writer, conversion CLI, or receipt-producing bundle command. The
+   release procedure must retain one measured external four-split smoke until
+   this becomes a bounded automated test.
+2. **Full train size is not frozen.** Validation/test represented counts are
    fixed at 2,500 each; train is only required to be a positive label-balanced
    multiple. There is no single reproducible definition of a “full” corpus or
    honest full-run duration/disk estimate yet.
-5. **Zero-ply top-up is unspecified.** Source counts and represented converted
+3. **Zero-ply top-up is unspecified.** Source counts and represented converted
    counts can diverge. The CLI has no deterministic continuation range or
    receipt-bound top-up workflow.
-6. **Offline verification has operational prerequisites.** Reproduction needs
+4. **Offline verification has operational prerequisites.** Reproduction needs
    the pinned pnpm runtime and all dependencies in the offline store, plus clean
    exact commits and the real Engine submodule checkout. Missing cached
    dependencies block verification even when the corpus bytes are correct.
 
 ## Required release gate
 
-The HOLD can be removed only after all of the following pass from a clean,
-pinned checkout:
+An accuracy-scale corpus remains on HOLD until all of the following pass from
+a clean, pinned checkout:
 
-- an Engine-owned supervisor creates both receipts around the real process,
-  including success, failure, cancellation, timeout, and cleanup behavior;
-- receipts authenticate the complete simulation/search policy, not just its ID;
-- one focused test executes a real 25-game Engine child process, converts its
-  trace, creates all receipts, creates the ledger, and verifies it in isolation;
+- the four-split 25-game Engine/convert/ledger smoke completes and its exact
+  commits, digests, throughput, memory, and byte measurements are retained;
+- a bounded regression executes the real producer-to-consumer path in CI;
 - tampering with any receipt, trace byte, converted byte, seed, schedule item,
   policy value, commit, or split membership fails closed;
 - interrupted execution leaves no accepted receipt or partial published file;
-- the 25-game-per-split smoke records machine-specific throughput, memory, and
-  byte measurements before a larger execution is authorized.
+- the train count and deterministic zero-ply continuation policy are frozen
+  before the larger validation/test execution is authorized.
 
 ## Current focused verification
 
@@ -365,9 +366,11 @@ pnpm exec vitest run `
   packages/trace-to-dataset/src/schema9-real-integration.test.ts
 ```
 
-At the audited commit, this passes 3 files and 20 tests. That result validates
-the ledger and replay contracts exercised by those tests; it must not be
-reported as proof of the missing real-child-process receipt path.
+At the receipt-v2 contract commit, the focused suite passes 3 files and 68
+tests, while the complete trace-to-dataset package passes 6 files and 89 tests.
+Those tests validate tamper rejection and exact trace-policy binding. The
+external four-split smoke remains the proof of the actual child-process path
+until a bounded end-to-end CI regression is added.
 
 Primary implementation evidence:
 
@@ -376,8 +379,8 @@ Primary implementation evidence:
 - `packages/trace-to-dataset/src/schema9-ledger-authentication.ts`
 - `packages/trace-to-dataset/src/schema9-corpus-ledger.ts`
 - `apps/dataset-cli/src/schema9-ledger-cli.ts`
-- `engine/apps/engine-cli/src/player-private-batch-cli.ts`
-- `engine/apps/engine-cli/src/player-private-output.ts`
+- `engine/apps/engine-cli/src/schema9-player-private-cli.ts`
+- `engine/apps/engine-cli/src/schema9-player-private-bundle.ts`
 - `engine/packages/simulation-arena/src/player-private-assignment-scheduler.ts`
 - `engine/packages/simulation-arena/src/player-private-stream.ts`
 - `ml/training/drawback_ml/capturable_opportunity_workflow.py`
