@@ -12,6 +12,7 @@ from unittest.mock import patch
 from ml.evaluation.browser_ensemble_artifact import (
     BROWSER_ENSEMBLE_ARTIFACT_VERSION,
     BROWSER_ENSEMBLE_MODEL_VARIANT,
+    _write_atomic_no_clobber,
     export_browser_ensemble_artifact,
 )
 from ml.evaluation.cli import main
@@ -26,6 +27,7 @@ from ml.evaluation.ensemble_release import (
 )
 from ml.evaluation.release_selection_bundle import ContentAddressedJson
 from ml.training.drawback_ml.browser_artifact import BrowserArtifactError
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable_exact
 
 
 def sha(payload: bytes) -> str:
@@ -33,6 +35,33 @@ def sha(payload: bytes) -> str:
 
 
 class BrowserEnsembleArtifactTests(unittest.TestCase):
+    def test_publication_retry_accepts_only_exact_committed_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "browser.json"
+            payload = b'{"browser":true}\n'
+
+            def fail_after_publication(
+                path: Path,
+                value: bytes,
+                *,
+                label: str,
+            ) -> None:
+                publish_bytes_durable_exact(path, value, label=label)
+                raise OSError("simulated post-publication failure")
+
+            with patch(
+                "ml.evaluation.browser_ensemble_artifact."
+                "publish_bytes_durable_exact",
+                side_effect=fail_after_publication,
+            ):
+                with self.assertRaisesRegex(OSError, "post-publication"):
+                    _write_atomic_no_clobber(output, payload)
+
+            _write_atomic_no_clobber(output, payload)
+            self.assertEqual(output.read_bytes(), payload)
+            with self.assertRaisesRegex(BrowserArtifactError, "overwrite"):
+                _write_atomic_no_clobber(output, b"different\n")
+
     def inputs(
         self,
         root: Path,

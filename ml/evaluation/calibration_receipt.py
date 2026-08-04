@@ -6,10 +6,14 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
-import tempfile
 from typing import Mapping
+
+from ml.training.drawback_ml.durable_publish import (
+    publish_bytes_durable,
+    publish_bytes_durable_exact,
+)
+from ml.training.drawback_ml.path_validation import is_portable_safe_basename
 
 from .calibration_release import (
     ContentAddressedFile,
@@ -58,6 +62,8 @@ class LoadedCalibrationReceipt:
 def write_calibration_receipt(
     output: Path,
     inputs: CalibrationReceiptInputs,
+    *,
+    recover_exact: bool = False,
 ) -> CalibrationReceiptReference:
     """Verify completed local artifacts, then publish one non-circular receipt."""
 
@@ -68,7 +74,14 @@ def write_calibration_receipt(
         **bindings,
     }
     payload = _canonical_json(value)
-    _write_atomic_no_clobber(output, payload)
+    if recover_exact:
+        publish_bytes_durable_exact(
+            output,
+            payload,
+            label="calibration receipt",
+        )
+    else:
+        _write_atomic_no_clobber(output, payload)
     actual = hashlib.sha256(output.read_bytes()).hexdigest()
     expected = hashlib.sha256(payload).hexdigest()
     if actual != expected:
@@ -316,23 +329,12 @@ def _canonical_json(value: Mapping[str, object]) -> bytes:
 
 def _write_atomic_no_clobber(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "wb") as target:
-            target.write(payload)
-            target.flush()
-            os.fsync(target.fileno())
-        try:
-            os.link(temporary, path)
-        except FileExistsError as error:
-            raise ValueError(
-                f"refusing to overwrite calibration receipt: {path}"
-            ) from error
-    finally:
-        temporary.unlink(missing_ok=True)
+        publish_bytes_durable(path, payload)
+    except FileExistsError as error:
+        raise ValueError(
+            f"refusing to overwrite calibration receipt: {path}"
+        ) from error
 
 
 def _exact_keys(
@@ -349,8 +351,8 @@ def _object(value: object, name: str) -> Mapping[str, object]:
 
 
 def _basename(value: object, name: str) -> str:
-    if not isinstance(value, str) or not value or Path(value).name != value:
-        raise ValueError(f"{name} must be a non-empty basename")
+    if not is_portable_safe_basename(value):
+        raise ValueError(f"{name} must be a safe basename")
     return value
 
 

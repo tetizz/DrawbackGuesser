@@ -46,6 +46,14 @@ Use the existing `capturable25-schema9-opportunity-v1` protocol and version ever
 7. Evaluate that frozen pair once on validation B. Do not retrain, recalibrate, retune fusion, select another seed, or change preprocessing after Stage A.
 8. Make the final held-out path available only after validation B authorizes it. Consume that split once. A failed validation stage ends the experiment; it does not authorize another candidate search on the same split.
 
+The implemented consumption registry is a trusted-operator safeguard under one
+Git common directory. It prevents accidental or repeated use only in worktrees
+sharing that directory; its user-deletable markers do not follow another clone
+and cannot enforce a global one-shot claim. Any public global one-shot claim
+requires an external append-only authority that issues a signed, single-use
+lease keyed by the sealed-corpus identity. That authority is not implemented in
+this repository.
+
 Every generated report must be canonical, content-addressed, no-clobber, and path-minimized. Replaying a decision from its bound inputs must reproduce the same bytes.
 
 ## Success metrics and gates

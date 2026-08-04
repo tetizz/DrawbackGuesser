@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -52,12 +53,16 @@ from drawback_ml.capturable_fixed_corpus import (
     _load_pinned_capturable_dataset,
     _reproduce_trace,
     _resolve_toolchain,
+    _run,
+    _run_bounded,
     _sanitized_environment,
     _scrub_ignored_paths,
     _tracked_blob_sha256,
     _trusted_package_shell,
     _validate_receipt,
     _verify_conversion,
+    _windows_known_directory,
+    _windows_taskkill,
     main as corpus_main,
     reauthenticate_fixed_corpus_files,
     require_private_regular_file,
@@ -253,6 +258,64 @@ def _toolchain() -> ResolvedToolchain:
 
 
 class CapturableFixedCorpusTests(unittest.TestCase):
+    def test_nonzero_command_preserves_failure_when_cleanup_fails(self) -> None:
+        process = SimpleNamespace(
+            returncode=13,
+            communicate=lambda *, timeout: ("output", "child failed"),
+        )
+        with (
+            patch(
+                "drawback_ml.capturable_fixed_corpus._popen_contained",
+                return_value=(process, None),
+            ),
+            patch(
+                "drawback_ml.capturable_fixed_corpus._terminate_process_tree",
+                side_effect=OSError("cleanup failed"),
+            ),
+            self.assertRaises(subprocess.CalledProcessError) as raised,
+        ):
+            _run_bounded(
+                ["child"],
+                cwd=Path.cwd(),
+                environment={},
+                timeout=10,
+            )
+        self.assertEqual(raised.exception.returncode, 13)
+        self.assertEqual(raised.exception.stderr, "child failed")
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertIn(
+            "cleanup failed",
+            " ".join(getattr(raised.exception, "__notes__", ())),
+        )
+
+    @unittest.skipUnless(os.name == "nt", "Windows-only cleanup contract")
+    def test_taskkill_nonzero_fails_closed(self) -> None:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "SystemRoot": str(Path.cwd() / "attacker-windows"),
+                    "PATH": str(Path.cwd() / "attacker-bin"),
+                    "PATHEXT": ".EVIL",
+                },
+                clear=False,
+            ),
+            patch(
+                "drawback_ml.capturable_fixed_corpus.subprocess.run",
+                return_value=SimpleNamespace(returncode=9),
+            ) as run_process,
+            self.assertRaisesRegex(OSError, "exit code 9"),
+        ):
+            _windows_taskkill(12345)
+        environment = run_process.call_args.kwargs["env"]
+        system = _windows_known_directory("system")
+        windows = _windows_known_directory("windows")
+        self.assertEqual(environment["SystemRoot"], str(windows))
+        self.assertEqual(environment["WINDIR"], str(windows))
+        self.assertEqual(environment["ComSpec"], str(system / "cmd.exe"))
+        self.assertEqual(environment["PATH"], str(system))
+        self.assertEqual(environment["PATHEXT"], ".COM;.EXE;.BAT;.CMD")
+
     def test_fixed_entrypoints_require_isolated_python_311(self) -> None:
         valid_flags = SimpleNamespace(
             ignore_environment=1,
@@ -1546,6 +1609,73 @@ class CapturableFixedCorpusTests(unittest.TestCase):
                         receipt,
                         execution,
                     )
+
+    def test_timed_out_command_terminates_descendant_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            heartbeat = root / "heartbeat"
+            child = (
+                "from pathlib import Path; import sys,time\n"
+                "path=Path(sys.argv[1])\n"
+                "while True:\n"
+                " path.open('ab', buffering=0).write(b'x')\n"
+                " time.sleep(0.02)\n"
+            )
+            parent = (
+                "import subprocess,sys,time\n"
+                "subprocess.Popen([sys.executable,'-c',sys.argv[1],sys.argv[2]])\n"
+                "while True: time.sleep(1)\n"
+            )
+            with self.assertRaisesRegex(
+                CapturableDatasetError, "timed process could not run"
+            ):
+                _run(
+                    [sys.executable, "-c", parent, child, str(heartbeat)],
+                    cwd=root,
+                    operation="timed process",
+                    timeout=1,
+                    environment=dict(os.environ),
+                )
+            self.assertTrue(heartbeat.exists(), "descendant never started")
+            time.sleep(0.2)
+            settled_size = heartbeat.stat().st_size
+            time.sleep(0.3)
+            self.assertEqual(heartbeat.stat().st_size, settled_size)
+
+    def test_successful_fast_parent_terminates_descendant_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            heartbeat = root / "heartbeat"
+            child = (
+                "from pathlib import Path; import sys,time\n"
+                "path=Path(sys.argv[1])\n"
+                "while True:\n"
+                " path.open('ab', buffering=0).write(b'x')\n"
+                " time.sleep(0.02)\n"
+            )
+            parent = (
+                "from pathlib import Path; import subprocess,sys,time\n"
+                "heartbeat=Path(sys.argv[2])\n"
+                "subprocess.Popen([sys.executable,'-c',sys.argv[1],"
+                "sys.argv[2]],stdin=subprocess.DEVNULL,"
+                "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
+                "deadline=time.monotonic()+5\n"
+                "while not heartbeat.exists():\n"
+                " if time.monotonic() >= deadline: raise SystemExit(2)\n"
+                " time.sleep(0.01)\n"
+            )
+            _run(
+                [sys.executable, "-c", parent, child, str(heartbeat)],
+                cwd=root,
+                operation="fast parent process",
+                timeout=10,
+                environment=dict(os.environ),
+            )
+            self.assertTrue(heartbeat.exists(), "descendant never started")
+            time.sleep(0.2)
+            settled_size = heartbeat.stat().st_size
+            time.sleep(0.3)
+            self.assertEqual(heartbeat.stat().st_size, settled_size)
 
     def test_poisoned_ignored_outputs_are_scrubbed_and_rebuilt(
         self,

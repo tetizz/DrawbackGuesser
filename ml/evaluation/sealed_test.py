@@ -1,4 +1,4 @@
-"""One-shot, fail-closed execution of the signed sealed-test plan."""
+"""Fail-closed sealed-test execution with a checkout-local use guard."""
 
 from __future__ import annotations
 
@@ -15,6 +15,11 @@ import tempfile
 from typing import Mapping, Sequence
 
 from ml.training.drawback_ml.corpus_contract import open_audited_private_corpus_split
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable
+from ml.training.drawback_ml.path_validation import (
+    is_portable_safe_basename,
+    portable_basename_key,
+)
 
 from .ensemble_calibration import ContentAddressedFile
 from .promotion_evaluator import (
@@ -27,9 +32,19 @@ from .release_selection_bundle import ContentAddressedJson
 from .review_authorization import (
     SEALED_REPORT_FORMAT,
     ReviewAuthorizationError,
+    _ExecutableIdentity,
+    _assert_executable_unchanged,
+    _executable_identity,
+    _is_link_or_reparse_point,
+    _sanitized_system_tool_environment,
+    _windows_known_directory,
     load_authorization_receipt,
 )
 from .training_frequency import ContentAddressedFile as TrainingFrequencyReference
+from .validation_runtime import (
+    _GIT_FILTER_CONFIG_ARGUMENTS,
+    _assert_no_executable_git_filters,
+)
 from .validation_gate import (
     BOOTSTRAP_SEED,
     REPORT_FORMAT as VALIDATION_REPORT_FORMAT,
@@ -44,6 +59,7 @@ USE_FORMAT = "drawbacktrainer-sealed-test-use"
 AUTHORIZATION_FILE_ENV = "DRAWBACKTRAINER_AUTHORIZATION_FILE"
 AUTHORIZATION_SHA_ENV = "DRAWBACKTRAINER_AUTHORIZATION_SHA256"
 _SHA256 = frozenset("0123456789abcdef")
+_SOURCE_REVISION = frozenset("0123456789abcdef")
 
 
 def _canonical(value: object) -> bytes:
@@ -57,7 +73,7 @@ def _binding(value: object, label: str) -> tuple[str, str]:
     if not isinstance(value, Mapping) or set(value) != {"file", "sha256"}:
         raise ReviewAuthorizationError(f"{label} binding is invalid")
     name, digest = value["file"], value["sha256"]
-    if not isinstance(name, str) or Path(name).name != name or name in {".", ".."}:
+    if not is_portable_safe_basename(name):
         raise ReviewAuthorizationError(f"{label} file must be a safe basename")
     if (
         not isinstance(digest, str)
@@ -70,21 +86,10 @@ def _binding(value: object, label: str) -> tuple[str, str]:
 
 def _write_once(path: Path, payload: bytes, label: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "wb") as target:
-            target.write(payload)
-            target.flush()
-            os.fsync(target.fileno())
-        try:
-            os.link(temporary, path)
-        except FileExistsError as error:
-            raise ReviewAuthorizationError(f"refusing to reuse {label}") from error
-    finally:
-        temporary.unlink(missing_ok=True)
+        publish_bytes_durable(path, payload)
+    except FileExistsError as error:
+        raise ReviewAuthorizationError(f"refusing to reuse {label}") from error
 
 
 def _publish_pair(
@@ -93,40 +98,31 @@ def _publish_pair(
     decision_path: Path,
     decision_payload: bytes,
 ) -> None:
-    """Publish decision last as the completion marker, without partial evidence."""
+    """Publish decision last and retain an authenticated partial report safely."""
 
     if report_path.exists() or decision_path.exists():
         raise ReviewAuthorizationError("sealed outputs already exist")
-    staged: list[Path] = []
     published_report = False
     try:
-        for path, payload in (
-            (report_path, report_payload),
-            (decision_path, decision_payload),
-        ):
-            descriptor, name = tempfile.mkstemp(
-                prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-            )
-            staged_path = Path(name)
-            staged.append(staged_path)
-            with os.fdopen(descriptor, "wb") as target:
-                target.write(payload)
-                target.flush()
-                os.fsync(target.fileno())
-        os.link(staged[0], report_path)
+        publish_bytes_durable(report_path, report_payload)
         published_report = True
-        os.link(staged[1], decision_path)
+        publish_bytes_durable(decision_path, decision_payload)
     except FileExistsError as error:
         if published_report:
-            report_path.unlink(missing_ok=True)
+            error.add_note(
+                "retained the sealed report because portable Python cannot "
+                "unlink an authenticated object without a pathname race: "
+                f"{report_path}"
+            )
         raise ReviewAuthorizationError("refusing to overwrite sealed outputs") from error
-    except BaseException:
+    except BaseException as error:
         if published_report:
-            report_path.unlink(missing_ok=True)
+            error.add_note(
+                "retained the sealed report because portable Python cannot "
+                "unlink an authenticated object without a pathname race: "
+                f"{report_path}"
+            )
         raise
-    finally:
-        for path in staged:
-            path.unlink(missing_ok=True)
 
 
 def _file_sha256(path: Path, label: str) -> str:
@@ -146,31 +142,251 @@ def _digest(path: Path, expected: str, label: str) -> None:
         raise ReviewAuthorizationError(f"{label} SHA-256 does not match")
 
 
+def _trusted_git_executable() -> _ExecutableIdentity:
+    if os.name == "nt":
+        candidate = (
+            _windows_known_directory("program-files")
+            / "Git"
+            / "mingw64"
+            / "bin"
+            / "git.exe"
+        )
+    else:
+        candidates = {
+            item.resolve(strict=True)
+            for item in (Path("/usr/bin/git"), Path("/bin/git"))
+            if item.is_file()
+        }
+        if len(candidates) != 1:
+            raise ReviewAuthorizationError(
+                "trusted system Git executable is unavailable"
+            )
+        candidate = candidates.pop()
+    return _executable_identity(candidate, "trusted system Git executable")
+
+
+def _git_command(
+    executable: Path,
+    arguments: Sequence[str],
+) -> tuple[str, ...]:
+    return (
+        str(executable),
+        "--no-replace-objects",
+        "--no-pager",
+        "-c",
+        "core.attributesFile=",
+        "-c",
+        "core.autocrlf=true",
+        "-c",
+        "core.excludesFile=",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        f"core.hooksPath={os.devnull}",
+        "-c",
+        f"core.askPass={os.devnull}",
+        "-c",
+        "credential.helper=",
+        "-c",
+        "credential.interactive=false",
+        "-c",
+        "protocol.allow=never",
+        *arguments,
+    )
+
+
+def _git_environment(executable: Path) -> dict[str, str]:
+    environment = _sanitized_system_tool_environment(executable)
+    environment.update(
+        {
+            "GCM_INTERACTIVE": "Never",
+            "GIT_ASKPASS": os.devnull,
+            "GIT_CONFIG_COUNT": "0",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "",
+            "GIT_TERMINAL_PROMPT": "0",
+            "SSH_ASKPASS": os.devnull,
+            "SSH_ASKPASS_REQUIRE": "never",
+        }
+    )
+    return environment
+
+
+def _run_source_git(
+    *,
+    executable: Path,
+    directory: Path,
+    arguments: Sequence[str],
+    environment: Mapping[str, str],
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            _git_command(executable, arguments),
+            cwd=directory,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            env=dict(environment),
+            stdin=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except (OSError, UnicodeError, subprocess.TimeoutExpired) as error:
+        raise ReviewAuthorizationError(
+            "cannot execute authenticated source Git"
+        ) from error
+
+
 def _source_identity(directory: Path) -> tuple[Path, str]:
-    process = subprocess.run(
-        ("git", "rev-parse", "--show-toplevel", "HEAD"),
-        cwd=directory,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+    git = _trusted_git_executable()
+    environment = _git_environment(git.path)
+    process = _run_source_git(
+        executable=git.path,
+        directory=directory,
+        arguments=("rev-parse", "--show-toplevel", "HEAD"),
+        environment=environment,
     )
     if process.returncode != 0:
         raise ReviewAuthorizationError("cannot authenticate running source revision")
-    cleanliness = subprocess.run(
-        ("git", "status", "--porcelain", "--untracked-files=all"),
-        cwd=directory,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+    configured = _run_source_git(
+        executable=git.path,
+        directory=directory,
+        arguments=_GIT_FILTER_CONFIG_ARGUMENTS,
+        environment=environment,
     )
+    if configured.returncode != 0:
+        raise ReviewAuthorizationError(
+            "cannot authenticate executable Git filter configuration"
+        )
+    try:
+        _assert_no_executable_git_filters(configured.stdout)
+    except ValueError as error:
+        raise ReviewAuthorizationError(str(error)) from error
+    cleanliness = _run_source_git(
+        executable=git.path,
+        directory=directory,
+        arguments=("status", "--porcelain", "--untracked-files=all"),
+        environment=environment,
+    )
+    _assert_executable_unchanged(git, "trusted system Git executable")
     if cleanliness.returncode != 0 or cleanliness.stdout:
         raise ReviewAuthorizationError("sealed test requires a clean source tree")
     lines = process.stdout.splitlines()
-    if len(lines) != 2:
+    if (
+        len(lines) != 2
+        or len(lines[1]) != 40
+        or any(character not in _SOURCE_REVISION for character in lines[1])
+    ):
         raise ReviewAuthorizationError("running source identity is invalid")
-    return Path(lines[0]).resolve(), lines[1]
+    try:
+        root = Path(lines[0]).resolve(strict=True)
+    except OSError as error:
+        raise ReviewAuthorizationError(
+            "running source root is unavailable"
+        ) from error
+    return root, lines[1]
+
+
+def _git_common_directory(source_root: Path) -> Path:
+    """Resolve Git's canonical shared metadata directory without PATH lookup."""
+
+    dot_git = source_root / ".git"
+    try:
+        if dot_git.is_dir():
+            common = dot_git.resolve(strict=True)
+        elif dot_git.is_file():
+            payload = dot_git.read_bytes()
+            if len(payload) > 4096 or b"\x00" in payload:
+                raise ReviewAuthorizationError("worktree Git pointer is invalid")
+            try:
+                pointer = payload.decode("utf-8", errors="strict").strip()
+            except UnicodeDecodeError as error:
+                raise ReviewAuthorizationError(
+                    "worktree Git pointer is invalid"
+                ) from error
+            if not pointer.startswith("gitdir: ") or "\n" in pointer:
+                raise ReviewAuthorizationError("worktree Git pointer is invalid")
+            raw_git_directory = Path(pointer.removeprefix("gitdir: "))
+            git_directory = (
+                raw_git_directory
+                if raw_git_directory.is_absolute()
+                else source_root / raw_git_directory
+            ).resolve(strict=True)
+            common_pointer = git_directory / "commondir"
+            if common_pointer.is_file():
+                common_payload = common_pointer.read_bytes()
+                if len(common_payload) > 4096 or b"\x00" in common_payload:
+                    raise ReviewAuthorizationError(
+                        "worktree common Git pointer is invalid"
+                    )
+                try:
+                    common_text = common_payload.decode(
+                        "utf-8", errors="strict"
+                    ).strip()
+                except UnicodeDecodeError as error:
+                    raise ReviewAuthorizationError(
+                        "worktree common Git pointer is invalid"
+                    ) from error
+                if not common_text or "\n" in common_text:
+                    raise ReviewAuthorizationError(
+                        "worktree common Git pointer is invalid"
+                    )
+                raw_common = Path(common_text)
+                common = (
+                    raw_common
+                    if raw_common.is_absolute()
+                    else git_directory / raw_common
+                ).resolve(strict=True)
+            else:
+                common = git_directory
+        else:
+            raise ReviewAuthorizationError("source Git metadata is unavailable")
+    except OSError as error:
+        raise ReviewAuthorizationError(
+            "source Git metadata is unavailable"
+        ) from error
+    if not common.is_dir() or _is_link_or_reparse_point(common):
+        raise ReviewAuthorizationError("source Git metadata is invalid")
+    return common
+
+
+def _sealed_corpus_identity(inputs: Mapping[str, object]) -> str:
+    bindings = {
+        key: _binding(inputs[key], f"test_plan.inputs.{key}")[1]
+        for key in sorted(inputs)
+    }
+    return hashlib.sha256(
+        _canonical(
+            {
+                "format": "drawbacktrainer-sealed-corpus-identity",
+                "version": VERSION,
+                "inputs": bindings,
+            }
+        )
+    ).hexdigest()
+
+
+def _consumption_marker_path(source_root: Path, corpus_sha256: str) -> Path:
+    """Return a marker shared only by this trusted Git common directory."""
+
+    common = _git_common_directory(source_root)
+    registry = common / "drawbacktrainer" / "sealed-test-consumption-v1"
+    try:
+        registry.mkdir(parents=True, exist_ok=True)
+        resolved = registry.resolve(strict=True)
+    except OSError as error:
+        raise ReviewAuthorizationError(
+            "cannot initialize canonical sealed-test registry"
+        ) from error
+    if resolved != registry or resolved.parent.parent != common:
+        raise ReviewAuthorizationError(
+            "canonical sealed-test registry escaped Git metadata"
+        )
+    return resolved / f"{corpus_sha256}.json"
 
 
 @contextmanager
@@ -302,7 +518,7 @@ def execute_authorized_test(
     invocation: Sequence[str],
     directory: Path,
 ) -> tuple[Path, Path, bool]:
-    """Authenticate, consume once, then and only then resolve sealed inputs."""
+    """Authenticate, record trusted-local use, then resolve sealed inputs."""
 
     receipt = load_authorization_receipt(authorization)
     plan = receipt["authorized_test_plan"]
@@ -339,25 +555,39 @@ def execute_authorized_test(
     inputs = plan["inputs"]
     if not isinstance(outputs, Mapping) or not isinstance(inputs, Mapping):
         raise ReviewAuthorizationError("authorized test plan is invalid")
-    report_name = str(outputs["report"])
-    decision_name = str(outputs["decision"])
+    report_name = outputs["report"]
+    decision_name = outputs["decision"]
+    if not is_portable_safe_basename(report_name) or not is_portable_safe_basename(
+        decision_name
+    ):
+        raise ReviewAuthorizationError("sealed output file must be a safe basename")
+    if portable_basename_key(report_name) == portable_basename_key(decision_name):
+        raise ReviewAuthorizationError("sealed output basenames must be distinct")
     report_path, decision_path = directory / report_name, directory / decision_name
     if report_path.exists() or decision_path.exists():
         raise ReviewAuthorizationError("sealed outputs already exist")
 
-    use_path = directory / f".sealed-test-use-{authorization.sha256}.json"
+    corpus_identity_sha256 = _sealed_corpus_identity(inputs)
+    use_path = _consumption_marker_path(
+        source_root,
+        corpus_identity_sha256,
+    )
+    # This marker coordinates trusted worktrees that share one Git common
+    # directory. A repository owner can delete it or use another clone, so it
+    # is not a global one-shot authority.
     _write_once(
         use_path,
         _canonical(
             {
                 "format": USE_FORMAT,
                 "version": VERSION,
+                "sealed_corpus_identity_sha256": corpus_identity_sha256,
                 "authorization_sha256": authorization.sha256,
                 "plan_id": plan["plan_id"],
                 "argv_sha256": hashlib.sha256(_canonical(list(invocation))).hexdigest(),
             }
         ),
-        "sealed-test authorization",
+        "sealed-test corpus",
     )
 
     candidate = receipt["authorized_candidate"]
@@ -464,7 +694,16 @@ def execute_authorized_test(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m ml.evaluation.sealed_test")
+    parser = argparse.ArgumentParser(
+        prog="python -m ml.evaluation.sealed_test",
+        description=(
+            "Execute an authorized sealed test with a create-only marker in "
+            "one trusted Git common directory. This guards accidental or "
+            "repeated local use; global one-shot enforcement requires an "
+            "external append-only authority or signed single-use lease keyed "
+            "by corpus identity."
+        ),
+    )
     parser.add_argument("public_root", type=Path)
     parser.add_argument("private_test", type=Path)
     parser.add_argument("dataset", type=Path)

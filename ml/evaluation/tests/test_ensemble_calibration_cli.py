@@ -28,8 +28,10 @@ from ml.evaluation.ensemble_calibration import (
     FORMAT_VERSION,
     FUSION_METHOD,
     REPORT_FORMAT,
+    ContentAddressedFile,
     EnsembleCalibrationIdentity,
     EnsembleCalibrationMember,
+    fit_ensemble_calibration as fit_ensemble_calibration_real,
     load_ensemble_calibration,
     load_ensemble_calibration_sidecar,
 )
@@ -485,6 +487,28 @@ class EnsembleCalibrationCliTests(unittest.TestCase):
                 )
 
             captured = io.StringIO()
+            report_attempts = 0
+
+            from ml.evaluation.cli import (
+                _write_report_atomic_no_clobber as write_report_real,
+            )
+
+            def fail_first_report(
+                path: Path,
+                rendered: str,
+                *,
+                recover_exact: bool = False,
+            ) -> None:
+                nonlocal report_attempts
+                report_attempts += 1
+                if report_attempts == 1:
+                    raise OSError("injected report publication failure")
+                write_report_real(
+                    path,
+                    rendered,
+                    recover_exact=recover_exact,
+                )
+
             corpus_set = training_corpus_set_fixture()
             loaded_fusion_selection = SimpleNamespace(
                 selected_alpha=0.5,
@@ -511,7 +535,14 @@ class EnsembleCalibrationCliTests(unittest.TestCase):
             ), patch(
                 "ml.evaluation.cli.evaluate_held_out",
                 side_effect=evaluate,
+            ), patch(
+                "ml.evaluation.cli._write_report_atomic_no_clobber",
+                side_effect=fail_first_report,
             ), redirect_stdout(captured):
+                with self.assertRaisesRegex(OSError, "injected report"):
+                    _evaluate_ensemble_calibration(arguments, lease)
+                self.assertTrue(sidecar_output.is_file())
+                self.assertFalse(output.exists())
                 result = _evaluate_ensemble_calibration(arguments, lease)
 
             self.assertEqual(result, 0)
@@ -548,7 +579,7 @@ class EnsembleCalibrationCliTests(unittest.TestCase):
                 load_ensemble.call_args.kwargs["fusion_alpha"],
                 0.5,
             )
-            self.assertEqual(load_fusion_selection.call_count, 2)
+            self.assertEqual(load_fusion_selection.call_count, 4)
 
     def test_union_training_corpus_set_must_match_release_hash(self) -> None:
         corpus_set = training_corpus_set_fixture()
@@ -614,13 +645,57 @@ class EnsembleCalibrationCliTests(unittest.TestCase):
             fusion_selection = root / "fusion-selection.json"
             fusion_selection.write_text("{}\n", encoding="utf-8")
             captured = io.StringIO()
+            artifact_attempts = 0
+
+            def fail_first_artifact(
+                output: Path,
+                receipt_reference: ContentAddressedFile,
+                *,
+                recover_exact: bool = False,
+            ) -> ContentAddressedFile:
+                nonlocal artifact_attempts
+                artifact_attempts += 1
+                if artifact_attempts == 1:
+                    raise OSError("injected artifact publication failure")
+                return fit_ensemble_calibration_real(
+                    output,
+                    receipt_reference,
+                    recover_exact=recover_exact,
+                )
+
             with patch(
                 "ml.evaluation.ensemble_calibration.verify_ensemble_release",
                 return_value=loaded,
             ), patch(
                 "ml.evaluation.ensemble_calibration.load_fusion_selection_artifact",
                 return_value=SimpleNamespace(selected_alpha=0.5),
+            ), patch(
+                "ml.evaluation.cli.fit_ensemble_calibration",
+                side_effect=fail_first_artifact,
             ), redirect_stdout(captured):
+                with self.assertRaisesRegex(OSError, "injected artifact"):
+                    main(
+                        [
+                            "fit-ensemble-calibration",
+                            str(sidecar.path),
+                            str(report),
+                            str(release.path),
+                            str(receipt),
+                            str(artifact),
+                            "--sidecar-sha256",
+                            sidecar.sha256,
+                            "--report-sha256",
+                            sha(report.read_bytes()),
+                            "--ensemble-sha256",
+                            release.sha256,
+                            "--fusion-selection",
+                            str(fusion_selection),
+                            "--fusion-selection-sha256",
+                            "0" * 64,
+                        ]
+                    )
+                self.assertTrue(receipt.is_file())
+                self.assertFalse(artifact.exists())
                 result = main(
                     [
                         "fit-ensemble-calibration",

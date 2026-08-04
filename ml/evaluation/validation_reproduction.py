@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,8 @@ from typing import Callable, Mapping, Sequence
 from ml.training.drawback_ml.corpus_contract import (
     open_audited_private_corpus_split,
 )
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable_exact
+from ml.training.drawback_ml.path_validation import is_portable_safe_basename
 
 from .ensemble_calibration import ContentAddressedFile
 from .training_frequency import (
@@ -31,6 +34,24 @@ from .validation_gate import (
     VERSION as VALIDATION_GATE_VERSION,
     _canonical_pretty,
     load_validation_gate_document,
+)
+from .validation_runtime import (
+    _GIT_FILTER_CONFIG_ARGUMENTS,
+    RUNTIME_CLOSURE_ALGORITHM,
+    _PythonRuntimeConfiguration,
+    _RUNTIME_BOOTSTRAP,
+    _authenticated_git_environment,
+    _assert_no_executable_git_filters,
+    _isolated_python_environment,
+    _load_runtime_manifest,
+    _path_identity_sha256,
+    _python_runtime_configuration,
+    _read_executable_identity,
+    _run_bounded_process,
+    _run_git,
+    _trusted_git_executable,
+    _trusted_python_executable,
+    _validate_runtime_closure,
 )
 
 
@@ -56,8 +77,14 @@ class EnvironmentAttestation:
     pnpm_lock_sha256: str
     python_requirements_sha256: str
     python_project_sha256: str
+    git_executable_path_sha256: str
+    git_executable_sha256: str
+    git_version: str
+    python_executable_path_sha256: str
     python_executable_sha256: str
     python_version: str
+    python_import_roots_sha256: str
+    python_distributions_sha256: str
 
 
 @dataclass(frozen=True)
@@ -146,10 +173,12 @@ def load_validation_reproduction_receipt(
     original = value.get("original")
     candidate_inputs = value.get("candidate_inputs")
     comparison = value.get("comparison")
+    environment = value.get("environment")
     if (
         not isinstance(original, Mapping)
         or not isinstance(candidate_inputs, Mapping)
         or not isinstance(comparison, Mapping)
+        or not isinstance(environment, Mapping)
     ):
         raise ValueError("validation reproduction receipt sections are invalid")
     if set(candidate_inputs) != {
@@ -166,9 +195,7 @@ def load_validation_reproduction_receipt(
         if (
             not isinstance(binding, Mapping)
             or set(binding) != {"file", "sha256"}
-            or not isinstance(binding.get("file"), str)
-            or not binding.get("file")
-            or Path(str(binding.get("file"))).name != binding.get("file")
+            or not is_portable_safe_basename(binding.get("file"))
         ):
             raise ValueError("validation reproduction catalog binding is invalid")
         _expected_digest(
@@ -188,6 +215,61 @@ def load_validation_reproduction_receipt(
         or float(maximum) > FLOAT_TOLERANCE
     ):
         raise ValueError("validation reproduction metric difference is invalid")
+    legacy_environment_keys = {
+        "source_revision",
+        "pnpm_lock_sha256",
+        "python_requirements_sha256",
+        "python_project_sha256",
+        "python_executable_sha256",
+        "python_version",
+    }
+    authenticated_environment_keys = legacy_environment_keys | {
+        "git_executable_path_sha256",
+        "git_executable_sha256",
+        "git_version",
+        "python_executable_path_sha256",
+        "python_import_roots_sha256",
+        "python_distributions_sha256",
+        "python_runtime",
+    }
+    if set(environment) not in {
+        frozenset(legacy_environment_keys),
+        frozenset(authenticated_environment_keys),
+    }:
+        raise ValueError("validation reproduction environment fields are invalid")
+    _expected_digest(str(environment.get("pnpm_lock_sha256")), "pnpm lock sha256")
+    _expected_digest(
+        str(environment.get("python_requirements_sha256")),
+        "Python requirements sha256",
+    )
+    _expected_digest(
+        str(environment.get("python_project_sha256")),
+        "Python project sha256",
+    )
+    _expected_digest(
+        str(environment.get("python_executable_sha256")),
+        "Python executable sha256",
+    )
+    if (
+        REVISION_PATTERN.fullmatch(str(environment.get("source_revision"))) is None
+        or not isinstance(environment.get("python_version"), str)
+        or not environment.get("python_version")
+    ):
+        raise ValueError("validation reproduction environment identity is invalid")
+    if set(environment) == authenticated_environment_keys:
+        for key in (
+            "git_executable_path_sha256",
+            "git_executable_sha256",
+            "python_executable_path_sha256",
+            "python_import_roots_sha256",
+            "python_distributions_sha256",
+        ):
+            _expected_digest(str(environment.get(key)), key.replace("_", " "))
+        if not isinstance(environment.get("git_version"), str) or not environment.get(
+            "git_version"
+        ):
+            raise ValueError("validation reproduction Git version is invalid")
+        _validate_runtime_closure(environment.get("python_runtime"))
     loaded_original: dict[str, Mapping[str, object]] = {}
     references: dict[str, ContentAddressedFile] = {}
     for key, expected_format in (
@@ -199,12 +281,8 @@ def load_validation_reproduction_receipt(
             raise ValueError(f"original {key} binding is invalid")
         filename = binding.get("file")
         digest = binding.get("sha256")
-        if (
-            not isinstance(filename, str)
-            or not filename
-            or Path(filename).name != filename
-        ):
-            raise ValueError(f"original {key} file must be a basename")
+        if not is_portable_safe_basename(filename):
+            raise ValueError(f"original {key} file must be a safe basename")
         bound = ContentAddressedFile(
             reference.path.parent / filename,
             _expected_digest(str(digest), f"original {key} sha256"),
@@ -233,21 +311,6 @@ def load_validation_reproduction_receipt(
     return value
 
 
-def _run_git(
-    repository: Path, arguments: Sequence[str]
-) -> subprocess.CompletedProcess[str]:
-    try:
-        return subprocess.run(
-            ["git", "-C", str(repository), *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        )
-    except OSError as error:
-        raise ValueError("cannot execute Git for source attestation") from error
-
-
 def attest_clean_environment(
     repository: Path,
     *,
@@ -262,22 +325,49 @@ def attest_clean_environment(
     expected_revision = expected_source_revision.lower()
     if REVISION_PATTERN.fullmatch(expected_revision) is None:
         raise ValueError("expected source revision must be a full Git SHA")
-    head = _run_git(root, ["rev-parse", "HEAD"])
+    git_before = _read_executable_identity(
+        _trusted_git_executable(), "trusted Git executable"
+    )
+    python_before = _read_executable_identity(
+        _trusted_python_executable(), "current Python executable"
+    )
+    git_environment = _authenticated_git_environment(git_before.path)
+
+    def git(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        return _run_git(
+            root,
+            arguments,
+            git_executable=git_before.path,
+            environment=git_environment,
+        )
+
+    def git_status(arguments: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        configured = git(_GIT_FILTER_CONFIG_ARGUMENTS)
+        if configured.returncode != 0:
+            raise ValueError("cannot authenticate executable Git filter configuration")
+        _assert_no_executable_git_filters(configured.stdout)
+        return git(arguments)
+
+    version_result = git(["--version"])
+    if version_result.returncode != 0 or not version_result.stdout.strip().startswith(
+        "git version "
+    ):
+        raise ValueError("trusted Git version is unreadable")
+    git_version = version_result.stdout.strip()
+    head = git(["rev-parse", "HEAD"])
     if head.returncode != 0:
         raise ValueError("repository root is not a readable Git checkout")
     revision = head.stdout.strip().lower()
     if revision != expected_revision:
         raise ValueError("current source revision differs from the approved revision")
-    tracked_status = _run_git(
-        root,
+    tracked_status = git_status(
         ["status", "--porcelain=v1", "--untracked-files=no"],
     )
     if tracked_status.returncode != 0:
         raise ValueError("cannot inspect tracked worktree status")
     if tracked_status.stdout.strip():
         raise ValueError("tracked worktree is not clean")
-    status = _run_git(
-        root,
+    status = git_status(
         [
             "status",
             "--porcelain=v1",
@@ -314,16 +404,30 @@ def attest_clean_environment(
         if actual != expected_hash:
             raise ValueError(f"{label} differs from its approved SHA-256")
         observed.append(actual)
-    executable = Path(sys.executable).resolve()
+    runtime = _python_runtime_configuration(root)
+    git_after = _read_executable_identity(
+        git_before.path, "trusted Git executable"
+    )
+    python_after = _read_executable_identity(
+        python_before.path, "current Python executable"
+    )
+    if git_after != git_before:
+        raise ValueError("trusted Git executable changed during source attestation")
+    if python_after != python_before or runtime.executable != python_before:
+        raise ValueError("Python executable changed during environment attestation")
     return EnvironmentAttestation(
         source_revision=revision,
         pnpm_lock_sha256=observed[0],
         python_requirements_sha256=observed[1],
         python_project_sha256=observed[2],
-        python_executable_sha256=_digest_file(
-            executable, "Python executable"
-        ),
+        git_executable_path_sha256=_path_identity_sha256(git_before.path),
+        git_executable_sha256=git_before.sha256,
+        git_version=git_version,
+        python_executable_path_sha256=_path_identity_sha256(python_before.path),
+        python_executable_sha256=python_before.sha256,
         python_version=sys.version,
+        python_import_roots_sha256=runtime.import_roots_sha256,
+        python_distributions_sha256=runtime.distributions_sha256,
     )
 
 
@@ -486,33 +590,102 @@ def compare_validation_evidence(
 
 def _write_atomic_no_clobber(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "wb") as output:
-            output.write(payload)
-            output.flush()
-            os.fsync(output.fileno())
-        try:
-            os.link(temporary, path)
-        except FileExistsError as error:
-            raise ValueError(
-                f"refusing to overwrite validation reproduction receipt: {path}"
-            ) from error
-    finally:
-        temporary.unlink(missing_ok=True)
+        publish_bytes_durable_exact(
+            path,
+            payload,
+            label="validation reproduction receipt",
+        )
+    except ValueError as error:
+        raise ValueError(
+            f"refusing to overwrite validation reproduction receipt: {path}"
+        ) from error
 
 
-def _temporary_output_paths(directory: Path) -> tuple[Path, Path]:
+def _temporary_output_paths(directory: Path) -> tuple[Path, Path, Path]:
     for _ in range(10):
         nonce = secrets.token_hex(16)
         report = directory / f".reproduction-{nonce}.report.json"
         decision = directory / f".reproduction-{nonce}.decision.json"
-        if not report.exists() and not decision.exists():
-            return report, decision
+        runtime = directory / f".reproduction-{nonce}.runtime.json"
+        if not report.exists() and not decision.exists() and not runtime.exists():
+            return report, decision, runtime
     raise ValueError("cannot allocate fresh validation reproduction outputs")
+
+
+def _scratch_identity(path: Path, label: str) -> os.stat_result:
+    """Capture one regular scratch object's pathname-bound identity."""
+
+    try:
+        observed = path.stat(follow_symlinks=False)
+    except OSError as error:
+        raise ValueError(f"cannot authenticate {label}: {path}") from error
+    if not stat.S_ISREG(observed.st_mode):
+        raise ValueError(f"{label} is not a regular file: {path}")
+    return observed
+
+
+def _same_scratch_identity(
+    expected: os.stat_result,
+    observed: os.stat_result,
+) -> bool:
+    return (
+        stat.S_ISREG(observed.st_mode)
+        and os.path.samestat(expected, observed)
+        and expected.st_size == observed.st_size
+        and expected.st_mtime_ns == observed.st_mtime_ns
+        and expected.st_ctime_ns == observed.st_ctime_ns
+    )
+
+
+def _authenticate_scratch_after_read(
+    path: Path,
+    before: os.stat_result,
+    label: str,
+) -> os.stat_result:
+    after = _scratch_identity(path, label)
+    if not _same_scratch_identity(before, after):
+        raise ValueError(f"{label} changed while it was authenticated")
+    return after
+
+
+def _cleanup_reproduction_outputs(
+    outputs: Sequence[tuple[Path, os.stat_result | None, str]],
+    primary_error: BaseException | None,
+) -> None:
+    """Remove only authenticated child outputs, preserving any replacement."""
+
+    cleanup_errors: list[str] = []
+    for path, expected, label in outputs:
+        try:
+            observed = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            cleanup_errors.append(f"cannot inspect {label}; retained {path}: {error}")
+            continue
+        if expected is None:
+            cleanup_errors.append(f"retained unauthenticated {label}: {path}")
+            continue
+        if not _same_scratch_identity(expected, observed):
+            cleanup_errors.append(f"{label} pathname changed; retained {path}")
+            continue
+        # Python has no portable conditional unlink-by-file-identity primitive.
+        # The unpredictable same-directory name plus this final identity check
+        # bounds that platform limitation; every observed mismatch is retained.
+        try:
+            path.unlink()
+        except OSError as error:
+            cleanup_errors.append(f"cannot remove {label}; retained {path}: {error}")
+    if not cleanup_errors:
+        return
+    detail = "validation reproduction cleanup incomplete: " + "; ".join(
+        cleanup_errors
+    )
+    if primary_error is not None:
+        primary_error.add_note(detail)
+        return
+    raise OSError(detail)
 
 
 def _command(
@@ -526,13 +699,25 @@ def _command(
     private_validation: Path,
     report_output: Path,
     decision_output: Path,
+    runtime_manifest_output: Path,
+    runtime: _PythonRuntimeConfiguration,
     catalogs: Sequence[Path],
     batch_size: int,
 ) -> list[str]:
     command = [
-        sys.executable,
-        "-m",
-        "ml.evaluation.validation_gate",
+        str(runtime.executable.path),
+        "-B",
+        "-s",
+        "-S",
+        "-P",
+        "-c",
+        _RUNTIME_BOOTSTRAP,
+        str(repository.resolve()),
+        json.dumps(
+            [str(root.path) for root in runtime.import_roots],
+            separators=(",", ":"),
+        ),
+        str(runtime_manifest_output.resolve()),
         str(ensemble.path.resolve()),
         str(calibration.path.resolve()),
         str(frequency.path.resolve()),
@@ -576,14 +761,12 @@ def reproduce_validation(
     expected_engine_binary_sha256: str,
     expected_engine_fingerprint: str,
     batch_size: int,
-    process_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    process_runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
 ) -> ContentAddressedFile:
     """Rerun the gate in a fresh process and publish an immutable receipt."""
 
     if batch_size <= 0:
         raise ValueError("batch size must be positive")
-    if receipt_output.exists():
-        raise ValueError("validation reproduction receipt already exists")
     if (
         attest_clean_environment(
             repository,
@@ -597,6 +780,16 @@ def reproduce_validation(
         != environment
     ):
         raise ValueError("clean environment identity is not reproducible")
+    runtime = _python_runtime_configuration(repository.resolve())
+    if (
+        runtime.executable.sha256 != environment.python_executable_sha256
+        or _path_identity_sha256(runtime.executable.path)
+        != environment.python_executable_path_sha256
+        or runtime.import_roots_sha256 != environment.python_import_roots_sha256
+        or runtime.distributions_sha256
+        != environment.python_distributions_sha256
+    ):
+        raise ValueError("authenticated Python runtime identity differs")
     evidence_directory = ensemble.path.parent.resolve()
     for path, label in (
         (original_report.path, "original report"),
@@ -635,9 +828,16 @@ def reproduce_validation(
             or audited.evaluator_nodes != 10_000
         ):
             raise ValueError("authenticated validation evaluator identity differs")
-        report_output, decision_output = _temporary_output_paths(
-            ensemble.path.parent.resolve()
-        )
+        (
+            report_output,
+            decision_output,
+            runtime_manifest_output,
+        ) = _temporary_output_paths(ensemble.path.parent.resolve())
+        cleanup_identities: dict[Path, os.stat_result | None] = {
+            report_output: None,
+            decision_output: None,
+            runtime_manifest_output: None,
+        }
         command = _command(
             repository=repository,
             ensemble=ensemble,
@@ -648,23 +848,29 @@ def reproduce_validation(
             private_validation=private_validation,
             report_output=report_output,
             decision_output=decision_output,
+            runtime_manifest_output=runtime_manifest_output,
+            runtime=runtime,
             catalogs=catalogs,
             batch_size=batch_size,
         )
-        child_environment = dict(os.environ)
-        child_environment.update(
-            {"PYTHONHASHSEED": "0", "PYTHONNOUSERSITE": "1"}
-        )
+        child_environment = _isolated_python_environment()
+        primary_error: BaseException | None = None
         try:
-            completed = process_runner(
-                command,
-                cwd=repository.resolve(),
-                env=child_environment,
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-            )
+            runner = process_runner or _run_bounded_process
+            try:
+                completed = runner(
+                    command,
+                    cwd=repository.resolve(),
+                    env=child_environment,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                )
+            except (OSError, subprocess.TimeoutExpired, UnicodeError) as error:
+                raise ValueError(
+                    "fresh validation process did not complete within its boundary"
+                ) from error
             if completed.returncode != 0:
                 raise ValueError(
                     "fresh validation process failed: "
@@ -674,18 +880,51 @@ def reproduce_validation(
                 raise ValueError(
                     "fresh validation process did not publish both outputs"
                 )
+            runtime_before = _scratch_identity(
+                runtime_manifest_output, "reproduced runtime manifest"
+            )
+            runtime_closure = _load_runtime_manifest(
+                runtime_manifest_output,
+                repository=repository.resolve(),
+                runtime=runtime,
+            )
+            cleanup_identities[runtime_manifest_output] = (
+                _authenticate_scratch_after_read(
+                    runtime_manifest_output,
+                    runtime_before,
+                    "reproduced runtime manifest",
+                )
+            )
+            report_before = _scratch_identity(
+                report_output, "reproduced report"
+            )
             reproduced_report_ref = ContentAddressedFile(
                 report_output, _digest_file(report_output, "reproduced report")
+            )
+            reproduced_report = load_validation_gate_document(
+                reproduced_report_ref, REPORT_FORMAT
+            )
+            cleanup_identities[report_output] = _authenticate_scratch_after_read(
+                report_output,
+                report_before,
+                "reproduced report",
+            )
+            decision_before = _scratch_identity(
+                decision_output, "reproduced decision"
             )
             reproduced_decision_ref = ContentAddressedFile(
                 decision_output,
                 _digest_file(decision_output, "reproduced decision"),
             )
-            reproduced_report = load_validation_gate_document(
-                reproduced_report_ref, REPORT_FORMAT
-            )
             reproduced_decision = load_validation_gate_document(
                 reproduced_decision_ref, DECISION_FORMAT
+            )
+            cleanup_identities[decision_output] = (
+                _authenticate_scratch_after_read(
+                    decision_output,
+                    decision_before,
+                    "reproduced decision",
+                )
             )
             if (
                 reproduced_decision.get("passed") is not True
@@ -717,6 +956,21 @@ def reproduce_validation(
                 raise ValueError(
                     "clean environment identity changed during reproduction"
                 )
+            if (
+                _load_runtime_manifest(
+                    runtime_manifest_output,
+                    repository=repository.resolve(),
+                    runtime=runtime,
+                )
+                != runtime_closure
+            ):
+                raise ValueError("loaded Python runtime changed before publication")
+            _authenticate_scratch_after_read(
+                runtime_manifest_output,
+                cleanup_identities[runtime_manifest_output]
+                or runtime_before,
+                "reproduced runtime manifest",
+            )
             catalog_bindings = [
                 {
                     "file": catalog.name,
@@ -760,10 +1014,25 @@ def reproduce_validation(
                         environment.python_requirements_sha256
                     ),
                     "python_project_sha256": environment.python_project_sha256,
+                    "git_executable_path_sha256": (
+                        environment.git_executable_path_sha256
+                    ),
+                    "git_executable_sha256": environment.git_executable_sha256,
+                    "git_version": environment.git_version,
+                    "python_executable_path_sha256": (
+                        environment.python_executable_path_sha256
+                    ),
                     "python_executable_sha256": (
                         environment.python_executable_sha256
                     ),
                     "python_version": environment.python_version,
+                    "python_import_roots_sha256": (
+                        environment.python_import_roots_sha256
+                    ),
+                    "python_distributions_sha256": (
+                        environment.python_distributions_sha256
+                    ),
+                    "python_runtime": runtime_closure,
                 },
                 "evaluator": {
                     "engine_binary_sha256": audited.engine_binary_sha256,
@@ -800,9 +1069,30 @@ def reproduce_validation(
             )
             load_validation_reproduction_receipt(receipt)
             return receipt
+        except BaseException as error:
+            primary_error = error
+            raise
         finally:
-            report_output.unlink(missing_ok=True)
-            decision_output.unlink(missing_ok=True)
+            _cleanup_reproduction_outputs(
+                (
+                    (
+                        report_output,
+                        cleanup_identities[report_output],
+                        "reproduced report",
+                    ),
+                    (
+                        decision_output,
+                        cleanup_identities[decision_output],
+                        "reproduced decision",
+                    ),
+                    (
+                        runtime_manifest_output,
+                        cleanup_identities[runtime_manifest_output],
+                        "reproduced runtime manifest",
+                    ),
+                ),
+                primary_error,
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:

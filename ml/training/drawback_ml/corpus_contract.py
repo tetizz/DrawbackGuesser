@@ -20,6 +20,7 @@ from .evaluator_schedule_contract import (
     ExpectedEvaluatorSlot,
     expected_balanced_slots,
 )
+from .path_validation import is_portable_safe_basename, portable_basename_key
 from .splits import Split, assign_split
 from .symbolic_schema import SYMBOLIC_FEATURE_VERSION, SYMBOLIC_RULE_IDS
 
@@ -898,9 +899,19 @@ def _validate_manifest_identity(
     total_games = 0
     total_rows = 0
     seen_seeds: set[int] = set()
+    seen_split_files: set[str] = set()
     for split in SPLITS:
         entry = _mapping(split_entries[split], f"splits.{split}")
         _exact_keys(entry, EXPECTED_SPLIT_KEYS, f"splits.{split}")
+        file_name = entry["file"]
+        if not is_portable_safe_basename(file_name):
+            raise CorpusContractError(
+                f"splits.{split}.file must be a portable manifest-adjacent basename"
+            )
+        file_key = portable_basename_key(file_name)
+        if file_key in seen_split_files:
+            raise CorpusContractError("corpus split files are not portable-distinct")
+        seen_split_files.add(file_key)
         games = _positive_int(entry["games"], f"splits.{split}.games")
         rows = _nonnegative_int(entry["rows"], f"splits.{split}.rows")
         if games != _positive_int(split_sizes[split], f"splitSizes.{split}"):
@@ -960,14 +971,19 @@ def _audit_loaded_corpus_split(
 ) -> AuditedCorpusSplit:
     """Audit an already authenticated split without consulting sibling manifests."""
     file_name = _string(entry["file"], f"splits.{split}.file")
-    if Path(file_name).name != file_name:
-        raise CorpusContractError("split file must be a manifest-adjacent basename")
+    if not is_portable_safe_basename(file_name):
+        raise CorpusContractError(
+            "split file must be a portable manifest-adjacent basename"
+        )
     dataset_path = (
         dataset_path_override.resolve()
         if dataset_path_override is not None
         else manifest_path.parent / file_name
     )
-    if dataset_path.name != file_name:
+    if (
+        not is_portable_safe_basename(dataset_path.name)
+        or dataset_path.name != file_name
+    ):
         raise CorpusContractError("dataset basename disagrees with private manifest")
     expected_digest = _digest(entry["sha256"], f"splits.{split}.sha256")
     expected_bytes = _nonnegative_int(entry["bytes"], f"splits.{split}.bytes")
@@ -1969,9 +1985,11 @@ def _audit_hard_negative_handles(
         raise CorpusContractError("hard-negative train totals are invalid")
     if _positive_safe_int(train["rows"], "splits.train.rows") <= 0:
         raise CorpusContractError("hard-negative training corpus must contain rows")
+    train_file = train["file"]
     if (
-        train["file"] != dataset_path.name
-        or Path(dataset_path.name).name != dataset_path.name
+        not is_portable_safe_basename(train_file)
+        or not is_portable_safe_basename(dataset_path.name)
+        or train_file != dataset_path.name
     ):
         raise CorpusContractError("hard-negative dataset basename is invalid")
     seeds = _seed_list(train["seeds"], "splits.train.seeds")

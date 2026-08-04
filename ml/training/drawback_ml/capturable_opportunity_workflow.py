@@ -33,6 +33,7 @@ from .capturable_candidate_selection import (
     load_treatment_comparison,
 )
 from .capturable_experiment import (
+    _consumption_registry,
     _load_bound_selection_checkpoint,
     _load_stable_capturable_dataset,
     _training_config_from_json,
@@ -45,6 +46,7 @@ from .capturable_records import (
     CapturableDatasetRow,
 )
 from .durable_publish import publish_bytes_durable
+from .path_validation import is_portable_safe_basename
 
 
 OPPORTUNITY_WORKFLOW_VERSION = 2
@@ -55,9 +57,13 @@ CONSUMPTION_FORMAT = (
     "drawbackguesser-schema9-opportunity-sealed-test-consumption"
 )
 CORPUS_LEDGER_FORMAT = "drawbackguesser-schema9-corpus-ledger"
-CORPUS_LEDGER_VERSION = 2
+CORPUS_LEDGER_VERSION = 3
 LEDGER_VERIFICATION_FORMAT = "drawbackguesser-schema9-ledger-verification"
-LEDGER_VERIFICATION_VERSION = 1
+LEDGER_VERIFICATION_VERSION = 2
+PRODUCER_RUNTIME_FORMAT = "drawbackengine-schema9-producer-runtime"
+PRODUCER_RUNTIME_VERSION = 1
+PRODUCER_RUNTIME_ALGORITHM = "sha256-engine-runtime-tree-v1"
+PRODUCER_RUNTIME_STRING = re.compile(r"[0-9A-Za-z._-]+")
 CORPUS_LEDGER_SPLITS = (
     "train",
     "validation-a",
@@ -86,7 +92,6 @@ _FULL_GIT_COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _SCHEDULE_ID = re.compile(
     r"[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?\Z"
 )
-_SAFE_BASENAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
 _PRIVATE_TOKEN = re.compile(
     r"(?:password|passwd|secret|credential|api[-_.]?key|token)",
     re.IGNORECASE,
@@ -279,17 +284,7 @@ def _safe_basename(value: Any, label: str) -> str:
         if token is not None and len(token.strip()) >= 3
     }
     if (
-        not isinstance(value, str)
-        or not value
-        or _SAFE_BASENAME.fullmatch(value) is None
-        or PureWindowsPath(value).name != value
-        or PurePosixPath(value).name != value
-        or PureWindowsPath(value).drive
-        or ":" in value
-        or value[-1] in {" ", "."}
-        or any(ord(character) < 32 for character in value)
-        or _WINDOWS_RESERVED_BASENAME.fullmatch(value) is not None
-        or value in {".", ".."}
+        not is_portable_safe_basename(value)
         or _PRIVATE_TOKEN.search(value) is not None
         or any(token in lowered for token in environment_tokens)
     ):
@@ -298,7 +293,12 @@ def _safe_basename(value: Any, label: str) -> str:
 
 
 def _nonnegative_count(value: Any, label: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > 9_007_199_254_740_991
+    ):
         raise CapturableDatasetError(
             f"{label} must be a non-negative integer"
         )
@@ -306,7 +306,12 @@ def _nonnegative_count(value: Any, label: str) -> int:
 
 
 def _positive_count(value: Any, label: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value <= 0
+        or value > 9_007_199_254_740_991
+    ):
         raise CapturableDatasetError(f"{label} must be a positive integer")
     return value
 
@@ -392,6 +397,100 @@ def _ledger_receipt(
     return receipt
 
 
+def _producer_runtime_identity(
+    value: Any,
+    label: str,
+) -> Mapping[str, Any]:
+    identity = _mapping(value, label)
+    _exact_keys(
+        identity,
+        {
+            "format",
+            "version",
+            "algorithm",
+            "runtime",
+            "coordinator",
+            "parallelWorker",
+            "aggregateSha256",
+        },
+        label,
+    )
+    if (
+        identity.get("format") != PRODUCER_RUNTIME_FORMAT
+        or type(identity.get("version")) is not int
+        or identity.get("version") != PRODUCER_RUNTIME_VERSION
+        or identity.get("algorithm") != PRODUCER_RUNTIME_ALGORITHM
+    ):
+        raise CapturableDatasetError(
+            f"{label} format, version, or algorithm is unsupported"
+        )
+    runtime = _mapping(identity.get("runtime"), f"{label} runtime")
+    _exact_keys(
+        runtime,
+        {"nodeVersion", "platform", "architecture", "execArgv"},
+        f"{label} runtime",
+    )
+    node_version = runtime.get("nodeVersion")
+    platform = runtime.get("platform")
+    architecture = runtime.get("architecture")
+    if (
+        not isinstance(node_version, str)
+        or re.fullmatch(
+            r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?",
+            node_version,
+        )
+        is None
+        or not isinstance(platform, str)
+        or PRODUCER_RUNTIME_STRING.fullmatch(platform) is None
+        or not isinstance(architecture, str)
+        or PRODUCER_RUNTIME_STRING.fullmatch(architecture) is None
+        or not isinstance(runtime.get("execArgv"), list)
+        or runtime.get("execArgv") != []
+    ):
+        raise CapturableDatasetError(f"{label} runtime is invalid")
+    for component_name, expected_id in (
+        ("coordinator", "schema9-coordinator/v1"),
+        ("parallelWorker", "player-private-parallel-worker/v1"),
+    ):
+        component = _mapping(
+            identity.get(component_name),
+            f"{label} {component_name}",
+        )
+        _exact_keys(
+            component,
+            {"componentId", "files", "bytes", "sha256"},
+            f"{label} {component_name}",
+        )
+        if component.get("componentId") != expected_id:
+            raise CapturableDatasetError(
+                f"{label} {component_name} componentId is unsupported"
+            )
+        _positive_count(
+            component.get("files"),
+            f"{label} {component_name} files",
+        )
+        _positive_count(
+            component.get("bytes"),
+            f"{label} {component_name} bytes",
+        )
+        _sha256(
+            component.get("sha256"),
+            f"{label} {component_name} SHA-256",
+        )
+    aggregate = _sha256(
+        identity.get("aggregateSha256"),
+        f"{label} aggregate SHA-256",
+    )
+    payload = {
+        key: item
+        for key, item in identity.items()
+        if key != "aggregateSha256"
+    }
+    if hashlib.sha256(_canonical_json(payload)).hexdigest() != aggregate:
+        raise CapturableDatasetError(f"{label} aggregate is inconsistent")
+    return identity
+
+
 def _ledger_split(
     value: Any,
     expected_split: str,
@@ -405,6 +504,7 @@ def _ledger_split(
             "scheduleId",
             "seedRoots",
             "producerEngineCommit",
+            "producerRuntimeIdentity",
             "generatorReceipts",
             "scheduleProfile",
             "sourceTrace",
@@ -456,6 +556,10 @@ def _ledger_split(
         raise CapturableDatasetError(
             f"{label} producerEngineCommit is invalid"
         )
+    _producer_runtime_identity(
+        split.get("producerRuntimeIdentity"),
+        f"{label} producer runtime identity",
+    )
 
     receipts = _mapping(
         split.get("generatorReceipts"),
@@ -750,6 +854,9 @@ def _ledger_verification_input_set(
                 "scheduleId": split.get("scheduleId"),
                 "seedRoots": split.get("seedRoots"),
                 "producerEngineCommit": split.get("producerEngineCommit"),
+                "producerRuntimeIdentity": split.get(
+                    "producerRuntimeIdentity"
+                ),
                 "generatorReceipts": split.get("generatorReceipts"),
                 "sourceTrace": {
                     "sha256": source.get("sha256"),
@@ -939,6 +1046,7 @@ def _load_corpus_ledger(
             "converterEngineCommit",
             "producerConverterPolicy",
             "execution",
+            "producerRuntimeIdentity",
         },
         f"{path.name} corpus ledger identity",
     )
@@ -958,6 +1066,10 @@ def _load_corpus_ledger(
     _ledger_execution_identity(
         identity.get("execution"),
         f"{path.name} corpus ledger execution identity",
+    )
+    producer_runtime_identity = _producer_runtime_identity(
+        identity.get("producerRuntimeIdentity"),
+        f"{path.name} corpus ledger producer runtime identity",
     )
 
     schedule_contract = _mapping(
@@ -1052,6 +1164,13 @@ def _load_corpus_ledger(
     ):
         raise CapturableDatasetError(
             f"{path.name} exact/v1 producer identity is inconsistent"
+        )
+    if any(
+        split.get("producerRuntimeIdentity") != producer_runtime_identity
+        for split in splits.values()
+    ):
+        raise CapturableDatasetError(
+            f"{path.name} producer runtime identity differs across splits"
         )
     seen_game_ids: set[Any] = set()
     seen_seed_values: set[Any] = set()
@@ -1175,6 +1294,9 @@ def _corpus_ledger_reference(
         "executionAggregateSha256": identity["execution"][
             "aggregateSha256"
         ],
+        "producerRuntimeAggregateSha256": identity[
+            "producerRuntimeIdentity"
+        ]["aggregateSha256"],
         "sealedCorpusIdentitySha256": sealed_identity,
     }
 
@@ -2353,15 +2475,18 @@ def _build_sealed_result(
 def consumption_marker_path(
     stage_b_path: Path,
     sealed_corpus_identity_sha256: str,
+    *,
+    consumption_registry: Path | None = None,
 ) -> Path:
-    """Return the one marker canonically keyed by the sealed corpus."""
+    """Return the trusted-local marker keyed by the sealed corpus."""
 
+    del stage_b_path  # Compatibility only; caller-selected paths lack authority.
     digest = _sha256(
         sealed_corpus_identity_sha256,
         "sealed corpus identity SHA-256",
     )
-    return stage_b_path.with_name(
-        f"sealed-test-consumption-{digest}.json"
+    return _consumption_registry(consumption_registry) / (
+        f"schema9-opportunity-{digest}.json"
     )
 
 
@@ -2404,8 +2529,9 @@ def run_sealed_test(
     corpus_ledger_path: Path,
     corpus_ledger_sha256: str,
     corpus_ledger_verification_receipt_sha256: str,
+    consumption_registry: Path | None = None,
 ) -> Mapping[str, Any]:
-    """Consume the sealed test once after replaying Stage-B authorization."""
+    """Record trusted-local use after replaying Stage-B authorization."""
 
     _safe_basename(output_path.name, "sealed-test output filename")
     _safe_basename(stage_b_path.name, "Stage B filename")
@@ -2448,6 +2574,7 @@ def run_sealed_test(
     marker_path = consumption_marker_path(
         stage_b_path,
         sealed_identity,
+        consumption_registry=consumption_registry,
     )
     marker = _consumption_artifact(
         stage_b_path,
@@ -2508,6 +2635,7 @@ def load_sealed_test(
     corpus_ledger_path: Path,
     corpus_ledger_sha256: str,
     corpus_ledger_verification_receipt_sha256: str,
+    consumption_registry: Path | None = None,
 ) -> tuple[Mapping[str, Any], str]:
     """Authenticate a consumed report without reopening the sealed test."""
 
@@ -2590,7 +2718,11 @@ def load_sealed_test(
         expected_marker.get("sealedCorpusIdentitySha256"),
         "sealed corpus identity SHA-256",
     )
-    canonical_marker = consumption_marker_path(stage_b_path, marker_identity)
+    canonical_marker = consumption_marker_path(
+        stage_b_path,
+        marker_identity,
+        consumption_registry=consumption_registry,
+    )
     if marker_name != canonical_marker.name:
         raise CapturableDatasetError(
             f"{path.name} consumption marker filename is invalid"

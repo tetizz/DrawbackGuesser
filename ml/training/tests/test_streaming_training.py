@@ -187,6 +187,19 @@ class StreamingTrainingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "auxiliary loss weights"):
             TrainingConfig(seed=1, trigger_loss_weight=float("nan"))
 
+    def test_seed_and_learning_rate_reject_invalid_numeric_values(self) -> None:
+        for seed in (True, -1):
+            with self.subTest(seed=seed):
+                with self.assertRaisesRegex(ValueError, "non-negative integer"):
+                    TrainingConfig(seed=seed)  # type: ignore[arg-type]
+        for learning_rate in (True, float("nan"), float("inf"), 0.0):
+            with self.subTest(learning_rate=learning_rate):
+                with self.assertRaisesRegex(ValueError, "finite and positive"):
+                    TrainingConfig(
+                        seed=1,
+                        learning_rate=learning_rate,  # type: ignore[arg-type]
+                    )
+
     def test_staged_output_is_atomic_and_failure_is_retryable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

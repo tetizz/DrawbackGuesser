@@ -14,6 +14,14 @@ This protocol decides whether one current-catalog neural ensemble may advance
 from research to a one-time sealed-test evaluation and, if that test passes,
 to a post-game browser release review.
 
+"One-time" is a trusted-operator protocol requirement, not a global technical
+guarantee. The current opener records a create-only marker under one Git common
+directory, which prevents accidental or repeated use only for worktrees that
+share and preserve that directory. The marker is user-deletable and is absent
+from another clone. Global one-shot enforcement requires an external
+append-only authority or a signed single-use lease from that authority, keyed
+by sealed-corpus identity; neither exists in this repository.
+
 It does not authorize:
 
 - a live-game assistant;

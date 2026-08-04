@@ -5,13 +5,16 @@ from __future__ import annotations
 import argparse
 import chess.pgn
 from contextlib import ExitStack, contextmanager
+import ctypes
+from ctypes import wintypes
 from dataclasses import dataclass
 import hashlib
 from html.parser import HTMLParser
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import signal
 import shutil
 import subprocess
 import tempfile
@@ -21,6 +24,8 @@ from typing import Iterator, Mapping, Sequence
 from ml.training.drawback_ml.records import FeatureRecord
 from ml.training.drawback_ml.symbolic_schema import SYMBOLIC_RULE_IDS
 from ml.training.drawback_ml.ensemble import load_hybrid_ensemble
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable
+from ml.training.drawback_ml.path_validation import is_portable_safe_basename
 
 from .validation_gate import PROTOCOL_ID, _canonical_pretty
 from .ensemble_calibration import ContentAddressedFile, load_ensemble_calibration
@@ -70,6 +75,619 @@ PUBLIC_FIXTURE_AGENTS = (
     "human-like-weak",
     "greedy-material",
 )
+PROCESS_TERMINATION_GRACE_SECONDS = 5.0
+GIT_TIMEOUT_SECONDS = 30
+BUILD_TIMEOUT_SECONDS = 20 * 60
+BROWSER_VERSION_TIMEOUT_SECONDS = 30
+BROWSER_TIMEOUT_SECONDS = 180
+CREATE_SUSPENDED = 0x00000004
+JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+WINDOWS_PATHEXT = ".COM;.EXE;.BAT;.CMD"
+
+
+class _JobObjectBasicLimitInformation(ctypes.Structure):
+    _fields_ = (
+        ("per_process_user_time_limit", ctypes.c_int64),
+        ("per_job_user_time_limit", ctypes.c_int64),
+        ("limit_flags", wintypes.DWORD),
+        ("minimum_working_set_size", ctypes.c_size_t),
+        ("maximum_working_set_size", ctypes.c_size_t),
+        ("active_process_limit", wintypes.DWORD),
+        ("affinity", ctypes.c_size_t),
+        ("priority_class", wintypes.DWORD),
+        ("scheduling_class", wintypes.DWORD),
+    )
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = tuple(
+        (name, ctypes.c_uint64)
+        for name in (
+            "read_operation_count",
+            "write_operation_count",
+            "other_operation_count",
+            "read_transfer_count",
+            "write_transfer_count",
+            "other_transfer_count",
+        )
+    )
+
+
+class _JobObjectExtendedLimitInformation(ctypes.Structure):
+    _fields_ = (
+        ("basic_limit_information", _JobObjectBasicLimitInformation),
+        ("io_info", _IoCounters),
+        ("process_memory_limit", ctypes.c_size_t),
+        ("job_memory_limit", ctypes.c_size_t),
+        ("peak_process_memory_used", ctypes.c_size_t),
+        ("peak_job_memory_used", ctypes.c_size_t),
+    )
+
+
+class _WindowsJob:
+    def __init__(self) -> None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_job = kernel32.CreateJobObjectW
+        create_job.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+        create_job.restype = wintypes.HANDLE
+        handle = create_job(None, None)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        self._handle: wintypes.HANDLE | None = handle
+        information = _JobObjectExtendedLimitInformation()
+        information.basic_limit_information.limit_flags = (
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        )
+        set_information = kernel32.SetInformationJobObject
+        set_information.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        )
+        set_information.restype = wintypes.BOOL
+        if not set_information(
+            handle,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            error = ctypes.WinError(ctypes.get_last_error())
+            self.close()
+            raise error
+
+    def assign_and_resume(self, process: subprocess.Popen[str]) -> None:
+        if self._handle is None:
+            raise OSError("process containment is already closed")
+        raw_process_handle = getattr(process, "_handle", None)
+        if raw_process_handle is None:
+            raise OSError("spawned process handle is unavailable")
+        process_handle = wintypes.HANDLE(int(raw_process_handle))
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        assign = kernel32.AssignProcessToJobObject
+        assign.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        assign.restype = wintypes.BOOL
+        if not assign(self._handle, process_handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        ntdll = ctypes.WinDLL("ntdll")
+        resume = ntdll.NtResumeProcess
+        resume.argtypes = (wintypes.HANDLE,)
+        resume.restype = ctypes.c_long
+        status = int(resume(process_handle))
+        if status < 0:
+            raise OSError(
+                "cannot resume contained process: "
+                f"NTSTATUS 0x{status & 0xFFFF_FFFF:08x}"
+            )
+
+    def close(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+        if not close_handle(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        self._handle = None
+
+
+def _popen_contained(
+    arguments: Sequence[str],
+    **options: object,
+) -> tuple[subprocess.Popen[str], _WindowsJob | None]:
+    if os.name != "nt":
+        options["start_new_session"] = True
+        return subprocess.Popen(list(arguments), **options), None
+    job = _WindowsJob()
+    options["creationflags"] = int(options.get("creationflags", 0)) | getattr(
+        subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+    ) | CREATE_SUSPENDED
+    try:
+        process: subprocess.Popen[str] = subprocess.Popen(
+            list(arguments), **options
+        )
+    except BaseException:
+        job.close()
+        raise
+    try:
+        job.assign_and_resume(process)
+    except BaseException as error:
+        try:
+            job.close()
+        except BaseException as cleanup_error:
+            error.add_note(f"job cleanup also failed: {cleanup_error!r}")
+        try:
+            process.kill()
+            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        _close_process_streams(process)
+        raise
+    return process, job
+
+
+@dataclass(frozen=True)
+class _ExecutableIdentity:
+    path: Path
+    sha256: str
+    stat: tuple[int, int, int, int, int]
+
+
+@dataclass(frozen=True)
+class _PublishedIdentity:
+    path: Path
+    sha256: str
+    stat: tuple[int, int, int, int, int]
+
+
+def _stat_identity(path: Path) -> tuple[int, int, int, int, int]:
+    status = path.stat()
+    return (
+        status.st_dev,
+        status.st_ino,
+        status.st_size,
+        status.st_mtime_ns,
+        status.st_ctime_ns,
+    )
+
+
+def _authenticated_git() -> _ExecutableIdentity:
+    raw_path = os.environ.get("DRAWBACK_AUTHENTICATED_GIT")
+    expected_sha256 = os.environ.get("DRAWBACK_AUTHENTICATED_GIT_SHA256")
+    if (
+        raw_path is None
+        or expected_sha256 is None
+        or len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        raise ValueError("authenticated Git executable binding is unavailable")
+    unresolved = Path(raw_path)
+    if not unresolved.is_absolute() or unresolved.is_symlink():
+        raise ValueError("authenticated Git executable path is invalid")
+    try:
+        path = unresolved.resolve(strict=True)
+        payload = path.read_bytes()
+        stat_identity = _stat_identity(path)
+    except OSError as error:
+        raise ValueError("authenticated Git executable is unavailable") from error
+    if not path.is_file() or _sha256(payload) != expected_sha256:
+        raise ValueError("authenticated Git executable digest differs")
+    return _ExecutableIdentity(path, expected_sha256, stat_identity)
+
+
+def _reauthenticate_git(identity: _ExecutableIdentity) -> None:
+    if _authenticated_git() != identity:
+        raise ValueError("authenticated Git executable changed during use")
+
+
+def _sanitized_git_environment() -> Mapping[str, str]:
+    environment = {
+        "GIT_ASKPASS": os.devnull,
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GCM_INTERACTIVE": "never",
+        "SSH_ASKPASS": os.devnull,
+        "SSH_ASKPASS_REQUIRE": "never",
+    }
+    if os.name == "nt":
+        environment.update(_windows_process_environment())
+    else:
+        environment.update(
+            {
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": os.defpath,
+            }
+        )
+    return environment
+
+
+def _hardened_git_command(
+    executable: Path,
+    *arguments: str,
+) -> list[str]:
+    """Build a read-only Git command without executable config hooks."""
+
+    command = [str(executable)]
+    for key, value in (
+        ("core.attributesFile", ""),
+        ("core.excludesFile", ""),
+        ("core.fsmonitor", "false"),
+        ("core.hooksPath", os.devnull),
+        ("core.askPass", os.devnull),
+        ("credential.helper", ""),
+        ("credential.interactive", "false"),
+    ):
+        command.extend(("-c", f"{key}={value}"))
+    command.extend(arguments)
+    return command
+
+
+def _reject_executable_git_filters(
+    executable: Path,
+    *,
+    repository: Path,
+    environment: Mapping[str, str],
+) -> None:
+    """Reject effective local/worktree filters before Git reads the tree."""
+
+    try:
+        configured = _run_process(
+            _hardened_git_command(
+                executable,
+                "-C",
+                str(repository),
+                "config",
+                "--includes",
+                "--show-scope",
+                "--name-only",
+                "--list",
+            ),
+            check=True,
+            capture_output=True,
+            timeout=GIT_TIMEOUT_SECONDS,
+            environment=environment,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError(
+            "cannot authenticate executable Git filter configuration"
+        ) from error
+    for line in configured.stdout.splitlines():
+        fields = line.split(maxsplit=1)
+        if len(fields) != 2:
+            raise ValueError(
+                "Git filter configuration probe returned malformed output"
+            )
+        scope, key = fields[0].casefold(), fields[1].casefold()
+        if (
+            scope in {"local", "worktree"}
+            and key.startswith("filter.")
+            and key.rsplit(".", maxsplit=1)[-1]
+            in {"clean", "smudge", "process"}
+        ):
+            raise ValueError(
+                "repository config contains an executable Git filter"
+            )
+
+
+def _gitlink_paths(index: str) -> tuple[PurePosixPath, ...]:
+    paths: list[PurePosixPath] = []
+    for record in index.split("\0"):
+        if not record:
+            continue
+        header, separator, raw_path = record.partition("\t")
+        fields = header.split()
+        if (
+            not separator
+            or len(fields) != 3
+            or not raw_path
+            or "\\" in raw_path
+            or "\ufffd" in raw_path
+        ):
+            raise ValueError("Git index probe returned malformed output")
+        if fields[0] != "160000" or fields[2] != "0":
+            continue
+        path = PurePosixPath(raw_path)
+        if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+            raise ValueError("Git index contains an unsafe gitlink path")
+        paths.append(path)
+    return tuple(paths)
+
+
+def _preflight_recursive_git_filters(
+    executable: Path,
+    *,
+    repository: Path,
+    environment: Mapping[str, str],
+) -> tuple[Path, ...]:
+    """Reject executable filters in every checked-out nested worktree."""
+
+    try:
+        root = repository.resolve(strict=True)
+    except OSError as error:
+        raise ValueError("cannot resolve repository for Git preflight") from error
+    pending = [root]
+    repositories: list[Path] = []
+    seen: set[Path] = set()
+    while pending:
+        current = pending.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        try:
+            top_level = _run_process(
+                _hardened_git_command(
+                    executable, "rev-parse", "--show-toplevel"
+                ),
+                cwd=current,
+                check=True,
+                capture_output=True,
+                timeout=GIT_TIMEOUT_SECONDS,
+                environment=environment,
+            ).stdout.strip()
+            authenticated_current = Path(top_level).resolve(strict=True)
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            raise ValueError(
+                "cannot authenticate repository worktree root"
+            ) from error
+        if authenticated_current != current:
+            raise ValueError("repository resolves to a different worktree root")
+        _reject_executable_git_filters(
+            executable,
+            repository=current,
+            environment=environment,
+        )
+        try:
+            index = _run_process(
+                _hardened_git_command(executable, "ls-files", "--stage", "-z"),
+                cwd=current,
+                check=True,
+                capture_output=True,
+                timeout=GIT_TIMEOUT_SECONDS,
+                environment=environment,
+            ).stdout
+        except (OSError, subprocess.SubprocessError) as error:
+            raise ValueError("cannot enumerate repository gitlinks") from error
+        repositories.append(current)
+        for relative in reversed(_gitlink_paths(index)):
+            candidate = current.joinpath(*relative.parts)
+            metadata = candidate / ".git"
+            try:
+                if not candidate.exists():
+                    continue
+                if (
+                    not candidate.is_dir()
+                    or candidate.is_symlink()
+                ):
+                    raise ValueError(
+                        "checked-out gitlink has an unsafe worktree boundary"
+                    )
+                if not metadata.exists():
+                    continue
+                if metadata.is_symlink():
+                    raise ValueError(
+                        "checked-out gitlink has unsafe Git metadata"
+                    )
+                resolved = candidate.resolve(strict=True)
+                metadata_resolved = metadata.resolve(strict=True)
+            except OSError as error:
+                raise ValueError(
+                    "cannot authenticate checked-out gitlink worktree"
+                ) from error
+            if (
+                resolved != Path(os.path.abspath(candidate))
+                or not resolved.is_relative_to(root)
+                or (
+                    metadata.is_dir()
+                    and metadata_resolved != Path(os.path.abspath(metadata))
+                )
+            ):
+                raise ValueError("checked-out gitlink escapes the repository worktree")
+            try:
+                top_level = _run_process(
+                    _hardened_git_command(
+                        executable, "rev-parse", "--show-toplevel"
+                    ),
+                    cwd=resolved,
+                    check=True,
+                    capture_output=True,
+                    timeout=GIT_TIMEOUT_SECONDS,
+                    environment=environment,
+                ).stdout.strip()
+                authenticated = Path(top_level).resolve(strict=True)
+            except (OSError, subprocess.SubprocessError) as error:
+                raise ValueError(
+                    "cannot authenticate checked-out gitlink repository"
+                ) from error
+            if authenticated != resolved:
+                raise ValueError(
+                    "checked-out gitlink resolves to a different worktree"
+                )
+            pending.append(resolved)
+    return tuple(repositories)
+
+
+def _close_process_streams(process: subprocess.Popen[str]) -> None:
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def _windows_runtime_paths() -> tuple[Path, Path, Path]:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    def known_directory(function_name: str) -> Path:
+        buffer = ctypes.create_unicode_buffer(32_768)
+        function = getattr(kernel32, function_name)
+        function.argtypes = (wintypes.LPWSTR, wintypes.UINT)
+        function.restype = wintypes.UINT
+        length = function(buffer, len(buffer))
+        if length == 0 or length >= len(buffer):
+            raise OSError(f"{function_name} failed")
+        directory = Path(buffer.value).resolve(strict=True)
+        if not directory.is_dir():
+            raise OSError(f"{function_name} returned a non-directory")
+        return directory
+
+    system_directory = known_directory("GetSystemDirectoryW")
+    windows_directory = known_directory("GetWindowsDirectoryW")
+    command_processor = (system_directory / "cmd.exe").resolve(strict=True)
+    if (
+        not command_processor.is_file()
+        or command_processor.parent != system_directory
+    ):
+        raise OSError("Windows command processor is outside System32")
+    return windows_directory, system_directory, command_processor
+
+
+def _windows_process_environment(
+    runtime_paths: tuple[Path, Path, Path] | None = None,
+) -> dict[str, str]:
+    windows_directory, system_directory, command_processor = (
+        runtime_paths if runtime_paths is not None else _windows_runtime_paths()
+    )
+    return {
+        "SystemRoot": str(windows_directory),
+        "WINDIR": str(windows_directory),
+        "ComSpec": str(command_processor),
+        "PATH": str(system_directory),
+        "PATHEXT": WINDOWS_PATHEXT,
+    }
+
+
+def _windows_taskkill(process_id: int) -> None:
+    runtime_paths = _windows_runtime_paths()
+    _, system_directory, _ = runtime_paths
+    taskkill = (system_directory / "taskkill.exe").resolve(strict=True)
+    if taskkill.parent != system_directory:
+        raise OSError("taskkill resolved outside the Windows system directory")
+    taskkill_identity = _stat_identity(taskkill)
+    completed = subprocess.run(
+        [str(taskkill), "/PID", str(process_id), "/T", "/F"],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=PROCESS_TERMINATION_GRACE_SECONDS,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        env=_windows_process_environment(runtime_paths),
+    )
+    if _stat_identity(taskkill) != taskkill_identity:
+        raise OSError("taskkill identity changed during process-tree cleanup")
+    if completed.returncode != 0:
+        raise OSError(
+            f"taskkill failed with exit code {completed.returncode}"
+        )
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen[str],
+    containment: _WindowsJob | None,
+) -> None:
+    cleanup_error: BaseException | None = None
+    if os.name == "nt":
+        try:
+            if containment is None:
+                _windows_taskkill(process.pid)
+            else:
+                containment.close()
+        except (OSError, subprocess.SubprocessError) as error:
+            cleanup_error = error
+            try:
+                process.kill()
+            except OSError:
+                pass
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+    finally:
+        _close_process_streams(process)
+    if cleanup_error is not None:
+        raise OSError("Windows process-tree cleanup failed") from cleanup_error
+
+
+def _run_process(
+    arguments: Sequence[str],
+    *,
+    cwd: Path | None = None,
+    check: bool,
+    capture_output: bool,
+    timeout: int,
+    environment: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    process, containment = _popen_contained(
+        arguments,
+        cwd=cwd,
+        shell=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE if capture_output else None,
+        stderr=subprocess.PIPE if capture_output else None,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=dict(environment) if environment is not None else None,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except BaseException as error:
+        try:
+            _terminate_process_tree(process, containment)
+        except BaseException as cleanup_error:
+            error.add_note(f"process-tree cleanup also failed: {cleanup_error!r}")
+        raise
+    completed = subprocess.CompletedProcess(
+        list(arguments), process.returncode, stdout, stderr
+    )
+    child_error = None
+    if completed.returncode != 0:
+        child_error = subprocess.CalledProcessError(
+            completed.returncode,
+            completed.args,
+            output=completed.stdout,
+            stderr=completed.stderr,
+        )
+    try:
+        _terminate_process_tree(process, containment)
+    except BaseException as cleanup_error:
+        if child_error is not None:
+            child_error.add_note(
+                f"process-tree cleanup also failed: {cleanup_error!r}"
+            )
+            raise child_error from cleanup_error
+        raise
+    if check and child_error is not None:
+        raise child_error
+    return completed
 
 
 @dataclass(frozen=True)
@@ -408,29 +1026,40 @@ def build_public_parity_input(
     fixture_digest = _sha256(
         _canonical_pretty({"partition": partition, "cases": cases})
     )
-    revision = subprocess.run(
-        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+    git = _authenticated_git()
+    git_environment = _sanitized_git_environment()
+    revision = _run_process(
+        _hardened_git_command(
+            git.path, "-C", str(repository), "rev-parse", "HEAD"
+        ),
         check=True,
         capture_output=True,
-        text=True,
-        encoding="utf-8",
+        timeout=GIT_TIMEOUT_SECONDS,
+        environment=git_environment,
     ).stdout.strip()
-    source_status = subprocess.run(
-        [
-            "git",
+    _preflight_recursive_git_filters(
+        git.path,
+        repository=repository,
+        environment=git_environment,
+    )
+    source_status = _run_process(
+        _hardened_git_command(
+            git.path,
             "-C",
             str(repository),
             "status",
             "--porcelain",
             "--untracked-files=all",
+            "--ignore-submodules=none",
             "--",
             *SOURCE_PATHS,
-        ],
+        ),
         check=True,
         capture_output=True,
-        text=True,
-        encoding="utf-8",
+        timeout=GIT_TIMEOUT_SECONDS,
+        environment=git_environment,
     ).stdout.strip()
+    _reauthenticate_git(git)
     if source_status:
         raise ValueError("parity input production requires a clean source HEAD")
     value: Mapping[str, object] = {
@@ -455,9 +1084,7 @@ def build_public_parity_input(
         "cases": cases,
     }
     payload = _canonical_pretty(value)
-    descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    with os.fdopen(descriptor, "wb") as destination:
-        destination.write(payload)
+    publish_bytes_durable(output, payload)
     return value
 
 
@@ -556,8 +1183,7 @@ def load_authenticated_input(
             "maxPlies": PUBLIC_FIXTURE_MAX_PLIES,
             "agentSchedule": list(PUBLIC_FIXTURE_AGENTS),
         }
-        or not isinstance(public_fixture.get("file"), str)
-        or Path(str(public_fixture["file"])).name != public_fixture["file"]
+        or not is_portable_safe_basename(public_fixture.get("file"))
         or not isinstance(public_fixture.get("sha256"), str)
         or len(str(public_fixture["sha256"])) != 64
     ):
@@ -699,29 +1325,40 @@ def authenticate_runtime_bindings(
         != bindings.get("pnpmLockSha256")
     ):
         raise ValueError("candidate or dependency binding differs")
-    revision = subprocess.run(
-        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+    git = _authenticated_git()
+    git_environment = _sanitized_git_environment()
+    revision = _run_process(
+        _hardened_git_command(
+            git.path, "-C", str(repository), "rev-parse", "HEAD"
+        ),
         check=True,
         capture_output=True,
-        text=True,
-        encoding="utf-8",
+        timeout=GIT_TIMEOUT_SECONDS,
+        environment=git_environment,
     ).stdout.strip()
-    dirty = subprocess.run(
-        [
-            "git",
+    _preflight_recursive_git_filters(
+        git.path,
+        repository=repository,
+        environment=git_environment,
+    )
+    dirty = _run_process(
+        _hardened_git_command(
+            git.path,
             "-C",
             str(repository),
             "status",
             "--porcelain",
             "--untracked-files=all",
+            "--ignore-submodules=none",
             "--",
             *SOURCE_PATHS,
-        ],
+        ),
         check=False,
         capture_output=True,
-        text=True,
-        encoding="utf-8",
+        timeout=GIT_TIMEOUT_SECONDS,
+        environment=git_environment,
     )
+    _reauthenticate_git(git)
     if (
         revision != bindings.get("sourceRevision")
         or dirty.returncode != 0
@@ -781,20 +1418,22 @@ def run_real_worker(
 
     browser_payload = browser.read_bytes()
     browser_sha256 = _sha256(browser_payload)
-    browser_version_process = subprocess.run(
+    browser_identity = _stat_identity(browser)
+    browser_version_process = _run_process(
         [str(browser), "--version"],
         check=True,
         capture_output=True,
-        text=True,
-        encoding="utf-8",
+        timeout=BROWSER_VERSION_TIMEOUT_SECONDS,
     )
-    browser_version = browser_version_process.stdout.strip()
+    browser_version = (browser_version_process.stdout or "").strip()
     if not browser_version:
         raise ValueError("browser did not report a version")
-    subprocess.run(
+    _run_process(
         ["pnpm", "--filter", "@drawbackguesser/web", "build"],
         cwd=repository,
         check=True,
+        capture_output=False,
+        timeout=BUILD_TIMEOUT_SECONDS,
     )
     dist = repository / "apps" / "web" / "dist"
     with tempfile.TemporaryDirectory(prefix="drawback-parity-") as temporary:
@@ -803,7 +1442,7 @@ def run_real_worker(
         shutil.copy2(artifact, webroot / "browser-model.json")
         shutil.copy2(parity_input, webroot / "browser-parity-input.json")
         with _serve(webroot) as url:
-            completed = subprocess.run(
+            completed = _run_process(
                 [
                     str(browser),
                     "--headless=new",
@@ -816,16 +1455,19 @@ def run_real_worker(
                 ],
                 check=False,
                 capture_output=True,
-                text=True,
-                encoding="utf-8",
-                timeout=180,
+                timeout=BROWSER_TIMEOUT_SECONDS,
             )
+    if (
+        _stat_identity(browser) != browser_identity
+        or _sha256(browser.read_bytes()) != browser_sha256
+    ):
+        raise ValueError("browser executable changed during parity execution")
     if completed.returncode != 0:
         raise ValueError(
             f"headless browser failed with exit code {completed.returncode}"
         )
     parser = _ResultParser()
-    parser.feed(completed.stdout)
+    parser.feed(completed.stdout or "")
     if not parser.fragments:
         raise ValueError("headless browser returned no parity transcript")
     value = dict(
@@ -838,16 +1480,15 @@ def run_real_worker(
     return _canonical_pretty(value)
 
 
-def publish_evidence(
+def _build_evidence_payload(
     *,
     transcript_payload: bytes,
     browser_artifact_sha256: str,
     calibration_sha256: str,
     parity_input: Mapping[str, object],
     parity_input_sha256: str,
-    output: Path,
-) -> Mapping[str, object]:
-    """Verify a Worker transcript and atomically publish review evidence."""
+) -> tuple[Mapping[str, object], bytes]:
+    """Verify a Worker transcript and build its review projection."""
 
     transcript = _strict_json(transcript_payload, "worker transcript")
     if transcript_payload != _canonical_pretty(transcript):
@@ -899,10 +1540,28 @@ def publish_evidence(
         "public_fixture_sha256": parity_input["publicFixture"]["sha256"],
     }
     payload = _canonical_pretty(evidence)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    descriptor = os.open(output, flags, 0o644)
-    with os.fdopen(descriptor, "wb") as destination:
-        destination.write(payload)
+    return evidence, payload
+
+
+def publish_evidence(
+    *,
+    transcript_payload: bytes,
+    browser_artifact_sha256: str,
+    calibration_sha256: str,
+    parity_input: Mapping[str, object],
+    parity_input_sha256: str,
+    output: Path,
+) -> Mapping[str, object]:
+    """Verify and durably publish one create-only review projection."""
+
+    evidence, payload = _build_evidence_payload(
+        transcript_payload=transcript_payload,
+        browser_artifact_sha256=browser_artifact_sha256,
+        calibration_sha256=calibration_sha256,
+        parity_input=parity_input,
+        parity_input_sha256=parity_input_sha256,
+    )
+    publish_bytes_durable(output, payload)
     return evidence
 
 
@@ -930,6 +1589,96 @@ def _digest_file(path: Path) -> str:
     return _sha256(path.read_bytes())
 
 
+def _published_identity(path: Path, payload: bytes) -> _PublishedIdentity:
+    if _digest_file(path) != _sha256(payload):
+        raise OSError("published browser parity bytes changed immediately")
+    return _PublishedIdentity(path, _sha256(payload), _stat_identity(path))
+
+
+def _retain_owned_publication(identity: _PublishedIdentity) -> str:
+    detail = "changed after publication"
+    try:
+        if (
+            _stat_identity(identity.path) == identity.stat
+            and _digest_file(identity.path) == identity.sha256
+        ):
+            detail = "is the exact partial publication"
+    except OSError as error:
+        detail = f"could not be reauthenticated: {error}"
+    return (
+        f"retained browser output ({detail}) because portable Python cannot "
+        "unlink an authenticated object without a pathname race: "
+        f"{identity.path}"
+    )
+
+
+def _authenticate_existing_publication(
+    path: Path,
+    payload: bytes,
+    label: str,
+) -> None:
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"existing {label} is not a regular file")
+        before = _stat_identity(path)
+        observed = path.read_bytes()
+        after = _stat_identity(path)
+    except OSError as error:
+        raise ValueError(f"existing {label} cannot be authenticated") from error
+    if before != after or observed != payload:
+        raise ValueError(f"existing {label} bytes do not match this run")
+
+
+def _publish_browser_outputs(
+    transcript_path: Path,
+    transcript_payload: bytes,
+    evidence_path: Path,
+    evidence_payload: bytes,
+) -> None:
+    transcript_existed = transcript_path.exists()
+    evidence_existed = evidence_path.exists()
+    if transcript_existed:
+        _authenticate_existing_publication(
+            transcript_path, transcript_payload, "browser transcript"
+        )
+    if evidence_existed:
+        _authenticate_existing_publication(
+            evidence_path, evidence_payload, "browser evidence"
+        )
+    owned: list[_PublishedIdentity] = []
+    try:
+        if not transcript_existed:
+            try:
+                publish_bytes_durable(transcript_path, transcript_payload)
+            except FileExistsError:
+                _authenticate_existing_publication(
+                    transcript_path,
+                    transcript_payload,
+                    "browser transcript",
+                )
+            else:
+                owned.append(
+                    _published_identity(transcript_path, transcript_payload)
+                )
+        if not evidence_existed:
+            try:
+                publish_bytes_durable(evidence_path, evidence_payload)
+            except FileExistsError:
+                _authenticate_existing_publication(
+                    evidence_path,
+                    evidence_payload,
+                    "browser evidence",
+                )
+            else:
+                owned.append(
+                    _published_identity(evidence_path, evidence_payload)
+                )
+    except BaseException as error:
+        for identity in reversed(owned):
+            error.add_note(_retain_owned_publication(identity))
+        raise
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run production browser Worker parity and publish evidence."
@@ -948,8 +1697,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     artifact_sha256 = _digest_file(args.browser_artifact)
-    if args.transcript_output.exists() or args.evidence_output.exists():
-        raise FileExistsError("parity output already exists")
     parity_input = load_authenticated_input(
         args.input, args.input_sha256, artifact_sha256
     )
@@ -966,25 +1713,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.input.resolve(),
     )
     verify_transcript_bindings(transcript, parity_input)
-    # Both transcript and approval projection are canonical and no-clobber.
-    try:
-        descriptor = os.open(
-            args.transcript_output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644
-        )
-        with os.fdopen(descriptor, "wb") as destination:
-            destination.write(transcript)
-        publish_evidence(
-            transcript_payload=transcript,
-            browser_artifact_sha256=artifact_sha256,
-            calibration_sha256=_digest_file(args.calibration),
-            parity_input=parity_input,
-            parity_input_sha256=args.input_sha256,
-            output=args.evidence_output,
-        )
-    except BaseException:
-        args.transcript_output.unlink(missing_ok=True)
-        args.evidence_output.unlink(missing_ok=True)
-        raise
+    _evidence, evidence_payload = _build_evidence_payload(
+        transcript_payload=transcript,
+        browser_artifact_sha256=artifact_sha256,
+        calibration_sha256=_digest_file(args.calibration),
+        parity_input=parity_input,
+        parity_input_sha256=args.input_sha256,
+    )
+    _publish_browser_outputs(
+        args.transcript_output,
+        transcript,
+        args.evidence_output,
+        evidence_payload,
+    )
     return 0
 
 

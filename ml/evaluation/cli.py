@@ -8,11 +8,9 @@ import hashlib
 import io
 import json
 import math
-import os
 from pathlib import Path
 import re
 import sys
-import tempfile
 from typing import Any, Mapping
 
 from ml.training.drawback_ml.checkpoint import (
@@ -36,6 +34,11 @@ from ml.training.drawback_ml.symbolic_schema import SYMBOLIC_FEATURE_VERSION
 from ml.training.drawback_ml.training_corpus_set import (
     verify_training_corpus_set,
 )
+from ml.training.drawback_ml.durable_publish import (
+    publish_bytes_durable,
+    publish_bytes_durable_exact,
+)
+from ml.training.drawback_ml.path_validation import is_portable_safe_basename
 
 from .runner import (
     evaluate_held_out,
@@ -199,25 +202,48 @@ def _require_checkpoint_corpus_provenance(
             )
 
 
-def _write_report_atomic_no_clobber(path: Path, rendered: str) -> None:
+def _write_report_atomic_no_clobber(
+    path: Path,
+    rendered: str,
+    *,
+    recover_exact: bool = False,
+) -> None:
+    if recover_exact:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        publish_bytes_durable_exact(
+            path,
+            rendered.encode("utf-8"),
+            label="evaluation report",
+        )
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=path.parent,
-    )
-    temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as output:
-            output.write(rendered)
-            output.flush()
-            os.fsync(output.fileno())
-        try:
-            os.link(temporary, path)
-        except FileExistsError as error:
-            raise ValueError(f"refusing to overwrite evaluation report: {path}") from error
-    finally:
-        temporary.unlink(missing_ok=True)
+        publish_bytes_durable(path, rendered.encode("utf-8"))
+    except FileExistsError as error:
+        raise ValueError(
+            f"refusing to overwrite evaluation report: {path}"
+        ) from error
+
+
+def _abort_sidecar_preserving_failure(
+    stream: Any,
+    primary: BaseException,
+) -> None:
+    try:
+        stream.abort()
+    except BaseException as cleanup_error:
+        primary.add_note(
+            "calibration sidecar cleanup also failed: "
+            f"{cleanup_error!r}"
+        )
+
+
+def _finalize_sidecar_preserving_failure(stream: Any) -> Any:
+    try:
+        return stream.finalize(recover_exact=True)
+    except BaseException as error:
+        _abort_sidecar_preserving_failure(stream, error)
+        raise
 
 
 def _non_empty_manifest_string(
@@ -677,12 +703,8 @@ def _selection_digest(value: object, name: str) -> str:
 
 
 def _selection_basename(value: object, name: str) -> str:
-    if (
-        not isinstance(value, str)
-        or not value
-        or Path(value).name != value
-    ):
-        raise ValueError(f"{name} must be a non-empty basename")
+    if not is_portable_safe_basename(value):
+        raise ValueError(f"{name} must be a safe basename")
     return value
 
 
@@ -1379,9 +1401,9 @@ def _evaluate_ensemble_calibration(
             raise ValueError(
                 "fusion selection artifact changed during evaluation"
             )
-        sidecar = stream.finalize()
-    except BaseException:
-        stream.abort()
+        sidecar = stream.finalize(recover_exact=True)
+    except BaseException as error:
+        _abort_sidecar_preserving_failure(stream, error)
         raise
     envelope = {
         "format": ENSEMBLE_REPORT_FORMAT,
@@ -1403,7 +1425,11 @@ def _evaluate_ensemble_calibration(
     rendered = (
         json.dumps(envelope, indent=2, sort_keys=True, allow_nan=False) + "\n"
     )
-    _write_report_atomic_no_clobber(arguments.output, rendered)
+    _write_report_atomic_no_clobber(
+        arguments.output,
+        rendered,
+        recover_exact=True,
+    )
     print(
         json.dumps(
             {
@@ -1674,8 +1700,13 @@ def _fit_ensemble_calibration(arguments: argparse.Namespace) -> int:
         sidecar=sidecar,
         ensemble_release=ensemble,
         fusion_selection=fusion_selection,
+        recover_exact=True,
     )
-    artifact = fit_ensemble_calibration(arguments.output, receipt)
+    artifact = fit_ensemble_calibration(
+        arguments.output,
+        receipt,
+        recover_exact=True,
+    )
     print(
         json.dumps(
             {
@@ -2035,19 +2066,21 @@ def _evaluate(
                 None if epoch_scorer is None else score_epoch_prediction
             ),
         )
-    except BaseException:
+    except BaseException as error:
         if calibration_stream is not None:
-            calibration_stream.abort()
+            _abort_sidecar_preserving_failure(calibration_stream, error)
         raise
     if reaudit() != audited:
+        error = ValueError("held-out corpus changed during evaluation")
         if calibration_stream is not None:
-            calibration_stream.abort()
-        raise ValueError("held-out corpus changed during evaluation")
-    calibration_sidecar = (
-        None
-        if calibration_stream is None
-        else calibration_stream.finalize()
-    )
+            _abort_sidecar_preserving_failure(calibration_stream, error)
+        raise error
+    if calibration_stream is None:
+        calibration_sidecar = None
+    else:
+        calibration_sidecar = _finalize_sidecar_preserving_failure(
+            calibration_stream
+        )
     epoch_metrics = None if epoch_scorer is None else epoch_scorer.report()
     envelope = {
         "formatVersion": 2 if epoch_metrics is not None else 1,
@@ -2100,7 +2133,11 @@ def _evaluate(
     if arguments.output is None:
         print(rendered, end="")
     else:
-        _write_report_atomic_no_clobber(arguments.output, rendered)
+        _write_report_atomic_no_clobber(
+            arguments.output,
+            rendered,
+            recover_exact=True,
+        )
         if calibration_requested:
             if (
                 calibration_sidecar is None
@@ -2128,6 +2165,7 @@ def _evaluate(
                     selection_artifact=selection_json_reference,
                     training_run=training_run_reference,
                 ),
+                recover_exact=True,
             )
     return 0
 

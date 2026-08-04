@@ -40,10 +40,122 @@ from .capturable_records import (
     load_capturable_opportunity_dataset,
 )
 from .capturable_reliability import validation_reliability_checks
+from .durable_publish import publish_bytes_durable
 
 CAPTURABLE_SELECTION_FORMAT = "drawbackguesser-capturable-selection"
 CAPTURABLE_SELECTION_VERSION = 1
 CAPTURABLE_OPPORTUNITY_SELECTION_VERSION = 2
+CAPTURABLE_SEALED_CONSUMPTION_FORMAT = (
+    "drawbackguesser-capturable-sealed-corpus-consumption"
+)
+
+
+def _git_common_directory() -> Path:
+    """Resolve this checkout's common Git directory without executing Git."""
+
+    repository = Path(__file__).resolve().parents[3]
+    dot_git = repository / ".git"
+    try:
+        if dot_git.is_dir():
+            common = dot_git.resolve(strict=True)
+        elif dot_git.is_file():
+            payload = dot_git.read_bytes()
+            if len(payload) > 4096 or b"\x00" in payload:
+                raise CapturableDatasetError("Git worktree pointer is invalid")
+            pointer = payload.decode("utf-8", errors="strict").strip()
+            if not pointer.startswith("gitdir: ") or "\n" in pointer:
+                raise CapturableDatasetError("Git worktree pointer is invalid")
+            raw_git_directory = Path(pointer.removeprefix("gitdir: "))
+            git_directory = (
+                raw_git_directory
+                if raw_git_directory.is_absolute()
+                else repository / raw_git_directory
+            ).resolve(strict=True)
+            common_pointer = git_directory / "commondir"
+            if common_pointer.is_file():
+                common_payload = common_pointer.read_bytes()
+                if len(common_payload) > 4096 or b"\x00" in common_payload:
+                    raise CapturableDatasetError(
+                        "Git common-directory pointer is invalid"
+                    )
+                common_text = common_payload.decode(
+                    "utf-8", errors="strict"
+                ).strip()
+                if not common_text or "\n" in common_text:
+                    raise CapturableDatasetError(
+                        "Git common-directory pointer is invalid"
+                    )
+                raw_common = Path(common_text)
+                common = (
+                    raw_common
+                    if raw_common.is_absolute()
+                    else git_directory / raw_common
+                ).resolve(strict=True)
+            else:
+                common = git_directory
+        else:
+            raise CapturableDatasetError("Git metadata is unavailable")
+    except (OSError, UnicodeError) as error:
+        raise CapturableDatasetError("Git metadata is unavailable") from error
+    if not common.is_dir():
+        raise CapturableDatasetError("Git common directory is invalid")
+    return common
+
+
+def _consumption_registry(registry: Path | None) -> Path:
+    """Return the trusted local registry, not a global one-shot authority."""
+
+    if registry is None:
+        root = (
+            _git_common_directory()
+            / "drawbackguesser"
+            / "sealed-corpus-consumption-v1"
+        )
+    else:
+        root = registry.resolve()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        resolved = root.resolve(strict=True)
+    except OSError as error:
+        raise CapturableDatasetError(
+            "sealed-corpus consumption registry is unavailable"
+        ) from error
+    if resolved != root or not resolved.is_dir():
+        raise CapturableDatasetError(
+            "sealed-corpus consumption registry is invalid"
+        )
+    return resolved
+
+
+def _consume_sealed_corpus(
+    *,
+    test_sha256: str,
+    authorization_sha256: str,
+    operation: str,
+    registry: Path | None,
+) -> Path:
+    for digest, label in (
+        (test_sha256, "sealed corpus"),
+        (authorization_sha256, "sealed authorization"),
+    ):
+        if len(digest) != 64 or any(
+            character not in "0123456789abcdef" for character in digest
+        ):
+            raise CapturableDatasetError(f"{label} SHA-256 is invalid")
+    marker = _consumption_registry(registry) / f"{test_sha256}.json"
+    publish_bytes_durable(
+        marker,
+        _canonical_json(
+            {
+                "format": CAPTURABLE_SEALED_CONSUMPTION_FORMAT,
+                "version": 1,
+                "sealedCorpusIdentitySha256": test_sha256,
+                "authorizationSha256": authorization_sha256,
+                "operation": operation,
+            }
+        ),
+    )
+    return marker
 
 
 def _load_stable_capturable_dataset(
@@ -102,8 +214,6 @@ def run_selection(
 
     report_path = output_directory / "selection.json"
     checkpoint_path = output_directory / "model.pt"
-    if report_path.exists() or checkpoint_path.exists():
-        raise FileExistsError("capturable selection outputs already exist")
     if not train_paths:
         raise ValueError("at least one train dataset is required")
     checked_source_weights = _checked_train_source_weights(
@@ -208,6 +318,7 @@ def run_selection(
             if opportunity_mode is None
             else CAPTURABLE_OPPORTUNITY_SELECTION_VERSION
         ),
+        recover_exact=True,
     )
     report = {
         **measured,
@@ -225,7 +336,7 @@ def run_selection(
         "sealedTestStatus": "unopened",
     }
     payload = _canonical_json(report)
-    _publish_bytes(report_path, payload)
+    _publish_bytes(report_path, payload, recover_exact=True)
     return {
         "reportPath": str(report_path),
         "reportSha256": hashlib.sha256(payload).hexdigest(),
@@ -486,8 +597,11 @@ def run_sealed_evaluation(
     checkpoint_path: Path,
     test_path: Path,
     output_path: Path,
+    *,
+    expected_test_sha256: str,
+    consumption_registry: Path | None = None,
 ) -> Mapping[str, Any]:
-    """Evaluate a frozen selection once against a disjoint test dataset."""
+    """Evaluate under a local guard against an authenticated test corpus."""
 
     if output_path.exists():
         raise FileExistsError("sealed evaluation output already exists")
@@ -496,10 +610,24 @@ def run_sealed_evaluation(
     )
     config = _training_config_from_json(metadata["config"])
     opportunity_mode = metadata.get("opportunityMode")
+    marker = _consume_sealed_corpus(
+        test_sha256=expected_test_sha256,
+        authorization_sha256=checkpoint_sha256,
+        operation="single-checkpoint-evaluation",
+        registry=consumption_registry,
+    )
+    # Do not resolve, stat, or open the sealed path before the canonical
+    # caller-authenticated corpus identity is recorded in the trusted local
+    # registry. This marker is not a global one-shot authority.
+    test_resolved = test_path.resolve(strict=True)
     test_rows, test_sha256 = _load_stable_capturable_dataset(
-        test_path,
+        test_resolved,
         opportunity_mode,
     )
+    if test_sha256 != expected_test_sha256:
+        raise CapturableDatasetError(
+            "sealed test changed after its consumption was recorded"
+        )
     source_game_ids = set(metadata["sourceGameIds"])
     overlap = sorted(
         {
@@ -531,12 +659,16 @@ def run_sealed_evaluation(
         },
         "test": {
             "input": {
-                "path": test_path.resolve().name,
+                "path": test_resolved.name,
                 "sha256": test_sha256,
                 "rows": len(test_rows),
                 "games": len(
                     {row.evaluation.game_id for row in test_rows}
                 ),
+            },
+            "consumption": {
+                "file": marker.name,
+                "sealedCorpusIdentitySha256": test_sha256,
             },
             "metrics": evaluate_capturable(
                 model,
@@ -558,6 +690,7 @@ def run_sealed_evaluation(
         "reportPath": str(output_path),
         "reportSha256": hashlib.sha256(payload).hexdigest(),
         "checkpointSha256": checkpoint_sha256,
+        "consumptionMarker": marker.name,
         "testHybridTop1": report["test"]["metrics"]["hybrid"][
             "top_1_accuracy"
         ],
@@ -644,8 +777,11 @@ def run_paired_sealed_evaluation(
     comparison_path: Path,
     test_path: Path,
     output_path: Path,
+    *,
+    expected_test_sha256: str,
+    consumption_registry: Path | None = None,
 ) -> Mapping[str, Any]:
-    """Evaluate one frozen control/treatment pair in a single sealed pass."""
+    """Evaluate a frozen pair under the checkout-local consumption guard."""
 
     if output_path.exists():
         raise FileExistsError(
@@ -685,10 +821,24 @@ def run_paired_sealed_evaluation(
         raise CapturableDatasetError(
             "paired checkpoints use different opportunity contracts"
         )
+    marker = _consume_sealed_corpus(
+        test_sha256=expected_test_sha256,
+        authorization_sha256=comparison_sha256,
+        operation="paired-treatment-evaluation",
+        registry=consumption_registry,
+    )
+    # The sealed path remains opaque until the authorized corpus identity is
+    # recorded in the trusted local registry. The marker is user-deletable and
+    # therefore does not make the evaluation globally irreversible.
+    test_resolved = test_path.resolve(strict=True)
     test_rows, test_sha256 = _load_stable_capturable_dataset(
-        test_path,
+        test_resolved,
         control_mode,
     )
+    if test_sha256 != expected_test_sha256:
+        raise CapturableDatasetError(
+            "sealed test changed after its consumption was recorded"
+        )
     control_test_tensors = tensorize(
         test_rows,
         opportunity_mode=control_mode,
@@ -730,12 +880,16 @@ def run_paired_sealed_evaluation(
         },
         "test": {
             "input": {
-                "path": test_path.resolve().name,
+                "path": test_resolved.name,
                 "sha256": test_sha256,
                 "rows": len(test_rows),
                 "games": len(
                     {row.evaluation.game_id for row in test_rows}
                 ),
+            },
+            "consumption": {
+                "file": marker.name,
+                "sealedCorpusIdentitySha256": test_sha256,
             },
             "control": control,
             "treatment": treatment,
@@ -776,6 +930,7 @@ def run_paired_sealed_evaluation(
         "primaryDecision": report["test"]["primaryDecision"],
         "releaseDecision": report["test"]["releaseDecision"],
         "testSha256": test_sha256,
+        "consumptionMarker": marker.name,
         "controlGameNormalizedTop1": control_order[0],
         "treatmentGameNormalizedTop1": treatment_order[0],
         "controlGameNormalizedTop3": control_order[1],
@@ -818,7 +973,10 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Select a fresh capturable model without test access, then "
-            "evaluate its frozen checkpoint on a sealed split."
+            "evaluate its frozen checkpoint on a sealed split. Sealed "
+            "commands use a create-only marker in one trusted Git common "
+            "directory; this prevents accidental or repeated local use, not "
+            "global one-shot access."
         )
     )
     commands = parser.add_subparsers(dest="command", required=True)
@@ -869,6 +1027,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     evaluate.add_argument("--checkpoint", type=Path, required=True)
     evaluate.add_argument("--test", type=Path, required=True)
+    evaluate.add_argument(
+        "--test-sha256",
+        required=True,
+        help="Caller-authenticated SHA-256 of the sealed test corpus.",
+    )
     evaluate.add_argument("--output", type=Path, required=True)
 
     choose = commands.add_parser(
@@ -908,6 +1071,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     paired.add_argument("--comparison", type=Path, required=True)
     paired.add_argument("--test", type=Path, required=True)
+    paired.add_argument(
+        "--test-sha256",
+        required=True,
+        help="Caller-authenticated SHA-256 of the sealed test corpus.",
+    )
     paired.add_argument("--output", type=Path, required=True)
     return parser
 
@@ -936,6 +1104,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             options.checkpoint,
             options.test,
             options.output,
+            expected_test_sha256=options.test_sha256,
         )
     elif options.command == "choose":
         result = run_candidate_selection(
@@ -953,6 +1122,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             options.comparison,
             options.test,
             options.output,
+            expected_test_sha256=options.test_sha256,
         )
     print(json.dumps(result, allow_nan=False, sort_keys=True))
     return 0

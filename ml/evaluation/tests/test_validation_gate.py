@@ -6,7 +6,9 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
+import ml.evaluation.validation_gate as validation_gate
 from ml.evaluation.promotion_evaluator import (
     PROMOTION_REPORT_FORMAT,
     PROMOTION_REPORT_VERSION,
@@ -26,6 +28,7 @@ from ml.evaluation.validation_gate import (
     publish_validation_gate,
 )
 from ml.evaluation.ensemble_calibration import ContentAddressedFile
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable_exact
 from ml.training.drawback_ml.symbolic_schema import SYMBOLIC_RULE_IDS
 
 
@@ -187,7 +190,7 @@ class ValidationGateTests(unittest.TestCase):
             "passed",
         )
 
-    def test_publishes_canonical_bound_report_and_no_clobber_decision(self) -> None:
+    def test_publishes_canonical_bound_report_and_recovers_exact_pair(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             report_path = root / "validation-report.json"
@@ -214,10 +217,85 @@ class ValidationGateTests(unittest.TestCase):
             )
             self.assertEqual(decision_value["passed"], decision.passed)
             self.assertTrue(report_path.read_bytes().endswith(b"\n"))
-            with self.assertRaisesRegex(ValueError, "must not exist"):
+            recovered_report, recovered_decision, recovered = (
                 publish_validation_gate(
                     promotion_report(), report_path, decision_path
                 )
+            )
+            self.assertEqual(recovered_report, report_ref)
+            self.assertEqual(recovered_decision, decision_ref)
+            self.assertEqual(recovered, decision)
+
+    def test_pair_retry_converges_after_late_publication_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            report_path = root / "validation-report.json"
+            decision_path = root / "validation-decision.json"
+            calls = 0
+
+            def fail_after_second_publication(
+                path: Path,
+                payload: bytes,
+                *,
+                label: str,
+            ) -> None:
+                nonlocal calls
+                calls += 1
+                publish_bytes_durable_exact(path, payload, label=label)
+                if calls == 2:
+                    raise OSError("simulated late publication failure")
+
+            with mock.patch.object(
+                validation_gate,
+                "publish_bytes_durable_exact",
+                side_effect=fail_after_second_publication,
+            ):
+                with self.assertRaisesRegex(OSError, "simulated late"):
+                    publish_validation_gate(
+                        promotion_report(), report_path, decision_path
+                    )
+
+            self.assertTrue(report_path.is_file())
+            self.assertTrue(decision_path.is_file())
+            publish_validation_gate(
+                promotion_report(), report_path, decision_path
+            )
+
+            decision_path.write_bytes(b"competitor\n")
+            with self.assertRaisesRegex(ValueError, "do not match"):
+                publish_validation_gate(
+                    promotion_report(), report_path, decision_path
+                )
+            self.assertTrue(report_path.is_file())
+            self.assertEqual(decision_path.read_bytes(), b"competitor\n")
+
+    def test_pair_rejects_the_same_output_before_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            for report, decision, expected in (
+                ("validation.json", "validation.json", "must be distinct"),
+                (
+                    "Validation-Report.json",
+                    "validation-report.JSON",
+                    "must be distinct",
+                ),
+                (
+                    "validation-report.json:secret",
+                    "validation-decision.json",
+                    "safe basename",
+                ),
+                ("NUL", "validation-decision.json", "safe basename"),
+            ):
+                with self.subTest(report=report, decision=decision):
+                    report_output = root / report
+                    decision_output = root / decision
+                    with self.assertRaisesRegex(ValueError, expected):
+                        publish_validation_gate(
+                            promotion_report(),
+                            report_output,
+                            decision_output,
+                        )
+                    self.assertEqual(list(root.iterdir()), [])
 
     def test_missing_view_is_recorded_instead_of_raising_or_passing(self) -> None:
         report = promotion_report()

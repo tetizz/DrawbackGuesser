@@ -12,6 +12,7 @@ from drawback_ml.corpus_contract import (
     CorpusContractError,
     HARD_NEGATIVE_AGENT_IDS,
     HARD_NEGATIVE_PROFILES,
+    _audit_hard_negative_handles,
     _canonical_json,
     _expected_hard_negative_slots,
     _expected_hard_negative_train_seeds,
@@ -369,6 +370,43 @@ class HardNegativeCorpusContractTests(unittest.TestCase):
                     lease.audited.evaluator_nodes, 10_000
                 )
                 lease.verify_unchanged(chunk_size=17)
+
+    def test_rejects_nonportable_hard_negative_dataset_basename(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = write_fixture(root)
+            original_manifest = json.loads(paths[0].read_text(encoding="utf-8"))
+            for invalid_name in (
+                "train.ndjson\x00ignored",
+                "CON.json",
+                "train.ndjson:secret",
+                "train.ndjson.",
+                "train.ndjson ",
+                "nested/train.ndjson",
+                "nested\\train.ndjson",
+            ):
+                with self.subTest(file=invalid_name):
+                    manifest = json.loads(json.dumps(original_manifest))
+                    manifest["splits"]["train"]["file"] = invalid_name
+                    paths[0].write_bytes(exact_json(manifest))
+                    with (
+                        paths[0].open("rb") as manifest_source,
+                        paths[1].open("rb") as dataset_source,
+                        paths[2].open("rb") as plan_source,
+                        self.assertRaisesRegex(
+                            CorpusContractError,
+                            "dataset basename is invalid",
+                        ),
+                    ):
+                        _audit_hard_negative_handles(
+                            paths[0],
+                            root / invalid_name,
+                            paths[2],
+                            PROFILE_ID,
+                            manifest_source,
+                            dataset_source,
+                            plan_source,
+                        )
 
     def test_rejects_wrong_profile_and_nonempty_heldout_split(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

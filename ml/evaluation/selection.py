@@ -6,10 +6,11 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
-import tempfile
 from typing import Iterable, Mapping, Sequence
+
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable_exact
+from ml.training.drawback_ml.path_validation import is_portable_safe_basename
 
 from ml.training.drawback_ml.checkpoint import (
     FUSION_GRID_DRAWBACK_OBJECTIVE,
@@ -722,27 +723,16 @@ def _require_fusion_grid_selection_objective(
 
 def _write_atomic_no_clobber(path: Path, rendered: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=path.parent,
-    )
-    temporary = Path(temporary_name)
     try:
-        with os.fdopen(
-            descriptor, "w", encoding="utf-8", newline="\n"
-        ) as target:
-            target.write(rendered)
-            target.flush()
-            os.fsync(target.fileno())
-        try:
-            os.link(temporary, path)
-        except FileExistsError as error:
-            raise ValueError(
-                f"refusing to overwrite epoch selection artifact: {path}"
-            ) from error
-    finally:
-        temporary.unlink(missing_ok=True)
+        publish_bytes_durable_exact(
+            path,
+            rendered.encode("utf-8"),
+            label="epoch selection artifact",
+        )
+    except ValueError as error:
+        raise ValueError(
+            f"refusing to overwrite epoch selection artifact: {path}"
+        ) from error
 
 
 def _reject_json_constant(token: str) -> None:
@@ -830,10 +820,6 @@ def _digest(value: object, name: str) -> str:
 
 
 def _basename(value: object, name: str) -> str:
-    if (
-        not isinstance(value, str)
-        or not value
-        or Path(value).name != value
-    ):
-        raise ValueError(f"{name} must be a non-empty basename")
+    if not is_portable_safe_basename(value):
+        raise ValueError(f"{name} must be a safe basename")
     return value

@@ -21,11 +21,12 @@ The intended data path is:
    `capturable-king/v1` authority and evaluator `none`.
 4. Supply the Engine-owned launch and completion receipts that authenticate
    the declared schedule, complete generation configuration, producer commit,
-   and exact trace bytes.
+   exact coordinator and deferred-worker runtime trees, and exact trace bytes.
 5. Create the four-split ledger. Its verifier reconstructs the schedule,
    reparses every source game, reconverts every represented game, checks exact
-   converted bytes, checks split disjointness, and reproduces the executing
-   code identity in isolated checkouts.
+   converted bytes, checks split disjointness, reproduces the executing code
+   identity, and independently rebuilds the producer runtime identity in
+   isolated checkouts.
 6. Preserve the ledger SHA-256 and the TypeScript verification-receipt SHA-256
    printed by the CLI as the public handoff to downstream training.
 
@@ -55,13 +56,18 @@ Per-split values:
 - producer Engine commit.
 
 All sixteen artifact paths must be distinct across the four splits. Receipts
-are authenticated by raw byte identity, not only parsed values. The version-2
+are authenticated by raw byte identity, not only parsed values. The version-3
 launch receipt must declare authority
 `capturable25-schema9-opportunity/v1`, Engine split `train`, a positive train
 count, zero validation/test counts, and the exact frozen generation config.
 Every schema-2/ruleset-2 source trace must realize that config for both
-players. The completion receipt binds the launch receipt hash plus the exact
-output trace hash, byte count, game count, and contiguous index range.
+players. Launch and completion must contain the same
+`drawbackengine-schema9-producer-runtime` version-1 identity. The ledger
+rebuilds the recorded Engine commit in an isolated checkout and recomputes the
+`sha256-engine-runtime-tree-v1` identity over both the coordinator and deferred
+parallel-worker component trees. The completion receipt also binds the launch
+receipt hash plus the exact output trace hash, byte count, game count, and
+contiguous index range.
 
 The public validators impose these per-file limits:
 
@@ -380,9 +386,13 @@ pnpm exec vitest run `
   packages/trace-to-dataset/src/schema9-real-integration.test.ts
 ```
 
-At the receipt-v2 contract commit, the focused suite passes 3 files and 68
-tests, while the complete trace-to-dataset package passes 6 files and 89 tests.
-Those tests validate tamper rejection and exact trace-policy binding. The
+The receipt-v3 suite includes exhaustive launch/completion runtime-identity
+mutation cases, a shared Engine/Guesser golden aggregate, four-split runtime
+equality, reproducible-build mismatch rejection, and exact trace-policy
+binding. It also injects delayed in-process cancellation and proves that
+authentication stops and both create-only publication paths remove temporary
+files without exposing final artifacts. Release evidence must record a fresh
+run of the command above rather than relying on a historical test count. The
 external four-split smoke remains the proof of the actual child-process path
 until a bounded end-to-end CI regression is added.
 
@@ -398,3 +408,18 @@ Primary implementation evidence:
 - `engine/packages/simulation-arena/src/player-private-assignment-scheduler.ts`
 - `engine/packages/simulation-arena/src/player-private-stream.ts`
 - `ml/training/drawback_ml/capturable_opportunity_workflow.py`
+
+CI currently references standard GitHub Actions by their maintained major
+version tags. The local and clean-snapshot gates authenticate repository and
+runtime inputs, but they do not provide immutable provenance for those moving
+third-party Action tags. Pinning every Action to a reviewed commit remains a
+release-infrastructure hardening item; no production deployment is authorized
+by this readiness work.
+
+Clean-source authentication also assumes an isolated checkout with no
+concurrent writer running as the same OS user. Git executable, worktree, and
+filter configuration are checked before and after sensitive operations, but
+portable subprocess APIs cannot hold every pathname and repository-config byte
+open across Git's complete recursive status traversal. A same-user ABA swap can
+therefore defeat local attestation. Run release gates in an ACL-private
+checkout and do not describe this boundary as hostile-host attestation.

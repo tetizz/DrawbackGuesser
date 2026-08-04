@@ -29,6 +29,7 @@ from ml.evaluation.training_frequency import (
     HardNegativeBinding,
 )
 from ml.training.drawback_ml.symbolic_schema import SYMBOLIC_RULE_IDS
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable_exact
 from ml.training.drawback_ml.training_corpus_set import (
     FROZEN_SUPPLEMENT_PROFILES,
 )
@@ -144,6 +145,31 @@ def write_artifact(root: Path, value: object) -> ContentAddressedFile:
 
 
 class TrainingFrequencyTests(unittest.TestCase):
+    def test_publication_retry_accepts_only_exact_committed_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            output = Path(raw) / "frequency.json"
+            payload = b'{"frequency":true}\n'
+
+            def fail_after_publication(
+                path: Path,
+                value: bytes,
+                *,
+                label: str,
+            ) -> None:
+                publish_bytes_durable_exact(path, value, label=label)
+                raise OSError("simulated post-publication failure")
+
+            with patch(
+                "ml.evaluation.training_frequency.publish_bytes_durable_exact",
+                side_effect=fail_after_publication,
+            ):
+                with self.assertRaisesRegex(OSError, "post-publication"):
+                    _write_atomic_no_clobber(output, payload)
+
+            _write_atomic_no_clobber(output, payload)
+            with self.assertRaisesRegex(ValueError, "overwrite"):
+                _write_atomic_no_clobber(output, b"different\n")
+
     def test_counts_each_observed_player_color_once_per_game(self) -> None:
         values = [
             row("one", "white", "vegan", ply=0),

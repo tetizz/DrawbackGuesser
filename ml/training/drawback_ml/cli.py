@@ -9,10 +9,10 @@ import hashlib
 import json
 from pathlib import Path
 import re
-import subprocess
 from typing import Any, BinaryIO, Iterable, Mapping
 
 from .browser_artifact import export_browser_artifact
+from .capturable_blend import _authenticated_git_runner
 from .corpus_contract import (
     audit_corpus_split,
     open_audited_hard_negative_train_corpus,
@@ -629,27 +629,14 @@ def _verify_clean_execution_revision(
             "execution source revision must be a full lowercase Git SHA"
         )
     source_repository_root = Path(__file__).resolve().parents[3]
-    head = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-        shell=False,
-        cwd=source_repository_root,
-    ).stdout.strip()
+    git = _authenticated_git_runner(source_repository_root)
+    head = git("rev-parse", "HEAD").stdout.strip()
     if head != expected:
         raise ValueError(
             "execution source revision differs from repository HEAD"
         )
     reported_repository_root = Path(
-        subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            check=True,
-            capture_output=True,
-            text=True,
-            shell=False,
-            cwd=source_repository_root,
-        ).stdout.strip()
+        git("rev-parse", "--show-toplevel").stdout.strip()
     ).resolve()
     if reported_repository_root != source_repository_root:
         raise ValueError(
@@ -657,28 +644,13 @@ def _verify_clean_execution_revision(
             "repository"
         )
     repository_root = source_repository_root
-    status = subprocess.run(
-        [
-            "git",
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        shell=False,
-        cwd=repository_root,
+    status = git(
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
     ).stdout
-    final_head = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-        shell=False,
-        cwd=repository_root,
-    ).stdout.strip()
+    final_head = git("rev-parse", "HEAD").stdout.strip()
     if final_head != expected:
         raise ValueError(
             "execution source revision changed during source verification"

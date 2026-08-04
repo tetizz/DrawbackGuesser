@@ -4,6 +4,7 @@ from contextlib import redirect_stdout
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -307,6 +308,45 @@ def release_inputs(
 
 
 class CalibrationReleaseTest(unittest.TestCase):
+    def test_abort_never_deletes_a_replacement_pathname(self) -> None:
+        class ReplaceOnClose:
+            def __init__(self, stream: object, path: Path) -> None:
+                self.stream = stream
+                self.path = path
+
+            def fileno(self) -> int:
+                return self.stream.fileno()  # type: ignore[attr-defined]
+
+            def close(self) -> None:
+                self.stream.close()  # type: ignore[attr-defined]
+                self.path.unlink(missing_ok=True)
+                self.path.write_bytes(b"replacement\n")
+
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            _sidecar, checkpoint, selection, _run, _receipt = release_inputs(directory)
+            stream = CalibrationSidecarStream(
+                directory / "aborted.ndjson",
+                CalibrationSidecarHeader(
+                    calibration_seed_sha256="4" * 64,
+                    checkpoint_sha256=checkpoint.sha256,
+                    selection_artifact_sha256=selection.sha256,
+                    symbolic_schema_sha256="5" * 64,
+                    symbolic_feature_version=6,
+                    class_count=3,
+                ),
+            )
+            temporary = stream._temporary
+            stream._file = ReplaceOnClose(stream._file, temporary)  # type: ignore[assignment]
+            if os.name == "nt":
+                with self.assertRaisesRegex(OSError, "retained replacement"):
+                    stream.abort()
+            else:
+                stream.abort()
+
+            self.assertTrue(stream._closed)
+            self.assertEqual(temporary.read_bytes(), b"replacement\n")
+
     def test_streaming_sidecar_is_atomic_and_content_addressed(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             directory = Path(raw)
@@ -333,6 +373,40 @@ class CalibrationReleaseTest(unittest.TestCase):
             loaded = load_calibration_observation_sidecar(published)
             self.assertEqual((len(loaded.white), len(loaded.black)), (4, 4))
             self.assertEqual(list(directory.glob("*.tmp")), [])
+
+    def test_streaming_sidecar_recovers_only_an_exact_crash_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            _sidecar, checkpoint, selection, _run, _receipt = release_inputs(directory)
+            output = directory / "streamed.ndjson"
+            header = CalibrationSidecarHeader(
+                calibration_seed_sha256="4" * 64,
+                checkpoint_sha256=checkpoint.sha256,
+                selection_artifact_sha256=selection.sha256,
+                symbolic_schema_sha256="5" * 64,
+                symbolic_feature_version=6,
+                class_count=3,
+            )
+
+            for attempt in range(2):
+                stream = CalibrationSidecarStream(output, header)
+                for observation in observations():
+                    stream.add(observation)
+                published = stream.finalize(recover_exact=attempt == 1)
+
+            self.assertEqual(published.sha256, digest(output.read_bytes()))
+            self.assertEqual(
+                len(list(directory.glob(".streamed.ndjson.*.tmp"))),
+                1,
+            )
+
+            changed = CalibrationSidecarStream(output, header)
+            altered = list(observations())
+            changed.add(altered[0])
+            for observation in altered[2:]:
+                changed.add(observation)
+            with self.assertRaisesRegex(ValueError, "do not match"):
+                changed.finalize(recover_exact=True)
 
     def test_runner_streams_only_mover_scores_without_changing_report(self) -> None:
         class ScorePredictor(FakePredictor):

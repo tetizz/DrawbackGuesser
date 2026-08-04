@@ -33,6 +33,18 @@ class SplitTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-negative"):
             assign_split(-1)
 
+    def test_split_config_rejects_non_finite_and_non_numeric_values(self) -> None:
+        for train_fraction in (float("nan"), float("inf"), True, "0.8"):
+            with self.subTest(train_fraction=train_fraction):
+                with self.assertRaisesRegex(ValueError, "finite numbers"):
+                    SplitConfig(
+                        train_fraction=train_fraction,  # type: ignore[arg-type]
+                        validation_fraction=0.1,
+                        test_fraction=0.1,
+                    )
+        with self.assertRaisesRegex(ValueError, "non-empty string"):
+            SplitConfig(salt=1)  # type: ignore[arg-type]
+
 
 class CheckpointTests(unittest.TestCase):
     def test_checkpoint_name_and_metadata_are_deterministic(self) -> None:

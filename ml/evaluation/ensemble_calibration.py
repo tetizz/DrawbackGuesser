@@ -16,6 +16,13 @@ import os
 from pathlib import Path
 import tempfile
 from typing import Iterable, Mapping
+from ml.training.drawback_ml.durable_publish import (
+    abort_staged_file_safely,
+    publish_bytes_durable,
+    publish_bytes_durable_exact,
+    publish_staged_file_durable,
+)
+from ml.training.drawback_ml.path_validation import is_portable_safe_basename
 from ml.training.drawback_ml.rank_preserving_fusion import (
     RANK_PRESERVING_FUSION_METHOD,
 )
@@ -209,33 +216,53 @@ class EnsembleCalibrationSidecarStream:
         )
         self._index += 1
 
-    def finalize(self) -> ContentAddressedFile:
+    def finalize(self, *, recover_exact: bool = False) -> ContentAddressedFile:
         if self._closed:
             raise ValueError("ensemble calibration sidecar stream is closed")
         if any(count == 0 for count in self._counts.values()):
-            self.abort()
-            raise ValueError("sidecar requires White and Black observations")
+            error = ValueError("sidecar requires White and Black observations")
+            try:
+                self.abort()
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "ensemble calibration sidecar cleanup also failed: "
+                    f"{cleanup_error!r}"
+                )
+            raise error
         self._file.flush()
         os.fsync(self._file.fileno())
         self._file.close()
+        expected_sha256 = self._hash.hexdigest()
         try:
-            os.link(self._temporary, self.output)
+            publish_staged_file_durable(
+                self.output,
+                self._temporary,
+                expected_sha256,
+                label="ensemble calibration sidecar",
+                recover_exact=recover_exact,
+            )
         except FileExistsError as error:
-            self._temporary.unlink(missing_ok=True)
             self._closed = True
             raise ValueError(
                 "refusing to overwrite ensemble calibration sidecar: "
                 f"{self.output}"
             ) from error
-        self._temporary.unlink(missing_ok=True)
+        except BaseException:
+            self._closed = True
+            raise
         self._closed = True
-        return ContentAddressedFile(self.output, self._hash.hexdigest())
+        return ContentAddressedFile(self.output, expected_sha256)
 
     def abort(self) -> None:
         if not self._closed:
-            self._file.close()
-            self._temporary.unlink(missing_ok=True)
-            self._closed = True
+            try:
+                abort_staged_file_safely(
+                    self._temporary,
+                    self._file,
+                    label="ensemble calibration sidecar",
+                )
+            finally:
+                self._closed = True
 
 
 def identity_from_release(
@@ -283,8 +310,14 @@ def write_ensemble_calibration_sidecar(
         for observation in observations:
             stream.add(observation)
         return stream.finalize()
-    except BaseException:
-        stream.abort()
+    except BaseException as error:
+        try:
+            stream.abort()
+        except BaseException as cleanup_error:
+            error.add_note(
+                "ensemble calibration sidecar cleanup also failed: "
+                f"{cleanup_error!r}"
+            )
         raise
 
 
@@ -353,6 +386,7 @@ def write_ensemble_calibration_receipt(
     sidecar: ContentAddressedFile,
     ensemble_release: ContentAddressedJson,
     fusion_selection: ContentAddressedJson,
+    recover_exact: bool = False,
 ) -> ContentAddressedFile:
     """Publish a non-circular receipt after independently verifying all inputs."""
 
@@ -394,7 +428,14 @@ def write_ensemble_calibration_receipt(
         "identity": _identity_value(expected_identity),
     }
     payload = _canonical_pretty(value)
-    _write_atomic_no_clobber(output, payload, "ensemble calibration receipt")
+    if recover_exact:
+        publish_bytes_durable_exact(
+            output,
+            payload,
+            label="ensemble calibration receipt",
+        )
+    else:
+        _write_atomic_no_clobber(output, payload, "ensemble calibration receipt")
     return ContentAddressedFile(output, hashlib.sha256(payload).hexdigest())
 
 
@@ -460,6 +501,8 @@ def load_ensemble_calibration_receipt(
 def fit_ensemble_calibration(
     output: Path,
     receipt: ContentAddressedFile,
+    *,
+    recover_exact: bool = False,
 ) -> ContentAddressedFile:
     """Fit both validation heads and publish the final verified artifact."""
 
@@ -531,7 +574,14 @@ def fit_ensemble_calibration(
         "black": black.to_metadata(),
     }
     payload = _canonical_pretty(value)
-    _write_atomic_no_clobber(output, payload, "ensemble calibration artifact")
+    if recover_exact:
+        publish_bytes_durable_exact(
+            output,
+            payload,
+            label="ensemble calibration artifact",
+        )
+    else:
+        _write_atomic_no_clobber(output, payload, "ensemble calibration artifact")
     return ContentAddressedFile(output, hashlib.sha256(payload).hexdigest())
 
 
@@ -941,14 +991,8 @@ def _reference(directory: Path, value: object, name: str) -> ContentAddressedFil
     binding = _object(value, f"{name} binding")
     _exact_keys(binding, {"file", "sha256"}, f"{name} binding")
     filename = binding["file"]
-    if (
-        not isinstance(filename, str)
-        or not filename
-        or Path(filename).name != filename
-        or "/" in filename
-        or "\\" in filename
-    ):
-        raise ValueError(f"{name} file must be a basename")
+    if not is_portable_safe_basename(filename):
+        raise ValueError(f"{name} file must be a safe basename")
     path = directory / filename
     _require_sibling(directory, path, name)
     return ContentAddressedFile(path, _digest(binding["sha256"], f"{name} sha256"))
@@ -1012,21 +1056,10 @@ def _canonical_pretty(value: Mapping[object, object]) -> bytes:
 
 def _write_atomic_no_clobber(path: Path, payload: bytes, name: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "wb") as target:
-            target.write(payload)
-            target.flush()
-            os.fsync(target.fileno())
-        try:
-            os.link(temporary, path)
-        except FileExistsError as error:
-            raise ValueError(f"refusing to overwrite {name}: {path}") from error
-    finally:
-        temporary.unlink(missing_ok=True)
+        publish_bytes_durable(path, payload)
+    except FileExistsError as error:
+        raise ValueError(f"refusing to overwrite {name}: {path}") from error
 
 
 def _require_sibling(directory: Path, path: Path, name: str) -> None:

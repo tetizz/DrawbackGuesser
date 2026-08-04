@@ -10,7 +10,7 @@ import math
 import os
 from pathlib import Path
 import random
-import secrets
+import tempfile
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -34,6 +34,11 @@ from .capturable_records import (
     capturable_feature_vector,
     load_capturable_dataset,
     load_capturable_opportunity_dataset,
+)
+from .durable_publish import (
+    publish_bytes_durable,
+    publish_bytes_durable_exact,
+    publish_staged_file_durable,
 )
 CAPTURABLE_BASELINE_FORMAT = "drawbackguesser-capturable-baseline"
 CAPTURABLE_BASELINE_VERSION = 2
@@ -1221,19 +1226,16 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _publish_bytes(path: Path, payload: bytes) -> None:
-    temporary = path.with_name(
-        f"{path.name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
-    )
-    try:
-        with temporary.open("xb") as destination:
-            os.chmod(temporary, 0o600)
-            destination.write(payload)
-            destination.flush()
-            os.fsync(destination.fileno())
-        os.link(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+def _publish_bytes(
+    path: Path,
+    payload: bytes,
+    *,
+    recover_exact: bool = False,
+) -> None:
+    if recover_exact:
+        publish_bytes_durable_exact(path, payload, label="capturable artifact")
+    else:
+        publish_bytes_durable(path, payload)
 
 
 def _publish_checkpoint(
@@ -1243,30 +1245,79 @@ def _publish_checkpoint(
     *,
     artifact_format: str = CAPTURABLE_BASELINE_FORMAT,
     artifact_version: int = CAPTURABLE_BASELINE_VERSION,
+    recover_exact: bool = False,
 ) -> str:
     import torch
 
-    temporary = path.with_name(
-        f"{path.name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
     )
+    temporary = Path(temporary_name)
     try:
-        with temporary.open("xb") as destination:
-            os.chmod(temporary, 0o600)
-            torch.save(
-                {
-                    "format": artifact_format,
-                    "version": artifact_version,
-                    "metadata": _jsonable(metadata),
-                    "stateDict": model.state_dict(),
-                },
-                destination,
+        destination = os.fdopen(descriptor, "w+b")
+    except BaseException as error:
+        try:
+            os.close(descriptor)
+        except OSError as close_error:
+            error.add_note(
+                "checkpoint scratch descriptor cleanup also failed: "
+                f"{close_error!r}"
             )
-            destination.flush()
-            os.fsync(destination.fileno())
-        os.link(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return _sha256_file(path)
+        error.add_note(
+            "retained checkpoint scratch after serialization failure: "
+            f"{temporary}"
+        )
+        raise
+    primary_error: BaseException | None = None
+    try:
+        torch.save(
+            {
+                "format": artifact_format,
+                "version": artifact_version,
+                "metadata": _jsonable(metadata),
+                "stateDict": model.state_dict(),
+            },
+            destination,
+        )
+        destination.flush()
+        os.fsync(destination.fileno())
+        destination.seek(0)
+        digest = hashlib.sha256()
+        while chunk := destination.read(1024 * 1024):
+            digest.update(chunk)
+        expected_sha256 = digest.hexdigest()
+    except BaseException as error:
+        primary_error = error
+    try:
+        destination.close()
+    except BaseException as close_error:
+        if primary_error is None:
+            primary_error = close_error
+        else:
+            primary_error.add_note(
+                "checkpoint scratch close also failed: "
+                f"{close_error!r}"
+            )
+    if primary_error is not None:
+        # The scratch name is closed by this point. Portable Windows Python
+        # cannot unlink it without a pathname-replacement race, so retain the
+        # unique file and make that cleanup outcome explicit on the primary.
+        primary_error.add_note(
+            "retained checkpoint scratch after serialization failure: "
+            f"{temporary}"
+        )
+        raise primary_error
+    publish_staged_file_durable(
+        path,
+        temporary,
+        expected_sha256,
+        label="capturable checkpoint",
+        recover_exact=recover_exact,
+    )
+    return expected_sha256
 
 
 def run_training(

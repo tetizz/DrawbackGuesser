@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -14,10 +16,12 @@ from drawback_ml.capturable_baseline import (
     SOURCE_WEIGHTING_OBJECTIVE,
     _checked_train_source_weights,
     _parser as _baseline_parser,
+    _publish_checkpoint,
     main as baseline_main,
     run_training,
 )
 from drawback_ml.capturable_candidate_selection import (
+    _validated_candidate,
     load_treatment_comparison,
 )
 from drawback_ml.capturable_experiment import (
@@ -353,6 +357,71 @@ class CapturableExperimentTests(unittest.TestCase):
             normalized_legacy["control"],
         )
 
+    def test_selection_retry_recovers_an_exact_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            train = self._write_split(root, "train")
+            validation = self._write_split(root, "validation")
+            output = root / "selection-recovery"
+            config = CapturableTrainingConfig(
+                seed=20260726,
+                epochs=1,
+                batch_size=2,
+                hidden_dimension=8,
+                torch_threads=1,
+            )
+            with (
+                patch(
+                    "drawback_ml.capturable_experiment._publish_bytes",
+                    side_effect=OSError("injected report publication failure"),
+                ),
+                self.assertRaisesRegex(
+                    OSError,
+                    "report publication failure",
+                ),
+            ):
+                run_selection((train,), validation, output, config)
+            checkpoint = output / "model.pt"
+            self.assertTrue(checkpoint.is_file())
+            before = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+            result = run_selection((train,), validation, output, config)
+            self.assertEqual(result["checkpointSha256"], before)
+            self.assertTrue((output / "selection.json").is_file())
+
+    def test_checkpoint_serialization_failures_report_retained_scratch(self) -> None:
+        class Model:
+            @staticmethod
+            def state_dict() -> dict[str, int]:
+                return {"weight": 1}
+
+        def write_checkpoint(_value: object, destination: object) -> None:
+            destination.write(b"checkpoint")  # type: ignore[attr-defined]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, save_effect, fsync_effect in (
+                ("save", OSError("save failed"), None),
+                ("fsync", write_checkpoint, OSError("fsync failed")),
+            ):
+                with self.subTest(name=name):
+                    output = root / name / "model.pt"
+                    with (
+                        patch("torch.save", side_effect=save_effect),
+                        patch(
+                            "drawback_ml.capturable_baseline.os.fsync",
+                            side_effect=fsync_effect,
+                        ),
+                        self.assertRaisesRegex(OSError, f"{name} failed") as raised,
+                    ):
+                        _publish_checkpoint(output, Model(), {})
+
+                    leftovers = list(output.parent.glob(".model.pt.*.tmp"))
+                    self.assertEqual(len(leftovers), 1)
+                    self.assertIn(
+                        "retained checkpoint scratch",
+                        " ".join(getattr(raised.exception, "__notes__", ())),
+                    )
+
     def test_selection_never_opens_test_and_frozen_checkpoint_evaluates_once(
         self,
     ) -> None:
@@ -454,10 +523,14 @@ class CapturableExperimentTests(unittest.TestCase):
             self.assertNotIn("test", selection_report)
             self.assertEqual(selected["selectedEpoch"], 1)
             sealed_path = root / "sealed-evaluation.json"
+            consumption_registry = root / "consumption-registry"
+            test_sha256 = hashlib.sha256(test.read_bytes()).hexdigest()
             evaluated = run_sealed_evaluation(
                 selection / "model.pt",
                 test,
                 sealed_path,
+                expected_test_sha256=test_sha256,
+                consumption_registry=consumption_registry,
             )
             sealed_report = json.loads(sealed_path.read_text("utf-8"))
             self.assertEqual(
@@ -468,6 +541,29 @@ class CapturableExperimentTests(unittest.TestCase):
                 sealed_report["test"]["input"]["games"],
                 2,
             )
+            copied_selection = root / "copied-selection"
+            copied_selection.mkdir()
+            shutil.copy2(
+                selection / "model.pt",
+                copied_selection / "model.pt",
+            )
+            copied_output = root / "copied-sealed-evaluation.json"
+
+            class UntouchablePath:
+                def __getattribute__(self, name: str):
+                    raise AssertionError(
+                        f"repeat touched sealed path via {name}"
+                    )
+
+            with self.assertRaises(FileExistsError):
+                run_sealed_evaluation(
+                    copied_selection / "model.pt",
+                    UntouchablePath(),  # type: ignore[arg-type]
+                    copied_output,
+                    expected_test_sha256=test_sha256,
+                    consumption_registry=consumption_registry,
+                )
+            self.assertFalse(copied_output.exists())
 
             overlap_output = root / "overlap.json"
             with self.assertRaisesRegex(
@@ -478,6 +574,10 @@ class CapturableExperimentTests(unittest.TestCase):
                     selection / "model.pt",
                     train,
                     overlap_output,
+                    expected_test_sha256=hashlib.sha256(
+                        train.read_bytes()
+                    ).hexdigest(),
+                    consumption_registry=consumption_registry,
                 )
             self.assertFalse(overlap_output.exists())
 
@@ -817,6 +917,40 @@ class CapturableExperimentTests(unittest.TestCase):
                 training_load.assert_not_called()
             self.assertFalse((root / "output").exists())
 
+    def test_sealed_cli_requires_caller_authenticated_test_digest(
+        self,
+    ) -> None:
+        digest = "a" * 64
+        for command, authority_flag in (
+            ("evaluate", "--checkpoint"),
+            ("evaluate-treatment", "--comparison"),
+        ):
+            with self.subTest(command=command):
+                arguments = (
+                    command,
+                    authority_flag,
+                    "authority.json",
+                    "--test",
+                    "sealed.ndjson",
+                    "--test-sha256",
+                    digest,
+                    "--output",
+                    "report.json",
+                )
+                options = _experiment_parser().parse_args(arguments)
+                self.assertEqual(options.test_sha256, digest)
+                without_digest = (
+                    *arguments[:5],
+                    *arguments[7:],
+                )
+                with patch("sys.stderr"), self.assertRaises(SystemExit):
+                    _experiment_parser().parse_args(without_digest)
+
+    def test_sealed_cli_discloses_local_consumption_scope(self) -> None:
+        help_text = " ".join(_experiment_parser().format_help().lower().split())
+        self.assertIn("trusted git common directory", help_text)
+        self.assertIn("not global one-shot access", help_text)
+
     def test_treatment_comparison_allows_train_only_intervention(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -926,6 +1060,119 @@ class CapturableExperimentTests(unittest.TestCase):
                 report["control"]["trainInput"],
                 report["treatments"][0]["trainInput"],
             )
+            for index, invalid_name in enumerate(
+                (
+                    "model.pt\x00ignored",
+                    "NUL",
+                    "model.pt:secret",
+                    "model.pt.",
+                    "model.pt ",
+                    "nested/model.pt",
+                    "nested\\model.pt",
+                )
+            ):
+                with self.subTest(checkpoint_file=invalid_name):
+                    malformed_selection = json.loads(
+                        (control / "selection.json").read_text("utf-8")
+                    )
+                    malformed_selection["checkpoint"]["file"] = invalid_name
+                    malformed_path = control / f"selection-invalid-{index}.json"
+                    malformed_path.write_text(
+                        json.dumps(
+                            malformed_selection,
+                            allow_nan=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                        newline="\n",
+                    )
+                    with self.assertRaisesRegex(
+                        CapturableDatasetError,
+                        "checkpoint identity is invalid",
+                    ):
+                        _validated_candidate(malformed_path)
+
+            colliding_selection_path = control / "selection-case.json"
+            colliding_selection = json.loads(
+                (control / "selection.json").read_text("utf-8")
+            )
+            colliding_selection["checkpoint"]["file"] = (
+                colliding_selection_path.name.upper()
+            )
+            colliding_selection_path.write_text(
+                json.dumps(
+                    colliding_selection,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            with self.assertRaisesRegex(
+                CapturableDatasetError,
+                "checkpoint identity is invalid",
+            ):
+                _validated_candidate(colliding_selection_path)
+
+            for index, (field, invalid_name) in enumerate(
+                (
+                    ("selectionDirectory", "NUL"),
+                    ("selectionDirectory", "control:secret"),
+                    ("selectionDirectory", "control."),
+                    ("selectionReport", "selection.json\x00ignored"),
+                    ("selectionReport", "nested/selection.json"),
+                    ("selectionReport", "nested\\selection.json"),
+                )
+            ):
+                with self.subTest(candidate_field=field, value=invalid_name):
+                    malformed = json.loads(json.dumps(report))
+                    malformed["control"][field] = invalid_name
+                    malformed_path = root / f"invalid-path-{index}.json"
+                    malformed_path.write_text(
+                        json.dumps(
+                            malformed,
+                            allow_nan=False,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                        newline="\n",
+                    )
+                    with self.assertRaisesRegex(
+                        CapturableDatasetError,
+                        "invalid candidate path",
+                    ):
+                        load_treatment_comparison(malformed_path)
+
+            colliding = json.loads(json.dumps(report))
+            colliding["treatments"][0]["selectionDirectory"] = report[
+                "control"
+            ]["selectionDirectory"].upper()
+            colliding["treatments"][0]["selectionReport"] = report["control"][
+                "selectionReport"
+            ].upper()
+            colliding_path = root / "portable-collision.json"
+            colliding_path.write_text(
+                json.dumps(
+                    colliding,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            with self.assertRaisesRegex(
+                CapturableDatasetError,
+                "portable-colliding candidate path",
+            ):
+                load_treatment_comparison(colliding_path)
             for field, replacement in (
                 (
                     "primaryDecision",
@@ -1103,11 +1350,17 @@ class CapturableExperimentTests(unittest.TestCase):
                 report["selected"],
             )
             paired_output = root / "paired-evaluation.json"
+            consumption_registry = root / "consumption-registry"
+            paired_test_sha256 = hashlib.sha256(
+                paired_test.read_bytes()
+            ).hexdigest()
             if result["releaseDecision"] == "promote-treatment":
                 paired = run_paired_sealed_evaluation(
                     output,
                     paired_test,
                     paired_output,
+                    expected_test_sha256=paired_test_sha256,
+                    consumption_registry=consumption_registry,
                 )
                 paired_report = json.loads(
                     paired_output.read_text("utf-8")
@@ -1140,6 +1393,10 @@ class CapturableExperimentTests(unittest.TestCase):
                         output,
                         control_train,
                         root / "overlap-paired-evaluation.json",
+                        expected_test_sha256=hashlib.sha256(
+                            control_train.read_bytes()
+                        ).hexdigest(),
+                        consumption_registry=consumption_registry,
                     )
             else:
                 with patch(
@@ -1154,6 +1411,8 @@ class CapturableExperimentTests(unittest.TestCase):
                             output,
                             paired_test,
                             paired_output,
+                            expected_test_sha256=paired_test_sha256,
+                            consumption_registry=consumption_registry,
                         )
                     test_loader.assert_not_called()
                 self.assertFalse(paired_output.exists())

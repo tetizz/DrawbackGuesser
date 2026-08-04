@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
 import shutil
-import subprocess
-from typing import Mapping, Sequence
+from typing import Iterator, Mapping, Sequence
 
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable_exact
+from ml.training.drawback_ml.path_validation import is_portable_safe_basename
 from ml.training.drawback_ml.symbolic_schema import (
     SYMBOLIC_FEATURE_VERSION,
     SYMBOLIC_RULE_IDS,
@@ -27,13 +29,19 @@ from .release_selection_bundle import (
     verify_release_selection_bundle,
 )
 from .release_workflow import (
+    ExternalRef,
+    GIT_TIMEOUT_SECONDS,
     ReleaseWorkflowError,
     _authenticate_external,
     _closed_environment,
     _confined,
     _execute_step,
     _external_tools,
+    _hardened_git_command,
     _input_references,
+    _preflight_recursive_git_filters,
+    _run_capture_process,
+    _stable_file_identity,
     build_plan,
     load_workflow,
 )
@@ -48,6 +56,36 @@ FIRST_STAGE = "ensemble-release"
 
 def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@contextmanager
+def _stable_external_git(
+    reference: ExternalRef,
+    authenticated: Path,
+) -> Iterator[None]:
+    identity = _stable_file_identity(authenticated)
+
+    def reauthenticate() -> None:
+        if (
+            _authenticate_external(reference, "external git") != authenticated
+            or _stable_file_identity(authenticated) != identity
+        ):
+            raise ReleaseWorkflowError(
+                "external git identity changed during source authentication"
+            )
+
+    try:
+        yield
+    except BaseException as primary:
+        try:
+            reauthenticate()
+        except BaseException as authentication_error:
+            primary.add_note(
+                "external Git reauthentication also failed: "
+                f"{authentication_error!r}"
+            )
+        raise
+    reauthenticate()
 
 
 def _relative(value: object, label: str) -> Path:
@@ -175,19 +213,27 @@ def load_manifest(path: Path) -> tuple[Mapping[str, object], str]:
 
 
 def _exclusive_copy(source: Path, destination: Path, expected: str) -> None:
-    _authenticate_reused_file(source, expected)
+    try:
+        payload = source.read_bytes()
+    except OSError as error:
+        raise ReleaseWorkflowError(
+            f"cannot read continuation evidence: {source}"
+        ) from error
+    if source.is_symlink() or hashlib.sha256(payload).hexdigest() != expected:
+        raise ReleaseWorkflowError(
+            f"reused evidence authentication failed: {source}"
+        )
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with source.open("rb") as reader, destination.open("xb") as writer:
-            shutil.copyfileobj(reader, writer)
-    except FileExistsError as error:
-        raise ReleaseWorkflowError(
-            f"continuation output already exists: {destination}"
-        ) from error
-    if destination.is_symlink() or _sha(destination) != expected:
-        raise ReleaseWorkflowError(
-            f"staged evidence authentication failed: {destination}"
+        publish_bytes_durable_exact(
+            destination,
+            payload,
+            label="continuation output",
         )
+    except (OSError, ValueError) as error:
+        raise ReleaseWorkflowError(
+            f"cannot publish continuation output: {destination}"
+        ) from error
 
 
 def _authenticate_reused_file(source: Path, expected: str) -> None:
@@ -202,14 +248,8 @@ def _authenticate_reused_file(source: Path, expected: str) -> None:
 
 
 def _basename(value: object, label: str) -> str:
-    if (
-        not isinstance(value, str)
-        or not value
-        or Path(value).name != value
-        or "/" in value
-        or "\\" in value
-    ):
-        raise ReleaseWorkflowError(f"{label} must be a basename")
+    if not is_portable_safe_basename(value):
+        raise ReleaseWorkflowError(f"{label} must be a safe basename")
     return value
 
 
@@ -671,40 +711,61 @@ def run(
                 "resume staged selections are not the exact seed boundary"
             )
 
+    external_references = _external_tools(source_workflow) if execute else {}
     external = {
         name: _authenticate_external(reference, f"external {name}")
-        for name, reference in _external_tools(source_workflow).items()
+        for name, reference in external_references.items()
     } if execute else {}
     environment = _closed_environment(root, external) if execute else {}
     if execute:
-        for executable_name in ("git", "node", "pnpm"):
-            resolved = shutil.which(
-                executable_name,
-                path=environment["PATH"],
-            )
-            if (
-                resolved is None
-                or Path(resolved).resolve() != external[executable_name]
-            ):
-                raise ReleaseWorkflowError(
-                    f"closed PATH resolves the wrong {executable_name}"
+        with _stable_external_git(
+            external_references["git"], external["git"]
+        ):
+            for executable_name in ("git", "node", "pnpm"):
+                resolved = shutil.which(
+                    executable_name,
+                    path=environment["PATH"],
                 )
-        revision = subprocess.run(
-            [str(external["git"]), "rev-parse", "HEAD"],
-            cwd=root, check=True, capture_output=True, text=True, env=environment,
-        ).stdout.strip()
-        if revision != manifest["executionSourceRevision"]:
-            raise ReleaseWorkflowError(
-                "source revision differs from continuation manifest"
+                if (
+                    resolved is None
+                    or Path(resolved).resolve() != external[executable_name]
+                ):
+                    raise ReleaseWorkflowError(
+                        f"closed PATH resolves the wrong {executable_name}"
+                    )
+            revision = _run_capture_process(
+                _hardened_git_command(
+                    external["git"], "rev-parse", "HEAD"
+                ),
+                cwd=root,
+                environment=environment,
+                timeout=GIT_TIMEOUT_SECONDS,
+            ).stdout.strip()
+            if revision != manifest["executionSourceRevision"]:
+                raise ReleaseWorkflowError(
+                    "source revision differs from continuation manifest"
+                )
+            _preflight_recursive_git_filters(
+                external["git"],
+                repository=root,
+                environment=environment,
             )
-        dirty = subprocess.run(
-            [str(external["git"]), "status", "--porcelain", "--untracked-files=all"],
-            cwd=root, check=True, capture_output=True, text=True, env=environment,
-        ).stdout
-        if dirty:
-            raise ReleaseWorkflowError(
-                "tracked source changes are present during continuation"
-            )
+            dirty = _run_capture_process(
+                _hardened_git_command(
+                    external["git"],
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=all",
+                    "--ignore-submodules=none",
+                ),
+                cwd=root,
+                environment=environment,
+                timeout=GIT_TIMEOUT_SECONDS,
+            ).stdout
+            if dirty:
+                raise ReleaseWorkflowError(
+                    "tracked source changes are present during continuation"
+                )
         for reference in _input_references(source_workflow):
             from .release_workflow import _authenticate_input
             _authenticate_input(root, reference)
@@ -811,10 +872,22 @@ def run(
     if execute:
         target = root / transcript_path
         target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("xb") as stream:
-            stream.write(json.dumps(
-                transcript, sort_keys=True, separators=(",", ":"), allow_nan=False,
-            ).encode() + b"\n")
+        payload = json.dumps(
+            transcript,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode() + b"\n"
+        try:
+            publish_bytes_durable_exact(
+                target,
+                payload,
+                label="continuation transcript",
+            )
+        except (OSError, ValueError) as error:
+            raise ReleaseWorkflowError(
+                f"cannot publish continuation transcript: {target}"
+            ) from error
     return transcript
 
 

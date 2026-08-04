@@ -317,6 +317,49 @@ class CorpusContractTests(unittest.TestCase):
                 hashlib.sha256(audited.dataset_path.read_bytes()).hexdigest(),
             )
 
+    def test_rejects_nonportable_and_colliding_split_file_names(self) -> None:
+        for invalid_name in (
+            "train.ndjson\x00ignored",
+            "NUL",
+            "train.ndjson:secret",
+            "train.ndjson.",
+            "train.ndjson ",
+            "nested/train.ndjson",
+            "nested\\train.ndjson",
+        ):
+            with (
+                self.subTest(file=invalid_name),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                manifest_path = write_fixture(Path(temporary))
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest["splits"]["train"]["file"] = invalid_name
+                manifest_path.write_text(
+                    json.dumps(manifest, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(CorpusContractError, "portable"):
+                    audit_corpus_split(
+                        manifest_path,
+                        "train",
+                        require_complete_catalog=False,
+                    )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = write_fixture(Path(temporary))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["splits"]["validation"]["file"] = "TRAIN.NDJSON"
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(CorpusContractError, "portable-distinct"):
+                audit_corpus_split(
+                    manifest_path,
+                    "train",
+                    require_complete_catalog=False,
+                )
+
     def test_complete_catalog_gate_rejects_random_assignment(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             manifest = write_fixture(Path(temporary))

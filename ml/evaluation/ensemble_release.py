@@ -8,8 +8,10 @@ import json
 import math
 import os
 from pathlib import Path, PurePosixPath
-import tempfile
 from typing import Mapping, Sequence
+
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable_exact
+from ml.training.drawback_ml.path_validation import is_portable_safe_basename
 
 from .release_selection_bundle import (
     ContentAddressedJson,
@@ -491,14 +493,8 @@ def _safe_relative(value: object, name: str) -> str:
 
 
 def _basename(value: object, name: str) -> str:
-    if (
-        not isinstance(value, str)
-        or not value
-        or Path(value).name != value
-        or "/" in value
-        or "\\" in value
-    ):
-        raise ValueError(f"{name} must be a non-empty basename")
+    if not is_portable_safe_basename(value):
+        raise ValueError(f"{name} must be a safe basename")
     return value
 
 
@@ -552,23 +548,16 @@ def _canonical_json(value: Mapping[str, object]) -> bytes:
 
 def _write_atomic_no_clobber(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "wb") as target:
-            target.write(payload)
-            target.flush()
-            os.fsync(target.fileno())
-        try:
-            os.link(temporary, path)
-        except FileExistsError as error:
-            raise ValueError(
-                f"refusing to overwrite ensemble release: {path}"
-            ) from error
-    finally:
-        temporary.unlink(missing_ok=True)
+        publish_bytes_durable_exact(
+            path,
+            payload,
+            label="ensemble release",
+        )
+    except ValueError as error:
+        raise ValueError(
+            f"refusing to overwrite ensemble release: {path}"
+        ) from error
 
 
 def _require_finite(value: object, name: str) -> None:

@@ -39,37 +39,37 @@ from test_corpus_contract import BINARY_DIGEST, ENGINE_FINGERPRINT, write_fixtur
 from test_private_corpus_contract import write_release
 
 
+def _patched_authenticated_git(*results: SimpleNamespace):
+    return patch(
+        "drawback_ml.cli._authenticated_git_runner",
+        return_value=Mock(side_effect=results),
+    )
+
+
 class LazyModelTests(unittest.TestCase):
     def test_release_revision_requires_matching_clean_head(self) -> None:
         revision = "a" * 40
         repository_root = Path.cwd().resolve()
-        with patch(
-            "drawback_ml.cli.subprocess.run",
-            side_effect=[
-                SimpleNamespace(stdout=revision + "\n"),
-                SimpleNamespace(stdout=str(repository_root) + "\n"),
-                SimpleNamespace(stdout=""),
-                SimpleNamespace(stdout=revision + "\n"),
-            ],
+        with _patched_authenticated_git(
+            SimpleNamespace(stdout=revision + "\n"),
+            SimpleNamespace(stdout=str(repository_root) + "\n"),
+            SimpleNamespace(stdout=""),
+            SimpleNamespace(stdout=revision + "\n"),
         ):
             self.assertEqual(
                 _verify_clean_execution_revision(revision),
                 revision,
             )
-        with patch(
-            "drawback_ml.cli.subprocess.run",
-            return_value=SimpleNamespace(stdout="b" * 40 + "\n"),
+        with _patched_authenticated_git(
+            SimpleNamespace(stdout="b" * 40 + "\n"),
         ):
             with self.assertRaisesRegex(ValueError, "differs"):
                 _verify_clean_execution_revision(revision)
-        with patch(
-            "drawback_ml.cli.subprocess.run",
-            side_effect=[
-                SimpleNamespace(stdout=revision + "\n"),
-                SimpleNamespace(stdout=str(repository_root) + "\n"),
-                SimpleNamespace(stdout=" M source.py\0"),
-                SimpleNamespace(stdout=revision + "\n"),
-            ],
+        with _patched_authenticated_git(
+            SimpleNamespace(stdout=revision + "\n"),
+            SimpleNamespace(stdout=str(repository_root) + "\n"),
+            SimpleNamespace(stdout=" M source.py\0"),
+            SimpleNamespace(stdout=revision + "\n"),
         ):
             with self.assertRaisesRegex(ValueError, "clean"):
                 _verify_clean_execution_revision(revision)
@@ -77,19 +77,16 @@ class LazyModelTests(unittest.TestCase):
             _verify_clean_execution_revision("not-a-revision")
 
         staging = repository_root / ".run.staging-fixture"
-        with patch(
-            "drawback_ml.cli.subprocess.run",
-            side_effect=[
-                SimpleNamespace(stdout=revision + "\n"),
-                SimpleNamespace(stdout=str(repository_root) + "\n"),
-                SimpleNamespace(
-                    stdout=(
-                        "?? .run.staging-fixture/checkpoint.pt\0"
-                        "?? .run.staging-fixture/run.json\0"
-                    )
-                ),
-                SimpleNamespace(stdout=revision + "\n"),
-            ],
+        with _patched_authenticated_git(
+            SimpleNamespace(stdout=revision + "\n"),
+            SimpleNamespace(stdout=str(repository_root) + "\n"),
+            SimpleNamespace(
+                stdout=(
+                    "?? .run.staging-fixture/checkpoint.pt\0"
+                    "?? .run.staging-fixture/run.json\0"
+                )
+            ),
+            SimpleNamespace(stdout=revision + "\n"),
         ):
             self.assertEqual(
                 _verify_clean_execution_revision(
@@ -99,26 +96,20 @@ class LazyModelTests(unittest.TestCase):
                 revision,
             )
 
-        with patch(
-            "drawback_ml.cli.subprocess.run",
-            side_effect=[
-                SimpleNamespace(stdout=revision + "\n"),
-                SimpleNamespace(stdout=str(repository_root) + "\n"),
-                SimpleNamespace(stdout=""),
-                SimpleNamespace(stdout="b" * 40 + "\n"),
-            ],
+        with _patched_authenticated_git(
+            SimpleNamespace(stdout=revision + "\n"),
+            SimpleNamespace(stdout=str(repository_root) + "\n"),
+            SimpleNamespace(stdout=""),
+            SimpleNamespace(stdout="b" * 40 + "\n"),
         ):
             with self.assertRaisesRegex(ValueError, "changed during"):
                 _verify_clean_execution_revision(revision)
 
-        with patch(
-            "drawback_ml.cli.subprocess.run",
-            side_effect=[
-                SimpleNamespace(stdout=revision + "\n"),
-                SimpleNamespace(
-                    stdout=str(repository_root.parent) + "\n"
-                ),
-            ],
+        with _patched_authenticated_git(
+            SimpleNamespace(stdout=revision + "\n"),
+            SimpleNamespace(
+                stdout=str(repository_root.parent) + "\n"
+            ),
         ):
             with self.assertRaisesRegex(ValueError, "loaded training source"):
                 _verify_clean_execution_revision(revision)

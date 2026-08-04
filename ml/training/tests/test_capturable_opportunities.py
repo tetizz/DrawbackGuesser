@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -284,6 +285,10 @@ class CapturableOpportunityTests(unittest.TestCase):
                 checkpoint_path,
                 test,
                 root / "sealed.json",
+                expected_test_sha256=hashlib.sha256(
+                    test.read_bytes()
+                ).hexdigest(),
+                consumption_registry=root / "consumption-registry",
             )
             self.assertIn("testHybridTop1", sealed)
 

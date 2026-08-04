@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 from types import SimpleNamespace
@@ -17,14 +18,62 @@ from ml.evaluation.review_authorization import (
 )
 from ml.evaluation.sealed_test import (
     _pinned_sealed_inputs,
+    _publish_pair,
     _source_identity,
+    build_parser,
     execute_authorized_test,
 )
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable
 from ml.evaluation.tests.test_review_authorization import fixture
 
 
 class SealedTestBoundaryTests(unittest.TestCase):
+    def test_help_discloses_checkout_local_consumption_scope(self) -> None:
+        help_text = " ".join(build_parser().format_help().lower().split()).replace(
+            "- ", "-"
+        )
+        self.assertIn("trusted git common directory", help_text)
+        self.assertIn("external append-only authority", help_text)
+        self.assertIn("signed single-use lease", help_text)
+
+    def test_pair_publication_retains_report_on_late_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            report = root / "report.json"
+            decision = root / "decision.json"
+            real_publish = publish_bytes_durable
+            calls = 0
+
+            def collide(path: Path, payload: bytes) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    path.write_bytes(b"competing decision\n")
+                real_publish(path, payload)
+
+            with (
+                patch(
+                    "ml.evaluation.sealed_test.publish_bytes_durable",
+                    side_effect=collide,
+                ),
+                self.assertRaisesRegex(
+                    ReviewAuthorizationError,
+                    "overwrite sealed outputs",
+                ) as raised,
+            ):
+                _publish_pair(
+                    report,
+                    b"sealed report\n",
+                    decision,
+                    b"sealed decision\n",
+                )
+            self.assertEqual(report.read_bytes(), b"sealed report\n")
+            self.assertEqual(decision.read_bytes(), b"competing decision\n")
+            cause_notes = getattr(raised.exception.__cause__, "__notes__", ())
+            self.assertIn("retained the sealed report", " ".join(cause_notes))
+
     def _authorization(self, root: Path) -> tuple[ContentAddressedFile, dict[str, object]]:
+        (root / ".git").mkdir(exist_ok=True)
         approval, allowed, reviewers, value = fixture(root)
         (root / "ml").mkdir()
         (root / "ml" / "requirements.txt").write_bytes(
@@ -223,7 +272,6 @@ class SealedTestBoundaryTests(unittest.TestCase):
             (evidence / "authorization.json").write_text(
                 "ignored evidence\n", encoding="utf-8"
             )
-            resolved_root, revision = _source_identity(evidence)
             expected = subprocess.run(
                 ("git", "rev-parse", "HEAD"),
                 cwd=root,
@@ -231,8 +279,181 @@ class SealedTestBoundaryTests(unittest.TestCase):
                 stdout=subprocess.PIPE,
                 text=True,
             ).stdout.strip()
+            real_run = subprocess.run
+            calls: list[tuple[object, dict[str, str]]] = []
+
+            def forged_path_git(command, *args, **kwargs):
+                if not Path(str(command[0])).is_absolute():
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        f"{evidence}\n{'f' * 40}\n",
+                        "",
+                    )
+                environment = kwargs.get("env")
+                self.assertIsInstance(environment, dict)
+                calls.append((command, dict(environment)))
+                return real_run(command, *args, **kwargs)
+
+            poison = evidence / "forged-git"
+            poison.mkdir()
+            with patch.dict(
+                os.environ,
+                {
+                    "PATH": str(poison),
+                    "GIT_DIR": str(poison),
+                    "GIT_WORK_TREE": str(poison),
+                    "PYTHONPATH": str(poison),
+                },
+            ), patch(
+                "ml.evaluation.sealed_test.subprocess.run",
+                side_effect=forged_path_git,
+            ):
+                resolved_root, revision = _source_identity(evidence)
             self.assertEqual(resolved_root, root.resolve())
             self.assertEqual(revision, expected)
+            self.assertEqual(len(calls), 3)
+            for command, environment in calls:
+                self.assertTrue(Path(str(command[0])).is_absolute())
+                self.assertIn("--no-pager", command)
+                self.assertIn(f"core.hooksPath={os.devnull}", command)
+                self.assertIn(f"core.askPass={os.devnull}", command)
+                self.assertIn("credential.helper=", command)
+                self.assertNotEqual(environment["PATH"], str(poison))
+                self.assertEqual(environment["GIT_ASKPASS"], os.devnull)
+                self.assertEqual(environment["SSH_ASKPASS"], os.devnull)
+                for key in (
+                    "GIT_DIR",
+                    "GIT_WORK_TREE",
+                    "PYTHONPATH",
+                ):
+                    self.assertNotIn(key, environment)
+
+    def test_source_identity_rejects_local_filter_before_status(self) -> None:
+        located = shutil.which("git")
+        if located is None:
+            self.skipTest("Git is unavailable")
+        git = Path(located).resolve(strict=True)
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            repository = root / "repository"
+            repository.mkdir()
+            marker = root / "filter-ran"
+            filter_hook = root / "filter-hook"
+            filter_hook.write_text(
+                "#!/bin/sh\n"
+                'printf x > "$DRAWBACK_TEST_FILTER_MARKER"\n'
+                "cat\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            filter_hook.chmod(0o755)
+            subprocess.run(
+                [str(git), "init", "-q"],
+                cwd=repository,
+                check=True,
+            )
+            (repository / ".gitattributes").write_text(
+                "*.txt filter=marker\n", encoding="utf-8"
+            )
+            tracked = repository / "tracked.txt"
+            tracked.write_text("tracked\n", encoding="utf-8")
+            subprocess.run(
+                [str(git), "add", ".gitattributes", "tracked.txt"],
+                cwd=repository,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    str(git),
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "fixture",
+                ],
+                cwd=repository,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    str(git),
+                    "config",
+                    "--local",
+                    "filter.marker.clean",
+                    f'"{filter_hook.as_posix()}"',
+                ],
+                cwd=repository,
+                check=True,
+            )
+            tracked.write_text("changed\n", encoding="utf-8")
+            fixture_environment = dict(os.environ)
+            fixture_environment["DRAWBACK_TEST_FILTER_MARKER"] = str(marker)
+            subprocess.run(
+                [str(git), "status", "--porcelain"],
+                cwd=repository,
+                env=fixture_environment,
+                check=True,
+                capture_output=True,
+            )
+            self.assertTrue(marker.exists(), "filter fixture did not run")
+            marker.unlink()
+            with patch.dict(
+                os.environ,
+                {"DRAWBACK_TEST_FILTER_MARKER": str(marker)},
+                clear=False,
+            ), self.assertRaisesRegex(
+                ReviewAuthorizationError, "executable Git filter"
+            ):
+                _source_identity(repository)
+            self.assertFalse(marker.exists())
+
+    def test_copied_authorization_cannot_reopen_same_sealed_corpus(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / ".git").mkdir()
+            first = root / "copy-a"
+            first.mkdir()
+            first_reference, value = self._authorization(first)
+            second = root / "copy-b"
+            shutil.copytree(first, second)
+            second_authorization = second / first_reference.path.name
+            second_reference = ContentAddressedFile(
+                second_authorization,
+                hashlib.sha256(second_authorization.read_bytes()).hexdigest(),
+            )
+            invocation = value["test_plan"]["argv"]  # type: ignore[index]
+            source_revision = value["dependencies"][  # type: ignore[index]
+                "source_revision"
+            ]
+            with patch(
+                "ml.evaluation.sealed_test._source_identity",
+                return_value=(root, source_revision),
+            ), patch("ml.evaluation.sealed_test._digest"):
+                with self._cwd(first), self.assertRaisesRegex(
+                    ReviewAuthorizationError,
+                    "cannot read sealed public_root",
+                ):
+                    execute_authorized_test(
+                        authorization=first_reference,
+                        invocation=invocation,
+                        directory=first,
+                    )
+                with self._cwd(second), patch(
+                    "ml.evaluation.sealed_test._pinned_sealed_inputs"
+                ) as sealed, self.assertRaisesRegex(
+                    ReviewAuthorizationError,
+                    "refusing to reuse sealed-test corpus",
+                ):
+                    execute_authorized_test(
+                        authorization=second_reference,
+                        invocation=invocation,
+                        directory=second,
+                    )
+                sealed.assert_not_called()
 
     def test_sealed_inputs_are_streamed_without_read_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

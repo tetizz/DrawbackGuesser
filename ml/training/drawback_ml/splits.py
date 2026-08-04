@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
+import math
 
 
 class Split(str, Enum):
@@ -26,12 +27,19 @@ class SplitConfig:
             self.validation_fraction,
             self.test_fraction,
         )
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in fractions
+        ):
+            raise ValueError("split fractions must be finite numbers")
         if any(value < 0.0 or value > 1.0 for value in fractions):
             raise ValueError("split fractions must be between zero and one")
         if abs(sum(fractions) - 1.0) > 1e-12:
             raise ValueError("split fractions must sum to one")
-        if not self.salt:
-            raise ValueError("split salt cannot be empty")
+        if not isinstance(self.salt, str) or not self.salt:
+            raise ValueError("split salt must be a non-empty string")
 
 
 def assign_split(seed: int, config: SplitConfig = SplitConfig()) -> Split:

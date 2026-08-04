@@ -15,6 +15,7 @@ from .checkpoint import (
     FUSION_GRID_DRAWBACK_OBJECTIVE,
     parse_checkpoint_drawback_objective,
 )
+from .durable_publish import publish_bytes_durable_exact
 from .features import FEATURE_DIMENSION, FEATURE_SCHEMA_VERSION, MOVE_VOCABULARY_SIZE
 from .sequence import (
     SEQUENCE_OBSERVATION_MODES,
@@ -586,15 +587,13 @@ def export_browser_artifact(checkpoint: Path, output: Path) -> Path:
         raise BrowserArtifactError(
             f"browser artifact exceeds {MAX_BROWSER_ARTIFACT_BYTES} bytes"
         )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(f"{output.name}.tmp")
     try:
-        temporary.write_bytes(rendered)
-        temporary.replace(output)
-    except OSError as error:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
+        output.parent.mkdir(parents=True, exist_ok=True)
+        publish_bytes_durable_exact(
+            output,
+            rendered,
+            label="browser artifact",
+        )
+    except (OSError, ValueError) as error:
         raise BrowserArtifactError(f"cannot write browser artifact: {output}") from error
     return output

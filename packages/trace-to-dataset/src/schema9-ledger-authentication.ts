@@ -1,14 +1,4 @@
 import { createHash } from "node:crypto";
-import {
-  createReadStream,
-  type BigIntStats,
-} from "node:fs";
-import {
-  lstat,
-  readFile,
-  realpath,
-  stat,
-} from "node:fs/promises";
 import { TextDecoder } from "node:util";
 import {
   parsePlayerPrivateSimulationTraceLine,
@@ -25,6 +15,7 @@ import {
   assertPathFreeJson,
   canonicalJsonBytes,
   checkedGitCommit,
+  checkedSchema9ProducerRuntimeIdentity,
   checkedSchema9SeedRoots,
   checkedScheduleId,
   checkedSha256,
@@ -34,15 +25,25 @@ import {
   SCHEMA9_GENERATOR_LAUNCH_FORMAT,
   SCHEMA9_GENERATOR_RECEIPT_VERSION,
   SCHEMA9_SCHEDULE_PROFILE,
+  throwIfSchema9Aborted,
   type Schema9AssignmentScheduler,
   type Schema9ConvertedIdentity,
   type Schema9LedgerSplit,
   type Schema9ReceiptIdentity,
+  type Schema9ProducerRuntimeIdentity,
   type Schema9SeedRoots,
   type Schema9SourceTraceIdentity,
   type Schema9SplitFiles,
   type Schema9SplitLedger,
 } from "./schema9-ledger-types.js";
+import {
+  assertSchema9OwnedStableFileUnchanged,
+  readSchema9OwnedStableFileChunks,
+  readSchema9OwnedStableFileBytes,
+  withSchema9OwnedStableFiles,
+  type Schema9OwnedStableFile,
+  type Schema9OwnedStableFileSet,
+} from "./schema9-stable-file.js";
 
 const MAX_TRACE_LINE_BYTES = 64 * 1024 * 1024;
 const MAX_DATASET_LINE_BYTES = 8 * 1024 * 1024;
@@ -52,12 +53,6 @@ const CAPTURABLE_RULE_ID_SET: ReadonlySet<string> = new Set(
   CAPTURABLE_HYPOTHESIS_RULE_IDS,
 );
 const DEFAULT_INITIAL_FEN = CapturableKingPosition.fromFen().fen;
-
-interface StableFile {
-  readonly requestedPath: string;
-  readonly resolvedPath: string;
-  readonly before: BigIntStats;
-}
 
 interface SourceGame {
   readonly gameId: string;
@@ -87,95 +82,31 @@ export interface AuthenticatedSchema9Split {
   readonly parameterSeeds: ReadonlySet<number>;
 }
 
-function fileSignature(value: BigIntStats): readonly bigint[] {
-  return Object.freeze([
-    value.dev,
-    value.ino,
-    value.size,
-    value.mtimeNs,
-    value.ctimeNs,
-  ]);
-}
-
-function sameSignature(left: BigIntStats, right: BigIntStats): boolean {
-  const leftSignature = fileSignature(left);
-  const rightSignature = fileSignature(right);
-  return leftSignature.every(
-    (value, index) => value === rightSignature[index],
+export async function assertDistinctExplicitFiles(
+  paths: readonly string[],
+  signal?: AbortSignal,
+): Promise<void> {
+  await withSchema9OwnedStableFiles(
+    paths.map((path, index) => Object.freeze({
+      path,
+      label: `input[${String(index)}]`,
+    })),
+    () => Promise.resolve(undefined),
+    signal,
   );
 }
 
-async function openStableFile(
-  path: string,
-  label: string,
-): Promise<StableFile> {
-  if (path.length === 0) {
-    throw new TypeError(`${label} path must not be empty.`);
-  }
-  const linkInfo = await lstat(path, { bigint: true });
-  if (linkInfo.isSymbolicLink()) {
-    throw new TypeError(`${label} must not be a symbolic link.`);
-  }
-  if (!linkInfo.isFile()) {
-    throw new TypeError(`${label} must be a regular file.`);
-  }
-  const resolvedPath = await realpath(path);
-  const before = await stat(resolvedPath, { bigint: true });
-  if (!before.isFile()) {
-    throw new TypeError(`${label} must resolve to a regular file.`);
-  }
-  return {
-    requestedPath: path,
-    resolvedPath,
-    before,
-  };
-}
-
-async function assertUnchanged(file: StableFile, label: string): Promise<void> {
-  const after = await stat(file.resolvedPath, { bigint: true });
-  if (!sameSignature(file.before, after)) {
-    throw new Error(`${label} changed while it was being authenticated.`);
-  }
-}
-
-function fileObjectKey(file: StableFile): string {
-  return `${file.before.dev.toString()}:${file.before.ino.toString()}`;
-}
-
-export async function assertDistinctExplicitFiles(
-  paths: readonly string[],
-): Promise<void> {
-  const seenObjects = new Set<string>();
-  const seenResolved = new Set<string>();
-  for (const [index, path] of paths.entries()) {
-    const file = await openStableFile(path, `input[${String(index)}]`);
-    const objectKey = fileObjectKey(file);
-    const normalizedPath = file.resolvedPath.toLocaleLowerCase("en-US");
-    if (
-      seenObjects.has(objectKey)
-      || seenResolved.has(normalizedPath)
-    ) {
-      throw new TypeError(
-        "Every ledger input must be an explicit, distinct file.",
-      );
-    }
-    seenObjects.add(objectKey);
-    seenResolved.add(normalizedPath);
-  }
-}
-
 async function authenticateReceipt(
-  path: string,
+  file: Schema9OwnedStableFile,
   label: string,
+  signal?: AbortSignal,
 ): Promise<AuthenticatedReceipt> {
-  const file = await openStableFile(path, label);
-  if (file.before.size <= 0n || file.before.size > BigInt(MAX_RECEIPT_BYTES)) {
-    throw new RangeError(
-      `${label} must be non-empty and at most ${String(MAX_RECEIPT_BYTES)} bytes.`,
-    );
-  }
-  const bytes = await readFile(file.resolvedPath);
-  await assertUnchanged(file, label);
+  const bytes = await readSchema9OwnedStableFileBytes(
+    file,
+    MAX_RECEIPT_BYTES,
+    label,
+    signal,
+  );
   let text: string;
   try {
     text = UTF8.decode(bytes);
@@ -287,7 +218,10 @@ function validateLaunchReceipt(
   scheduleId: string,
   seedRoots: readonly number[],
   producerEngineCommit: string,
-): Readonly<Record<string, unknown>> {
+): Readonly<{
+  counts: Readonly<Record<string, unknown>>;
+  producerRuntimeIdentity: Schema9ProducerRuntimeIdentity;
+}> {
   const value = receipt.value;
   exactReceiptKeys(value, [
     "format",
@@ -301,6 +235,7 @@ function validateLaunchReceipt(
     "scheduleProfile",
     "generationConfig",
     "producerEngineCommit",
+    "producerRuntimeIdentity",
   ], `${split} launch receipt`);
   if (
     value["format"] !== SCHEMA9_GENERATOR_LAUNCH_FORMAT
@@ -334,6 +269,10 @@ function validateLaunchReceipt(
     throw new TypeError(`${split} launch receipt profile is unsupported.`);
   }
   validateGenerationConfig(value["generationConfig"], split);
+  const producerRuntimeIdentity = checkedSchema9ProducerRuntimeIdentity(
+    value["producerRuntimeIdentity"],
+    `${split} launch producerRuntimeIdentity`,
+  );
   const counts = receiptObject(
     value["splitCounts"],
     `${split} launch split counts`,
@@ -347,7 +286,7 @@ function validateLaunchReceipt(
       `${split} launch receipt must use an isolated Engine train schedule.`,
     );
   }
-  return counts;
+  return Object.freeze({ counts, producerRuntimeIdentity });
 }
 
 function validateCompletionReceipt(
@@ -355,6 +294,7 @@ function validateCompletionReceipt(
   split: Schema9LedgerSplit,
   scheduleId: string,
   producerEngineCommit: string,
+  producerRuntimeIdentity: Schema9ProducerRuntimeIdentity,
   launchSha256: string,
   trace: Readonly<{ sha256: string; bytes: number; games: number }>,
 ): void {
@@ -366,6 +306,7 @@ function validateCompletionReceipt(
     "ledgerSplit",
     "state",
     "producerEngineCommit",
+    "producerRuntimeIdentity",
     "launchReceiptSha256",
     "output",
   ], `${split} completion receipt`);
@@ -377,11 +318,22 @@ function validateCompletionReceipt(
     || value["state"] !== "completed"
     || value["producerEngineCommit"] !== producerEngineCommit
     || checkedSha256(
-      String(value["launchReceiptSha256"]),
+      value["launchReceiptSha256"],
       `${split} completion launchReceiptSha256`,
     ) !== launchSha256
   ) {
     throw new TypeError(`${split} completion receipt identity is inconsistent.`);
+  }
+  const completionRuntimeIdentity = checkedSchema9ProducerRuntimeIdentity(
+    value["producerRuntimeIdentity"],
+    `${split} completion producerRuntimeIdentity`,
+  );
+  if (!canonicalJsonBytes(completionRuntimeIdentity).equals(
+    canonicalJsonBytes(producerRuntimeIdentity),
+  )) {
+    throw new TypeError(
+      `${split} completion producer runtime identity is inconsistent.`,
+    );
   }
   const output = receiptObject(value["output"], `${split} completion output`);
   exactReceiptKeys(
@@ -390,7 +342,7 @@ function validateCompletionReceipt(
     `${split} completion output`,
   );
   if (
-    checkedSha256(String(output["sha256"]), `${split} output SHA-256`)
+    checkedSha256(output["sha256"], `${split} output SHA-256`)
       !== trace.sha256
     || receiptInteger(output["bytes"], `${split} output bytes`, 1)
       !== trace.bytes
@@ -406,47 +358,53 @@ function validateCompletionReceipt(
 }
 
 async function* lfLines(
-  file: StableFile,
+  file: Schema9OwnedStableFile,
   label: string,
   maximumLineBytes: number,
+  signal?: AbortSignal,
 ): AsyncGenerator<Buffer> {
-  const stream = createReadStream(file.resolvedPath);
+  throwIfSchema9Aborted(signal, label);
   let fragments: Buffer[] = [];
   let bufferedBytes = 0;
   let lineNumber = 0;
-  for await (const rawChunk of stream) {
-    const chunk = Buffer.isBuffer(rawChunk)
-      ? rawChunk
-      : Buffer.from(rawChunk as Uint8Array);
-    let cursor = 0;
-    let newline = chunk.indexOf(0x0a, cursor);
-    while (newline >= 0) {
-      const fragment = chunk.subarray(cursor, newline + 1);
-      bufferedBytes += fragment.byteLength;
+  for await (const rawChunk of readSchema9OwnedStableFileChunks(
+    file,
+    1024 * 1024,
+    signal,
+  )) {
+      throwIfSchema9Aborted(signal, label);
+      const chunk = rawChunk;
+      let cursor = 0;
+      let newline = chunk.indexOf(0x0a, cursor);
+      while (newline >= 0) {
+        throwIfSchema9Aborted(signal, label);
+        const fragment = chunk.subarray(cursor, newline + 1);
+        bufferedBytes += fragment.byteLength;
+        if (bufferedBytes > maximumLineBytes) {
+          throw new RangeError(
+            `${label} line ${String(lineNumber + 1)} exceeds the byte limit.`,
+          );
+        }
+        fragments.push(fragment);
+        lineNumber += 1;
+        yield Buffer.concat(fragments, bufferedBytes);
+        fragments = [];
+        bufferedBytes = 0;
+        cursor = newline + 1;
+        newline = chunk.indexOf(0x0a, cursor);
+      }
+      const tail = chunk.subarray(cursor);
+      bufferedBytes += tail.byteLength;
       if (bufferedBytes > maximumLineBytes) {
         throw new RangeError(
           `${label} line ${String(lineNumber + 1)} exceeds the byte limit.`,
         );
       }
-      fragments.push(fragment);
-      lineNumber += 1;
-      yield Buffer.concat(fragments, bufferedBytes);
-      fragments = [];
-      bufferedBytes = 0;
-      cursor = newline + 1;
-      newline = chunk.indexOf(0x0a, cursor);
-    }
-    const tail = chunk.subarray(cursor);
-    bufferedBytes += tail.byteLength;
-    if (bufferedBytes > maximumLineBytes) {
-      throw new RangeError(
-        `${label} line ${String(lineNumber + 1)} exceeds the byte limit.`,
-      );
-    }
-    if (tail.byteLength > 0) {
-      fragments.push(tail);
-    }
+      if (tail.byteLength > 0) {
+        fragments.push(tail);
+      }
   }
+  throwIfSchema9Aborted(signal, label);
   if (bufferedBytes > 0) {
     throw new SyntaxError(`${label} must end every record with LF.`);
   }
@@ -617,13 +575,17 @@ function assertExpectedSchedule(
   sourceGames: readonly SourceGame[],
   seedRoots: Schema9SeedRoots,
   scheduler: Schema9AssignmentScheduler,
+  signal?: AbortSignal,
 ): void {
+  throwIfSchema9Aborted(signal, `${split} schedule replay`);
   const expected = scheduler.assignments(
     split,
     sourceGames.length,
     seedRoots,
+    signal,
   )[Symbol.iterator]();
   for (const [index, source] of sourceGames.entries()) {
+    throwIfSchema9Aborted(signal, `${split} schedule replay`);
     const nextAssignment = expected.next();
     const assignment = nextAssignment.done ? undefined : nextAssignment.value;
     if (
@@ -649,6 +611,7 @@ function assertExpectedSchedule(
       );
     }
   }
+  throwIfSchema9Aborted(signal, `${split} schedule replay`);
   if (!expected.next().done) {
     throw new TypeError(`${split} scheduler returned the wrong game count.`);
   }
@@ -725,12 +688,65 @@ export async function authenticateSchema9Split(
   split: Schema9LedgerSplit,
   files: Schema9SplitFiles,
   scheduler: Schema9AssignmentScheduler,
+  signal?: AbortSignal,
 ): Promise<AuthenticatedSchema9Split> {
   return authenticateSchema9SplitWithRuleContract(
     split,
     files,
     CAPTURABLE_HYPOTHESIS_RULE_IDS,
     scheduler,
+    signal,
+  );
+}
+
+function splitStableFileRequests(
+  split: Schema9LedgerSplit,
+  files: Schema9SplitFiles,
+) {
+  return Object.freeze([
+    Object.freeze({ path: files.tracePath, label: `${split} trace` }),
+    Object.freeze({
+      path: files.convertedPath,
+      label: `${split} converted dataset`,
+    }),
+    Object.freeze({
+      path: files.launchReceiptPath,
+      label: `${split} launch receipt`,
+    }),
+    Object.freeze({
+      path: files.completionReceiptPath,
+      label: `${split} completion receipt`,
+    }),
+  ]);
+}
+
+function ownedSplitFile(
+  owned: Schema9OwnedStableFileSet,
+  path: string,
+  label: string,
+): Schema9OwnedStableFile {
+  const file = owned.byPath.get(path);
+  if (file === undefined) {
+    throw new Error(`${label} was not retained by the stable-input owner.`);
+  }
+  return file;
+}
+
+/** Authenticate a split from handles retained by the corpus-level owner. */
+export async function authenticateSchema9SplitWithOwnedInputs(
+  split: Schema9LedgerSplit,
+  files: Schema9SplitFiles,
+  scheduler: Schema9AssignmentScheduler,
+  owned: Schema9OwnedStableFileSet,
+  signal?: AbortSignal,
+): Promise<AuthenticatedSchema9Split> {
+  return authenticateSchema9SplitFromOwnedInputs(
+    split,
+    files,
+    CAPTURABLE_HYPOTHESIS_RULE_IDS,
+    scheduler,
+    owned,
+    signal,
   );
 }
 
@@ -744,7 +760,31 @@ export async function authenticateSchema9SplitWithRuleContract(
   files: Schema9SplitFiles,
   ruleIds: readonly string[],
   scheduler: Schema9AssignmentScheduler,
+  signal?: AbortSignal,
 ): Promise<AuthenticatedSchema9Split> {
+  return withSchema9OwnedStableFiles(
+    splitStableFileRequests(split, files),
+    async (owned) => authenticateSchema9SplitFromOwnedInputs(
+      split,
+      files,
+      ruleIds,
+      scheduler,
+      owned,
+      signal,
+    ),
+    signal,
+  );
+}
+
+async function authenticateSchema9SplitFromOwnedInputs(
+  split: Schema9LedgerSplit,
+  files: Schema9SplitFiles,
+  ruleIds: readonly string[],
+  scheduler: Schema9AssignmentScheduler,
+  owned: Schema9OwnedStableFileSet,
+  signal?: AbortSignal,
+): Promise<AuthenticatedSchema9Split> {
+  throwIfSchema9Aborted(signal, `${split} authentication`);
   const checkedRuleIds = checkedRuleContract(ruleIds);
   const expectedRuleIds = new Set(checkedRuleIds);
   const scheduleId = checkedScheduleId(
@@ -756,21 +796,36 @@ export async function authenticateSchema9SplitWithRuleContract(
     files.producerEngineCommit,
     `${split} producerEngineCommit`,
   );
-  const traceFile = await openStableFile(files.tracePath, `${split} trace`);
-  const convertedFile = await openStableFile(
+  const traceFile = ownedSplitFile(
+    owned,
+    files.tracePath,
+    `${split} trace`,
+  );
+  const convertedFile = ownedSplitFile(
+    owned,
     files.convertedPath,
     `${split} converted dataset`,
   );
-  const launch = await authenticateReceipt(
-    files.launchReceiptPath,
+  const launchReceipt = await authenticateReceipt(
+    ownedSplitFile(
+      owned,
+      files.launchReceiptPath,
+      `${split} launch receipt`,
+    ),
     `${split} launch receipt`,
+    signal,
   );
   const completion = await authenticateReceipt(
-    files.completionReceiptPath,
+    ownedSplitFile(
+      owned,
+      files.completionReceiptPath,
+      `${split} completion receipt`,
+    ),
     `${split} completion receipt`,
+    signal,
   );
-  const launchCounts = validateLaunchReceipt(
-    launch,
+  const launchContract = validateLaunchReceipt(
+    launchReceipt,
     split,
     scheduleId,
     seedRoots,
@@ -783,11 +838,13 @@ export async function authenticateSchema9SplitWithRuleContract(
     traceFile,
     `${split} trace`,
     MAX_TRACE_LINE_BYTES,
+    signal,
   );
   const datasetIterator = lfLines(
     convertedFile,
     `${split} converted dataset`,
     MAX_DATASET_LINE_BYTES,
+    signal,
   )[Symbol.asyncIterator]();
   const sourceGames: SourceGame[] = [];
   const gameIds = new Set<string>();
@@ -804,95 +861,111 @@ export async function authenticateSchema9SplitWithRuleContract(
   let rows = 0;
   let zeroPlyGames = 0;
 
-  for await (const rawTrace of traceLines) {
-    traceHash.update(rawTrace);
-    traceBytes += rawTrace.byteLength;
-    const lineNumber = sourceGames.length + 1;
-    const trace = parsePlayerPrivateSimulationTraceLine(
-      decodedLine(rawTrace, `${split} trace line ${String(lineNumber)}`),
-    );
-    const encodedTrace = Buffer.from(`${JSON.stringify(trace)}\n`, "utf8");
-    if (!rawTrace.equals(encodedTrace)) {
-      throw new TypeError(
-        `${split} trace line ${String(lineNumber)} is not canonical Engine output.`,
+  try {
+    for await (const rawTrace of traceLines) {
+      throwIfSchema9Aborted(signal, `${split} trace replay`);
+      traceHash.update(rawTrace);
+      traceBytes += rawTrace.byteLength;
+      const lineNumber = sourceGames.length + 1;
+      const trace = parsePlayerPrivateSimulationTraceLine(
+        decodedLine(rawTrace, `${split} trace line ${String(lineNumber)}`),
       );
-    }
-    const source = sourceGame(trace, expectedRuleIds);
-    if (gameIds.has(source.gameId)) {
-      throw new TypeError(`${split} source contains a duplicate game ID.`);
-    }
-    if (simulationSeeds.has(source.seed)) {
-      throw new TypeError(
-        `${split} source contains a duplicate simulation seed.`,
-      );
-    }
-    if (allSeeds.has(source.seed)) {
-      throw new TypeError(`${split} reuses a seed across streams.`);
-    }
-    allSeeds.add(source.seed);
-    for (const parameterSeed of [
-      source.parameterSeeds.white,
-      source.parameterSeeds.black,
-    ]) {
-      if (allSeeds.has(parameterSeed)) {
+      const encodedTrace = Buffer.from(`${JSON.stringify(trace)}\n`, "utf8");
+      if (!rawTrace.equals(encodedTrace)) {
+        throw new TypeError(
+          `${split} trace line ${String(lineNumber)} is not canonical Engine output.`,
+        );
+      }
+      const source = sourceGame(trace, expectedRuleIds);
+      if (gameIds.has(source.gameId)) {
+        throw new TypeError(`${split} source contains a duplicate game ID.`);
+      }
+      if (simulationSeeds.has(source.seed)) {
+        throw new TypeError(
+          `${split} source contains a duplicate simulation seed.`,
+        );
+      }
+      if (allSeeds.has(source.seed)) {
         throw new TypeError(`${split} reuses a seed across streams.`);
       }
-      allSeeds.add(parameterSeed);
-      parameterSeeds.add(parameterSeed);
-    }
-    if (gameIndexes.has(source.gameIndex)) {
-      throw new TypeError(`${split} source contains a duplicate game index.`);
-    }
-    gameIds.add(source.gameId);
-    simulationSeeds.add(source.seed);
-    gameIndexes.add(source.gameIndex);
-    sourceGames.push(source);
-    whiteCounts[source.whiteRuleId] =
-      (whiteCounts[source.whiteRuleId] ?? 0) + 1;
-    blackCounts[source.blackRuleId] =
-      (blackCounts[source.blackRuleId] ?? 0) + 1;
+      allSeeds.add(source.seed);
+      for (const parameterSeed of [
+        source.parameterSeeds.white,
+        source.parameterSeeds.black,
+      ]) {
+        if (allSeeds.has(parameterSeed)) {
+          throw new TypeError(`${split} reuses a seed across streams.`);
+        }
+        allSeeds.add(parameterSeed);
+        parameterSeeds.add(parameterSeed);
+      }
+      if (gameIndexes.has(source.gameIndex)) {
+        throw new TypeError(`${split} source contains a duplicate game index.`);
+      }
+      gameIds.add(source.gameId);
+      simulationSeeds.add(source.seed);
+      gameIndexes.add(source.gameIndex);
+      sourceGames.push(source);
+      whiteCounts[source.whiteRuleId] =
+        (whiteCounts[source.whiteRuleId] ?? 0) + 1;
+      blackCounts[source.blackRuleId] =
+        (blackCounts[source.blackRuleId] ?? 0) + 1;
 
-    const convertedRows =
-      convertParsedPlayerPrivateTraceToDatasetRows(trace);
-    if (convertedRows.length !== source.plies) {
-      throw new Error(
-        `${split} converter row count disagrees with source plies.`,
+      const convertedRows =
+        convertParsedPlayerPrivateTraceToDatasetRows(trace);
+      if (convertedRows.length !== source.plies) {
+        throw new Error(
+          `${split} converter row count disagrees with source plies.`,
+        );
+      }
+      if (source.plies === 0) {
+        zeroPlyGames += 1;
+      } else {
+        convertedGameIds.add(source.gameId);
+        convertedSeeds.add(source.seed);
+      }
+      for (const row of convertedRows) {
+        throwIfSchema9Aborted(signal, `${split} conversion replay`);
+        const next = await datasetIterator.next();
+        throwIfSchema9Aborted(signal, `${split} conversion replay`);
+        if (next.done) {
+          throw new TypeError(
+            `${split} converted dataset ended before pinned conversion output.`,
+          );
+        }
+        const rawDataset = next.value;
+        const expected = exactDatasetRowBytes(row);
+        if (!rawDataset.equals(expected)) {
+          throw new TypeError(
+            `${split} converted dataset differs from pinned conversion at row `
+            + `${String(rows + 1)}.`,
+          );
+        }
+        datasetHash.update(rawDataset);
+        datasetBytes += rawDataset.byteLength;
+        rows += 1;
+      }
+    }
+    const extra = await datasetIterator.next();
+    throwIfSchema9Aborted(signal, `${split} conversion replay`);
+    if (extra.done === false) {
+      throw new TypeError(
+        `${split} converted dataset has rows outside the source trace.`,
       );
     }
-    if (source.plies === 0) {
-      zeroPlyGames += 1;
-    } else {
-      convertedGameIds.add(source.gameId);
-      convertedSeeds.add(source.seed);
-    }
-    for (const row of convertedRows) {
-      const next = await datasetIterator.next();
-      if (next.done) {
-        throw new TypeError(
-          `${split} converted dataset ended before pinned conversion output.`,
-        );
-      }
-      const rawDataset = next.value;
-      const expected = exactDatasetRowBytes(row);
-      if (!rawDataset.equals(expected)) {
-        throw new TypeError(
-          `${split} converted dataset differs from pinned conversion at row `
-          + `${String(rows + 1)}.`,
-        );
-      }
-      datasetHash.update(rawDataset);
-      datasetBytes += rawDataset.byteLength;
-      rows += 1;
-    }
+  } finally {
+    await datasetIterator.return(undefined);
   }
-  const extra = await datasetIterator.next();
-  if (extra.done === false) {
-    throw new TypeError(
-      `${split} converted dataset has rows outside the source trace.`,
-    );
-  }
-  await assertUnchanged(traceFile, `${split} trace`);
-  await assertUnchanged(convertedFile, `${split} converted dataset`);
+  await assertSchema9OwnedStableFileUnchanged(
+    traceFile,
+    `${split} trace`,
+    signal,
+  );
+  await assertSchema9OwnedStableFileUnchanged(
+    convertedFile,
+    `${split} converted dataset`,
+    signal,
+  );
 
   if (sourceGames.length === 0) {
     throw new TypeError(`${split} source trace must contain games.`);
@@ -902,10 +975,11 @@ export async function authenticateSchema9SplitWithRuleContract(
       `${split} converted dataset must contain at least one observed move.`,
     );
   }
-  if (launchCounts["train"] !== sourceGames.length) {
+  if (launchContract.counts["train"] !== sourceGames.length) {
     throw new TypeError(`${split} launch receipt game count is inconsistent.`);
   }
-  assertExpectedSchedule(split, sourceGames, seedRoots, scheduler);
+  assertExpectedSchedule(split, sourceGames, seedRoots, scheduler, signal);
+  throwIfSchema9Aborted(signal, `${split} schedule replay`);
   assertExactSchema9LabelBalance(
     sourceGames.length,
     whiteCounts,
@@ -958,17 +1032,20 @@ export async function authenticateSchema9SplitWithRuleContract(
     split,
     scheduleId,
     producerEngineCommit,
-    launch.identity.sha256,
+    launchContract.producerRuntimeIdentity,
+    launchReceipt.identity.sha256,
     sourceTrace,
   );
+  throwIfSchema9Aborted(signal, `${split} authentication`);
   return Object.freeze({
     ledger: Object.freeze({
       split,
       scheduleId,
       seedRoots,
       producerEngineCommit,
+      producerRuntimeIdentity: launchContract.producerRuntimeIdentity,
       generatorReceipts: Object.freeze({
-        launch: launch.identity,
+        launch: launchReceipt.identity,
         completion: completion.identity,
       }),
       scheduleProfile: SCHEMA9_SCHEDULE_PROFILE,

@@ -448,8 +448,9 @@ class ReleaseWorkflowBuilderTests(unittest.TestCase):
                     ),
                 ),
             )
+            fusion_module_index = fusion_step.argv.index("ml.evaluation.cli")
             self.assertEqual(
-                fusion_step.argv[11],
+                fusion_step.argv[fusion_module_index + 1],
                 "select-ensemble-fusion",
             )
             self.assertEqual(

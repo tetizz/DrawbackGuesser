@@ -32,6 +32,8 @@ export {
   createSchema9CorpusLedger,
   assertSchema9CorpusLedgerByteLength,
   loadAndReauthenticateSchema9CorpusLedger,
+  loadAndReauthenticateSchema9CorpusLedgerWithIdentity,
+  publishOrAuthenticateSchema9CorpusLedgerArtifactAtomic,
   schema9CorpusLedgerFileSha256,
   SCHEMA9_CORPUS_LEDGER_FORMAT,
   SCHEMA9_CORPUS_LEDGER_MAX_BYTES,
@@ -43,22 +45,39 @@ export {
   SCHEMA9_GENERATOR_RECEIPT_VERSION,
   SCHEMA9_LEDGER_SPLITS,
   SCHEMA9_PRODUCER_CONVERTER_POLICIES,
+  SCHEMA9_PRODUCER_RUNTIME_IDENTITY_FORMAT,
+  SCHEMA9_PRODUCER_RUNTIME_IDENTITY_VERSION,
+  SCHEMA9_PRODUCER_RUNTIME_MANIFEST_ALGORITHM,
   SCHEMA9_SEED_STREAMS,
   SCHEMA9_SCHEDULE_PROFILE,
   SCHEMA9_SPLIT_SEED_ROOTS,
   writeSchema9CorpusLedgerAtomic,
 } from "./schema9-corpus-ledger.js";
 export {
+  readSchema9StableFileBytes,
+  removeSchema9StableFileIfOwned,
+  withSchema9OwnedStableFiles,
+} from "./schema9-stable-file.js";
+export { runSchema9LinkedTaskGroup } from "./schema9-task-group.js";
+export { schema9PublicationMayBeCommitted } from "./schema9-atomic-publication.js";
+export {
   createSchema9LedgerVerificationReceipt,
+  publishOrAuthenticateSchema9LedgerVerificationReceipt,
   SCHEMA9_LEDGER_VERIFICATION_RECEIPT_FORMAT,
   SCHEMA9_LEDGER_VERIFICATION_RECEIPT_VERSION,
   schema9LedgerVerificationReceiptSha256,
   writeSchema9LedgerVerificationReceiptAtomic,
 } from "./schema9-ledger-verification-receipt.js";
-export { canonicalJsonBytes } from "./schema9-ledger-types.js";
+export {
+  canonicalJsonBytes,
+  checkedSchema9ProducerRuntimeIdentity,
+  throwIfSchema9Aborted,
+} from "./schema9-ledger-types.js";
 export { schema9AssignmentScheduler } from "./schema9-schedule-replay.js";
 export type {
+  PublishedOrAuthenticatedSchema9LedgerVerificationReceipt,
   Schema9LedgerVerificationReceipt,
+  WrittenSchema9LedgerVerificationReceipt,
 } from "./schema9-ledger-verification-receipt.js";
 export type {
   Schema9CorpusLedger,
@@ -69,6 +88,11 @@ export type {
   Schema9GenerationConfig,
   Schema9LedgerSplit,
   Schema9ProducerConverterPolicy,
+  Schema9ProducerRuntimeComponentIdentity,
+  Schema9ProducerRuntimeDescriptor,
+  Schema9ProducerRuntimeIdentity,
+  PublishedOrAuthenticatedSchema9CorpusLedger,
+  ReauthenticatedSchema9CorpusLedger,
   Schema9RepositoryVerifier,
   Schema9SeedRoots,
   Schema9SplitFiles,

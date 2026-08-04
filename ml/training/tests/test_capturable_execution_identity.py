@@ -28,8 +28,8 @@ _ORIGIN_COMMAND = (
 )
 _REDIRECTION_COMMAND = (
     "config",
-    "--local",
     "--no-includes",
+    "--show-scope",
     "--name-only",
     "--get-regexp",
     capturable_blend._LOCAL_CONFIG_REDIRECTION_PATTERN,
@@ -416,11 +416,12 @@ class CapturableExecutionIdentityTests(unittest.TestCase):
 
     def test_local_include_or_url_redirection_is_rejected(self) -> None:
         for redirection in (
-            "include.path\n",
-            "url.https://evil.example/.insteadof\n",
-            "http.https://github.com/.sslverify\n",
-            "credential.helper\n",
-            "core.excludesfile\n",
+            "local\tinclude.path\n",
+            "local\turl.https://evil.example/.insteadof\n",
+            "local\thttp.https://github.com/.sslverify\n",
+            "local\tcredential.helper\n",
+            "worktree\tcore.excludesfile\n",
+            "worktree\tfilter.hostile.process\n",
         ):
             with self.subTest(redirection=redirection):
                 stub = self._stub()
@@ -433,6 +434,11 @@ class CapturableExecutionIdentityTests(unittest.TestCase):
                     "repository identity is not the pushed release",
                 ):
                     self._execution(stub)
+                logical_calls = [
+                    stub.logical_arguments(command)
+                    for command, _ in stub.calls
+                ]
+                self.assertNotIn(_STATUS_COMMAND, logical_calls)
 
     def test_subprocess_timeout_and_failures_fail_closed(self) -> None:
         failures: tuple[BaseException, ...] = (

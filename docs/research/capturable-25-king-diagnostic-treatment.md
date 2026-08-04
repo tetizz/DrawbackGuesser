@@ -90,9 +90,11 @@ coverage `none`. Before evaluation, verify canonical schema-8 loading, exact
 pair and label/color balance, zero overlap with every earlier split, and a
 surviving true symbolic hypothesis for every row.
 
-Run `evaluate-treatment` once. It must authenticate the canonical comparison
-and both checkpoints before reading the test, then load the test once and
-evaluate the frozen control and t2 without an intervening decision.
+Run `evaluate-treatment` once with `--test-sha256` set to the exact digest
+recorded when this fresh test was preregistered. It must authenticate the
+canonical comparison and both checkpoints, consume that declared corpus
+identity before resolving or reading the test path, then load the test once
+and evaluate the frozen control and t2 without an intervening decision.
 
 The paired test confirms the treatment only if its game-normalized
 Top-1/Top-3/NLL tuple is lexicographically better than the control on this

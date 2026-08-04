@@ -1,13 +1,20 @@
+import { createHash } from "node:crypto";
+
 export const SCHEMA9_CORPUS_LEDGER_FORMAT =
   "drawbackguesser-schema9-corpus-ledger" as const;
-export const SCHEMA9_CORPUS_LEDGER_VERSION = 2 as const;
+export const SCHEMA9_CORPUS_LEDGER_VERSION = 3 as const;
 export const SCHEMA9_EXECUTION_MANIFEST_ALGORITHM =
   "sha256-loaded-module-graph-v2" as const;
 export const SCHEMA9_GENERATOR_LAUNCH_FORMAT =
   "drawbackengine-player-private-schedule-launch" as const;
 export const SCHEMA9_GENERATOR_COMPLETION_FORMAT =
   "drawbackengine-player-private-schedule-completion" as const;
-export const SCHEMA9_GENERATOR_RECEIPT_VERSION = 2 as const;
+export const SCHEMA9_GENERATOR_RECEIPT_VERSION = 3 as const;
+export const SCHEMA9_PRODUCER_RUNTIME_IDENTITY_VERSION = 1 as const;
+export const SCHEMA9_PRODUCER_RUNTIME_IDENTITY_FORMAT =
+  "drawbackengine-schema9-producer-runtime" as const;
+export const SCHEMA9_PRODUCER_RUNTIME_MANIFEST_ALGORITHM =
+  "sha256-engine-runtime-tree-v1" as const;
 export const SCHEMA9_GENERATION_CONFIG = Object.freeze({
   maxPlies: 120,
   maxDepth: 2,
@@ -87,15 +94,30 @@ export interface Schema9SplitFiles {
 
 export interface Schema9RepositoryVerifier {
   readonly pinnedEngineCommitAt:
-    (guesserCommit: string) => Promise<string>;
+    (guesserCommit: string, signal?: AbortSignal) => Promise<string>;
   readonly isEngineAncestor:
-    (ancestorCommit: string, descendantCommit: string) => Promise<boolean>;
+    (
+      ancestorCommit: string,
+      descendantCommit: string,
+      signal?: AbortSignal,
+    ) => Promise<boolean>;
   /**
    * Returns a content-derived identity for the modules executing the parser,
    * converter, scheduler, and ledger verifier. Callers cannot supply these
    * hashes as commit-shaped assertions.
    */
-  readonly executingCodeIdentity: () => Promise<Schema9ExecutionIdentity>;
+  readonly executingCodeIdentity:
+    (signal?: AbortSignal) => Promise<Schema9ExecutionIdentity>;
+  /**
+   * Rebuilds the exact producer commit in a fresh isolated checkout and
+   * returns the runtime-tree identity derived from that build. Receipt values
+   * are never accepted as the authority for this identity.
+   */
+  readonly producerRuntimeIdentityAt:
+    (
+      engineCommit: string,
+      signal?: AbortSignal,
+    ) => Promise<Schema9ProducerRuntimeIdentity>;
 }
 
 export interface Schema9ExpectedAssignment {
@@ -117,6 +139,7 @@ export interface Schema9AssignmentScheduler {
     split: Schema9LedgerSplit,
     gameCount: number,
     seedRoots: Schema9SeedRoots,
+    signal?: AbortSignal,
   ) => Iterable<Schema9ExpectedAssignment>;
 }
 
@@ -144,6 +167,40 @@ export interface Schema9ExecutionIdentity {
   readonly aggregateSha256: string;
 }
 
+export interface Schema9ProducerRuntimeIdentity {
+  readonly format: typeof SCHEMA9_PRODUCER_RUNTIME_IDENTITY_FORMAT;
+  readonly version: typeof SCHEMA9_PRODUCER_RUNTIME_IDENTITY_VERSION;
+  readonly algorithm: typeof SCHEMA9_PRODUCER_RUNTIME_MANIFEST_ALGORITHM;
+  readonly runtime: Schema9ProducerRuntimeDescriptor;
+  readonly coordinator:
+    Schema9ProducerRuntimeComponentIdentity<"schema9-coordinator/v1">;
+  readonly parallelWorker:
+    Schema9ProducerRuntimeComponentIdentity<
+      "player-private-parallel-worker/v1"
+    >;
+  readonly aggregateSha256: string;
+}
+
+export interface Schema9ProducerRuntimeDescriptor {
+  readonly nodeVersion: string;
+  readonly platform: string;
+  readonly architecture: string;
+  readonly execArgv: readonly [];
+}
+
+export interface Schema9ProducerRuntimeComponentIdentity<
+  ComponentId extends
+    | "schema9-coordinator/v1"
+    | "player-private-parallel-worker/v1" =
+      | "schema9-coordinator/v1"
+      | "player-private-parallel-worker/v1",
+> {
+  readonly componentId: ComponentId;
+  readonly files: number;
+  readonly bytes: number;
+  readonly sha256: string;
+}
+
 export interface Schema9CorpusLedgerOptions {
   readonly guesserCommit: string;
   readonly converterEngineCommit: string;
@@ -151,6 +208,7 @@ export interface Schema9CorpusLedgerOptions {
   readonly repositoryVerifier: Schema9RepositoryVerifier;
   readonly assignmentScheduler: Schema9AssignmentScheduler;
   readonly splits: Readonly<Record<Schema9LedgerSplit, Schema9SplitFiles>>;
+  readonly signal?: AbortSignal;
 }
 
 export interface Schema9ReceiptIdentity {
@@ -193,6 +251,7 @@ export interface Schema9SplitLedger {
   readonly scheduleId: string;
   readonly seedRoots: Schema9SeedRoots;
   readonly producerEngineCommit: string;
+  readonly producerRuntimeIdentity: Schema9ProducerRuntimeIdentity;
   readonly generatorReceipts: {
     readonly launch: Schema9ReceiptIdentity;
     readonly completion: Schema9ReceiptIdentity;
@@ -219,6 +278,7 @@ export interface Schema9CorpusLedger {
     readonly converterEngineCommit: string;
     readonly producerConverterPolicy: Schema9ProducerConverterPolicy;
     readonly execution: Schema9ExecutionIdentity;
+    readonly producerRuntimeIdentity: Schema9ProducerRuntimeIdentity;
   };
   readonly scheduleContract: {
     readonly authorityId: "capturable25-schema9-opportunity/v1";
@@ -250,23 +310,191 @@ const PRIVATE_TOKEN = /(?:password|passwd|secret|credential|api[-_.]?key|token)/
 const IDENTITY_EMBEDDED_BEFORE = /[\p{L}\p{N}]$/u;
 const IDENTITY_EMBEDDED_AFTER = /^[\p{L}\p{N}]/u;
 
-export function checkedGitCommit(value: string, label: string): string {
-  if (!FULL_GIT_COMMIT.test(value)) {
+export function checkedGitCommit(value: unknown, label: string): string {
+  if (typeof value !== "string" || !FULL_GIT_COMMIT.test(value)) {
     throw new TypeError(`${label} must be a full lowercase Git commit.`);
   }
   return value;
 }
 
-export function checkedSha256(value: string, label: string): string {
-  if (!LOWER_SHA256.test(value)) {
+export function checkedSha256(value: unknown, label: string): string {
+  if (typeof value !== "string" || !LOWER_SHA256.test(value)) {
     throw new TypeError(`${label} must be a lowercase SHA-256.`);
   }
   return value;
 }
 
-export function checkedScheduleId(value: string, label: string): string {
+export function throwIfSchema9Aborted(
+  signal: AbortSignal | undefined,
+  label = "Schema-9 operation",
+): void {
+  if (signal?.aborted !== true) {
+    return;
+  }
+  if (signal.reason instanceof Error) {
+    throw signal.reason;
+  }
+  throw new Error(`${label} was interrupted.`, { cause: signal.reason });
+}
+
+function exactObjectKeys(
+  value: Readonly<Record<string, unknown>>,
+  expected: readonly string[],
+  label: string,
+): void {
+  const actual = Object.keys(value).sort();
+  const canonical = [...expected].sort();
   if (
-    !IDENTIFIER.test(value)
+    actual.length !== canonical.length
+    || actual.some((key, index) => key !== canonical[index])
+  ) {
+    throw new TypeError(`${label} has invalid fields.`);
+  }
+}
+
+function checkedProducerRuntimeComponent<
+  ComponentId extends Schema9ProducerRuntimeComponentIdentity["componentId"],
+>(
+  value: unknown,
+  label: string,
+  expectedComponentId: ComponentId,
+): Schema9ProducerRuntimeComponentIdentity<ComponentId> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object.`);
+  }
+  const record = value as Readonly<Record<string, unknown>>;
+  exactObjectKeys(
+    record,
+    ["componentId", "files", "bytes", "sha256"],
+    label,
+  );
+  if (record["componentId"] !== expectedComponentId) {
+    throw new TypeError(`${label} componentId is unsupported.`);
+  }
+  const files = record["files"];
+  const bytes = record["bytes"];
+  if (
+    typeof files !== "number"
+    || !Number.isSafeInteger(files)
+    || Object.is(files, -0)
+    || files <= 0
+    || typeof bytes !== "number"
+    || !Number.isSafeInteger(bytes)
+    || Object.is(bytes, -0)
+    || bytes <= 0
+    || typeof record["sha256"] !== "string"
+  ) {
+    throw new TypeError(`${label} size or digest is invalid.`);
+  }
+  return Object.freeze({
+    componentId: expectedComponentId,
+    files,
+    bytes,
+    sha256: checkedSha256(record["sha256"], `${label} SHA-256`),
+  });
+}
+
+export function checkedSchema9ProducerRuntimeIdentity(
+  value: unknown,
+  label = "schema-9 producer runtime identity",
+): Schema9ProducerRuntimeIdentity {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object.`);
+  }
+  const record = value as Readonly<Record<string, unknown>>;
+  exactObjectKeys(record, [
+    "format",
+    "version",
+    "algorithm",
+    "runtime",
+    "coordinator",
+    "parallelWorker",
+    "aggregateSha256",
+  ], label);
+  if (
+    record["format"] !== SCHEMA9_PRODUCER_RUNTIME_IDENTITY_FORMAT
+    || record["version"] !== SCHEMA9_PRODUCER_RUNTIME_IDENTITY_VERSION
+    || record["algorithm"] !== SCHEMA9_PRODUCER_RUNTIME_MANIFEST_ALGORITHM
+  ) {
+    throw new TypeError(`${label} version or algorithm is unsupported.`);
+  }
+  const runtimeValue = record["runtime"];
+  if (
+    typeof runtimeValue !== "object"
+    || runtimeValue === null
+    || Array.isArray(runtimeValue)
+  ) {
+    throw new TypeError(`${label} runtime must be an object.`);
+  }
+  const runtimeRecord = runtimeValue as Readonly<Record<string, unknown>>;
+  exactObjectKeys(
+    runtimeRecord,
+    ["nodeVersion", "platform", "architecture", "execArgv"],
+    `${label} runtime`,
+  );
+  if (
+    typeof runtimeRecord["nodeVersion"] !== "string"
+    || !/^v[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/u.test(
+      runtimeRecord["nodeVersion"],
+    )
+    || typeof runtimeRecord["platform"] !== "string"
+    || typeof runtimeRecord["architecture"] !== "string"
+    || !Array.isArray(runtimeRecord["execArgv"])
+    || runtimeRecord["execArgv"].length !== 0
+  ) {
+    throw new TypeError(`${label} runtime is invalid.`);
+  }
+  const runtime = Object.freeze({
+    nodeVersion: runtimeRecord["nodeVersion"],
+    platform: runtimeRecord["platform"],
+    architecture: runtimeRecord["architecture"],
+    execArgv: Object.freeze([] as const),
+  });
+  if (
+    !/^[0-9A-Za-z._-]+$/u.test(runtime.platform)
+    || !/^[0-9A-Za-z._-]+$/u.test(runtime.architecture)
+  ) {
+    throw new TypeError(`${label} runtime is invalid.`);
+  }
+  const coordinator = checkedProducerRuntimeComponent(
+    record["coordinator"],
+    `${label} coordinator`,
+    "schema9-coordinator/v1",
+  );
+  const parallelWorker = checkedProducerRuntimeComponent(
+    record["parallelWorker"],
+    `${label} parallel worker`,
+    "player-private-parallel-worker/v1",
+  );
+  const payload = Object.freeze({
+    format: SCHEMA9_PRODUCER_RUNTIME_IDENTITY_FORMAT,
+    version: SCHEMA9_PRODUCER_RUNTIME_IDENTITY_VERSION,
+    algorithm: SCHEMA9_PRODUCER_RUNTIME_MANIFEST_ALGORITHM,
+    runtime,
+    coordinator,
+    parallelWorker,
+  });
+  const aggregateSha256 = typeof record["aggregateSha256"] === "string"
+    ? checkedSha256(
+        record["aggregateSha256"],
+        `${label} aggregate SHA-256`,
+      )
+    : "";
+  const expectedAggregate = createHash("sha256")
+    .update(canonicalJsonBytes(payload))
+    .digest("hex");
+  if (aggregateSha256 !== expectedAggregate) {
+    throw new TypeError(`${label} aggregate is inconsistent.`);
+  }
+  const identity = Object.freeze({ ...payload, aggregateSha256 });
+  assertPathFreeJson(identity, label);
+  return identity;
+}
+
+export function checkedScheduleId(value: unknown, label: string): string {
+  if (
+    typeof value !== "string"
+    || !IDENTIFIER.test(value)
     || value.includes("..")
     || value.includes("\\")
     || WINDOWS_RESERVED.test(value)

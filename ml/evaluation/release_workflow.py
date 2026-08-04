@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+import ctypes
+from ctypes import wintypes
 import hashlib
 import json
 import os
+import signal
 import shutil
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -14,7 +17,11 @@ import subprocess
 import sys
 import sysconfig
 import threading
+import time
 from typing import Mapping, Sequence
+
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable
+from ml.training.drawback_ml.path_validation import is_portable_safe_basename
 
 
 FORMAT = "drawbacktrainer-post-training-release-workflow"
@@ -23,14 +30,47 @@ VERSION = 3
 SEEDS = (20260811, 20260812, 20260813)
 EPOCHS = tuple(range(1, 9))
 SELECTION_EVALUATION_WORKERS = 4
+STEP_TIMEOUT_SECONDS = 6 * 60 * 60
+PROCESS_POLL_SECONDS = 0.05
+PROCESS_TERMINATION_GRACE_SECONDS = 5.0
+GIT_TIMEOUT_SECONDS = 30
+CREATE_SUSPENDED = 0x00000004
+JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+WINDOWS_PATHEXT = ".COM;.EXE;.BAT;.CMD"
 SHA256 = frozenset("0123456789abcdef")
-ISOLATED_MODULE_BOOTSTRAP = (
-    "import runpy,sys;"
-    "root,purelib,platlib,stdlib,dynlib,module=sys.argv[1:7];"
-    "sys.path[:]=[root,purelib,platlib,stdlib,dynlib];"
-    "sys.argv=[module,*sys.argv[7:]];"
-    "runpy.run_module(module,run_name='__main__')"
-)
+ISOLATED_MODULE_BOOTSTRAP = r"""
+import os
+import sys
+
+python_controls = {
+    name: value
+    for name, value in os.environ.items()
+    if name.upper().startswith("PYTHON")
+}
+if python_controls != {"PYTHONHASHSEED": "0"}:
+    raise SystemExit("closed Python controls are invalid")
+if (
+    sys.flags.isolated != 0
+    or sys.flags.ignore_environment != 0
+    or sys.flags.no_site != 1
+    or sys.flags.no_user_site != 1
+    or sys.flags.safe_path != 1
+    or sys.flags.dont_write_bytecode != 1
+    or sys.flags.hash_randomization != 0
+):
+    raise SystemExit("closed Python flags are invalid")
+if "sitecustomize" in sys.modules or "usercustomize" in sys.modules:
+    raise SystemExit("Python startup customization was loaded")
+
+sys.dont_write_bytecode = True
+import runpy
+
+root, purelib, platlib, stdlib, dynlib, module = sys.argv[1:7]
+sys.path[:] = [root, purelib, platlib, stdlib, dynlib]
+sys.argv = [module, *sys.argv[7:]]
+runpy.run_module(module, run_name="__main__")
+"""
 
 
 class ReleaseWorkflowError(ValueError):
@@ -39,6 +79,153 @@ class ReleaseWorkflowError(ValueError):
 
 class _SelectionWaveCancelled(ReleaseWorkflowError):
     pass
+
+
+class _JobObjectBasicLimitInformation(ctypes.Structure):
+    _fields_ = (
+        ("per_process_user_time_limit", ctypes.c_int64),
+        ("per_job_user_time_limit", ctypes.c_int64),
+        ("limit_flags", wintypes.DWORD),
+        ("minimum_working_set_size", ctypes.c_size_t),
+        ("maximum_working_set_size", ctypes.c_size_t),
+        ("active_process_limit", wintypes.DWORD),
+        ("affinity", ctypes.c_size_t),
+        ("priority_class", wintypes.DWORD),
+        ("scheduling_class", wintypes.DWORD),
+    )
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = tuple(
+        (name, ctypes.c_uint64)
+        for name in (
+            "read_operation_count",
+            "write_operation_count",
+            "other_operation_count",
+            "read_transfer_count",
+            "write_transfer_count",
+            "other_transfer_count",
+        )
+    )
+
+
+class _JobObjectExtendedLimitInformation(ctypes.Structure):
+    _fields_ = (
+        ("basic_limit_information", _JobObjectBasicLimitInformation),
+        ("io_info", _IoCounters),
+        ("process_memory_limit", ctypes.c_size_t),
+        ("job_memory_limit", ctypes.c_size_t),
+        ("peak_process_memory_used", ctypes.c_size_t),
+        ("peak_job_memory_used", ctypes.c_size_t),
+    )
+
+
+class _WindowsJob:
+    def __init__(self) -> None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_job = kernel32.CreateJobObjectW
+        create_job.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+        create_job.restype = wintypes.HANDLE
+        handle = create_job(None, None)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        self._handle: wintypes.HANDLE | None = handle
+        information = _JobObjectExtendedLimitInformation()
+        information.basic_limit_information.limit_flags = (
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        )
+        set_information = kernel32.SetInformationJobObject
+        set_information.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        )
+        set_information.restype = wintypes.BOOL
+        if not set_information(
+            handle,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            error = ctypes.WinError(ctypes.get_last_error())
+            self.close()
+            raise error
+
+    def assign_and_resume(
+        self,
+        process: subprocess.Popen[str] | subprocess.Popen[bytes],
+    ) -> None:
+        if self._handle is None:
+            raise OSError("process containment is already closed")
+        raw_process_handle = getattr(process, "_handle", None)
+        if raw_process_handle is None:
+            raise OSError("spawned process handle is unavailable")
+        process_handle = wintypes.HANDLE(int(raw_process_handle))
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        assign = kernel32.AssignProcessToJobObject
+        assign.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        assign.restype = wintypes.BOOL
+        if not assign(self._handle, process_handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        ntdll = ctypes.WinDLL("ntdll")
+        resume = ntdll.NtResumeProcess
+        resume.argtypes = (wintypes.HANDLE,)
+        resume.restype = ctypes.c_long
+        status = int(resume(process_handle))
+        if status < 0:
+            raise OSError(
+                "cannot resume contained process: "
+                f"NTSTATUS 0x{status & 0xFFFF_FFFF:08x}"
+            )
+
+    def close(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+        if not close_handle(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        self._handle = None
+
+
+def _popen_contained(
+    arguments: Sequence[str],
+    **options: object,
+) -> tuple[
+    subprocess.Popen[str] | subprocess.Popen[bytes],
+    _WindowsJob | None,
+]:
+    if os.name != "nt":
+        options["start_new_session"] = True
+        return subprocess.Popen(list(arguments), **options), None
+    job = _WindowsJob()
+    options["creationflags"] = int(options.get("creationflags", 0)) | getattr(
+        subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+    ) | CREATE_SUSPENDED
+    try:
+        process = subprocess.Popen(list(arguments), **options)
+    except BaseException:
+        job.close()
+        raise
+    try:
+        job.assign_and_resume(process)
+    except BaseException as error:
+        try:
+            job.close()
+        except BaseException as cleanup_error:
+            error.add_note(f"job cleanup also failed: {cleanup_error!r}")
+        try:
+            process.kill()
+            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        _close_process_streams(process)
+        raise
+    return process, job
 
 
 class _SelectionWave:
@@ -56,6 +243,247 @@ class _SelectionWave:
     def primary_failure(self) -> BaseException | None:
         with self._failure_lock:
             return self._primary_failure
+
+
+def _close_process_streams(
+    process: subprocess.Popen[str] | subprocess.Popen[bytes],
+) -> None:
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def _windows_runtime_paths() -> tuple[Path, Path, Path]:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    def known_directory(function_name: str) -> Path:
+        buffer = ctypes.create_unicode_buffer(32_768)
+        function = getattr(kernel32, function_name)
+        function.argtypes = (wintypes.LPWSTR, wintypes.UINT)
+        function.restype = wintypes.UINT
+        length = function(buffer, len(buffer))
+        if length == 0 or length >= len(buffer):
+            raise OSError(f"{function_name} failed")
+        directory = Path(buffer.value).resolve(strict=True)
+        if not directory.is_dir():
+            raise OSError(f"{function_name} returned a non-directory")
+        return directory
+
+    system_directory = known_directory("GetSystemDirectoryW")
+    windows_directory = known_directory("GetWindowsDirectoryW")
+    command_processor = (system_directory / "cmd.exe").resolve(strict=True)
+    if (
+        not command_processor.is_file()
+        or command_processor.parent != system_directory
+    ):
+        raise OSError("Windows command processor is outside System32")
+    return windows_directory, system_directory, command_processor
+
+
+def _windows_process_environment(
+    path_entries: Sequence[Path] = (),
+    *,
+    runtime_paths: tuple[Path, Path, Path] | None = None,
+) -> dict[str, str]:
+    windows_directory, system_directory, command_processor = (
+        runtime_paths if runtime_paths is not None else _windows_runtime_paths()
+    )
+    paths = {str(path.resolve()) for path in path_entries}
+    paths.add(str(system_directory))
+    return {
+        "SystemRoot": str(windows_directory),
+        "WINDIR": str(windows_directory),
+        "ComSpec": str(command_processor),
+        "PATH": os.pathsep.join(sorted(paths, key=str.casefold)),
+        "PATHEXT": WINDOWS_PATHEXT,
+    }
+
+
+def _windows_taskkill(process_id: int) -> None:
+    runtime_paths = _windows_runtime_paths()
+    _, system_directory, _ = runtime_paths
+    taskkill = (system_directory / "taskkill.exe").resolve(strict=True)
+    if taskkill.parent != system_directory:
+        raise OSError("taskkill resolved outside the Windows system directory")
+    taskkill_identity = _stable_file_identity(taskkill)
+    completed = subprocess.run(
+        [str(taskkill), "/PID", str(process_id), "/T", "/F"],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=PROCESS_TERMINATION_GRACE_SECONDS,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        env=_windows_process_environment(runtime_paths=runtime_paths),
+    )
+    if _stable_file_identity(taskkill) != taskkill_identity:
+        raise OSError("taskkill identity changed during process-tree cleanup")
+    if completed.returncode != 0:
+        raise OSError(
+            f"taskkill failed with exit code {completed.returncode}"
+        )
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen[str] | subprocess.Popen[bytes],
+    containment: _WindowsJob | None,
+) -> None:
+    cleanup_error: BaseException | None = None
+    if os.name == "nt":
+        try:
+            if containment is None:
+                _windows_taskkill(process.pid)
+            else:
+                containment.close()
+        except (
+            OSError,
+            subprocess.SubprocessError,
+            ReleaseWorkflowError,
+        ) as error:
+            cleanup_error = error
+            try:
+                process.kill()
+            except OSError:
+                pass
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        # The direct child can exit before a descendant that ignored SIGTERM.
+        # Always force the remaining process group down before settlement.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+    finally:
+        _close_process_streams(process)
+    if cleanup_error is not None:
+        raise OSError("Windows process-tree cleanup failed") from cleanup_error
+
+
+def _run_step_process(
+    arguments: Sequence[str],
+    *,
+    cwd: Path,
+    environment: Mapping[str, str],
+    cancel: threading.Event | None,
+) -> None:
+    process, containment = _popen_contained(
+        arguments,
+        cwd=cwd,
+        shell=False,
+        env=dict(environment),
+    )
+    deadline = time.monotonic() + STEP_TIMEOUT_SECONDS
+    try:
+        while True:
+            if cancel is not None and cancel.is_set():
+                raise _SelectionWaveCancelled(
+                    "selection evaluation wave was cancelled"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(arguments, STEP_TIMEOUT_SECONDS)
+            try:
+                return_code = process.wait(
+                    timeout=min(PROCESS_POLL_SECONDS, remaining)
+                )
+            except subprocess.TimeoutExpired:
+                continue
+            break
+    except BaseException as error:
+        try:
+            _terminate_process_tree(process, containment)
+        except BaseException as cleanup_error:
+            error.add_note(f"process-tree cleanup also failed: {cleanup_error!r}")
+        raise
+    child_error = (
+        subprocess.CalledProcessError(return_code, arguments)
+        if return_code != 0
+        else None
+    )
+    try:
+        _terminate_process_tree(process, containment)
+    except BaseException as cleanup_error:
+        if child_error is not None:
+            child_error.add_note(
+                f"process-tree cleanup also failed: {cleanup_error!r}"
+            )
+            raise child_error from cleanup_error
+        raise
+    if child_error is not None:
+        raise child_error
+
+
+def _run_capture_process(
+    arguments: Sequence[str],
+    *,
+    cwd: Path,
+    environment: Mapping[str, str],
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    process, containment = _popen_contained(
+        arguments,
+        cwd=cwd,
+        shell=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=dict(environment),
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except BaseException as error:
+        try:
+            _terminate_process_tree(process, containment)
+        except BaseException as cleanup_error:
+            error.add_note(f"process-tree cleanup also failed: {cleanup_error!r}")
+        raise
+    completed = subprocess.CompletedProcess(
+        list(arguments), process.returncode, stdout, stderr
+    )
+    child_error = None
+    if completed.returncode != 0:
+        child_error = subprocess.CalledProcessError(
+            completed.returncode,
+            completed.args,
+            output=completed.stdout,
+            stderr=completed.stderr,
+        )
+    try:
+        _terminate_process_tree(process, containment)
+    except BaseException as cleanup_error:
+        if child_error is not None:
+            child_error.add_note(
+                f"process-tree cleanup also failed: {cleanup_error!r}"
+            )
+            raise child_error from cleanup_error
+        raise
+    if child_error is not None:
+        raise child_error
+    return completed
 
 
 @dataclass(frozen=True)
@@ -118,12 +546,25 @@ def _relative(value: object, label: str) -> Path:
     ):
         raise ReleaseWorkflowError(f"{label} must be a normalized POSIX path")
     pure = PurePosixPath(value)
-    if pure.is_absolute() or ".." in pure.parts or "." in pure.parts:
+    if (
+        pure.is_absolute()
+        or ".." in pure.parts
+        or "." in pure.parts
+        or any(not is_portable_safe_basename(part) for part in pure.parts)
+    ):
         raise ReleaseWorkflowError(f"{label} escapes the repository")
     normalized = pure.as_posix()
     if normalized != value:
         raise ReleaseWorkflowError(f"{label} is not normalized")
     return Path(*pure.parts)
+
+
+def _portable_path_key(path: Path) -> tuple[str, ...]:
+    if path.is_absolute() or not path.parts or any(
+        not is_portable_safe_basename(part) for part in path.parts
+    ):
+        raise ReleaseWorkflowError("release artifact path is not portable")
+    return tuple(part.casefold() for part in path.parts)
 
 
 def _digest(value: object, label: str) -> str:
@@ -239,7 +680,7 @@ def build_plan(workflow: Mapping[str, object], root: Path) -> tuple[Step, ...]:
     candidate_data: dict[
         int, tuple[ArtifactRef, list[Mapping[str, object]]]
     ] = {}
-    candidate_paths: set[Path] = set()
+    candidate_paths: set[tuple[str, ...]] = set()
     input_references: list[ArtifactRef] = list(shared.values())
     for index, raw in enumerate(candidates):
         item = _object(raw, f"candidate {index}")
@@ -266,16 +707,18 @@ def build_plan(workflow: Mapping[str, object], root: Path) -> tuple[Step, ...]:
             input_references.append(checkpoint)
             for name in ("report", "summary"):
                 candidate_path = _relative(epoch[name], f"epoch.{name}")
-                if candidate_path in candidate_paths:
+                candidate_key = _portable_path_key(candidate_path)
+                if candidate_key in candidate_paths:
                     raise ReleaseWorkflowError(
                         "checkpoint/report/summary paths must be distinct"
                     )
-                candidate_paths.add(candidate_path)
-            if checkpoint.path in candidate_paths:
+                candidate_paths.add(candidate_key)
+            checkpoint_key = _portable_path_key(checkpoint.path)
+            if checkpoint_key in candidate_paths:
                 raise ReleaseWorkflowError(
                     "checkpoint/report/summary paths must be distinct"
                 )
-            candidate_paths.add(checkpoint.path)
+            candidate_paths.add(checkpoint_key)
         candidate_data[seed] = (training_run, epochs)
     selection_raw = _object(workflow["selectionOutputs"], "selectionOutputs")
     _exact(selection_raw, {str(seed) for seed in SEEDS}, "selectionOutputs")
@@ -283,7 +726,9 @@ def build_plan(workflow: Mapping[str, object], root: Path) -> tuple[Step, ...]:
         seed: _relative(selection_raw[str(seed)], f"selectionOutputs.{seed}")
         for seed in SEEDS
     }
-    if len(set(selections.values())) != len(SEEDS):
+    if len({_portable_path_key(path) for path in selections.values()}) != len(
+        SEEDS
+    ):
         raise ReleaseWorkflowError("selection output paths must be distinct")
     ensemble = _path_fields(workflow["ensemble"], {"output"}, "ensemble")
     fusion_selection = ensemble["output"].with_name("fusion-selection.json")
@@ -347,8 +792,10 @@ def build_plan(workflow: Mapping[str, object], root: Path) -> tuple[Step, ...]:
     def command(module: str, *arguments: str) -> tuple[str, ...]:
         return (
             sys.executable,
-            "-I",
+            "-B",
+            "-s",
             "-S",
+            "-P",
             "-c",
             ISOLATED_MODULE_BOOTSTRAP,
             str(root.resolve()),
@@ -543,11 +990,13 @@ def build_plan(workflow: Mapping[str, object], root: Path) -> tuple[Step, ...]:
         *(output for step in steps for output in step.outputs),
         transcript,
     ]
-    if len(set(input_paths)) != len(input_paths):
+    input_keys = {_portable_path_key(path) for path in input_paths}
+    output_keys = {_portable_path_key(path) for path in output_paths}
+    if len(input_keys) != len(input_paths):
         raise ReleaseWorkflowError("input artifact paths must be distinct")
-    if len(set(output_paths)) != len(output_paths):
+    if len(output_keys) != len(output_paths):
         raise ReleaseWorkflowError("output artifact paths must be distinct")
-    if set(input_paths).intersection(output_paths):
+    if input_keys.intersection(output_keys):
         raise ReleaseWorkflowError(
             "release outputs must not overwrite input artifacts"
         )
@@ -638,6 +1087,54 @@ def _authenticate_external(reference: ExternalRef, label: str) -> Path:
     return path
 
 
+def _stat_result_identity(
+    status: os.stat_result,
+) -> tuple[int, int, int, int, int]:
+    return (
+        status.st_dev,
+        status.st_ino,
+        status.st_size,
+        status.st_mtime_ns,
+        status.st_ctime_ns,
+    )
+
+
+def _stable_file_identity(path: Path) -> tuple[int, int, int, int, int]:
+    try:
+        status = path.stat()
+    except OSError as error:
+        raise ReleaseWorkflowError(
+            "external executable identity cannot be measured"
+        ) from error
+    return _stat_result_identity(status)
+
+
+def _rollback_new_selection_outputs(
+    output_paths: Sequence[Path],
+) -> tuple[str, ...]:
+    """Retain partial outputs because portable handle-bound unlink is absent.
+
+    A pathname can be replaced after any stat/open authentication and before
+    ``unlink``. Retention is therefore the only portable fail-closed rollback;
+    the caller reports every retained path for explicit operator cleanup.
+    """
+
+    retained: list[str] = []
+    for path in output_paths:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            retained.append(f"cannot inspect retained output {path}: {error}")
+            continue
+        retained.append(
+            "retained selection output because portable Python cannot unlink "
+            f"an authenticated object without a pathname race: {path}"
+        )
+    return tuple(retained)
+
+
 def _authenticate_generated(root: Path, relative: Path) -> tuple[Path, str]:
     try:
         path = _confined(root, relative, must_exist=True)
@@ -656,26 +1153,244 @@ def _closed_environment(
     root: Path,
     tools: Mapping[str, Path],
 ) -> Mapping[str, str]:
-    system_root = os.environ.get("SystemRoot", "")
-    path_entries = {
-        str(path.parent) for path in tools.values()
-    }
-    if system_root:
-        path_entries.add(str(Path(system_root) / "System32"))
-    return {
-        "PATH": os.pathsep.join(sorted(path_entries)),
+    path_entries = {path.parent for path in tools.values()}
+    environment = {
         "PYTHONHASHSEED": "0",
-        "PYTHONNOUSERSITE": "1",
-        "PYTHONPATH": "",
-        **(
-            {"PATHEXT": os.environ["PATHEXT"]}
-            if "PATHEXT" in os.environ
-            else {}
-        ),
-        "TEMP": os.environ.get("TEMP", str(root)),
-        "TMP": os.environ.get("TMP", str(root)),
-        **({"SystemRoot": system_root} if system_root else {}),
+        "TEMP": str(root),
+        "TMP": str(root),
+        "GIT_ASKPASS": os.devnull,
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GCM_INTERACTIVE": "never",
+        "SSH_ASKPASS": os.devnull,
+        "SSH_ASKPASS_REQUIRE": "never",
     }
+    if os.name == "nt":
+        environment.update(_windows_process_environment(tuple(path_entries)))
+    else:
+        environment["PATH"] = os.pathsep.join(
+            sorted((str(path.resolve()) for path in path_entries))
+        )
+    git = tools.get("git")
+    if git is not None:
+        environment["DRAWBACK_AUTHENTICATED_GIT"] = str(git)
+        environment["DRAWBACK_AUTHENTICATED_GIT_SHA256"] = _sha(git)
+    return environment
+
+
+def _hardened_git_command(
+    executable: Path,
+    *arguments: str,
+) -> list[str]:
+    """Build a read-only Git command without executable config hooks."""
+
+    command = [str(executable)]
+    for key, value in (
+        ("core.attributesFile", ""),
+        ("core.excludesFile", ""),
+        ("core.fsmonitor", "false"),
+        ("core.hooksPath", os.devnull),
+        ("core.askPass", os.devnull),
+        ("credential.helper", ""),
+        ("credential.interactive", "false"),
+    ):
+        command.extend(("-c", f"{key}={value}"))
+    command.extend(arguments)
+    return command
+
+
+def _reject_executable_git_filters(
+    executable: Path,
+    *,
+    repository: Path,
+    environment: Mapping[str, str],
+) -> None:
+    """Reject effective local/worktree filters before Git reads the tree."""
+
+    try:
+        configured = _run_capture_process(
+            _git_filter_config_probe_command(executable),
+            cwd=repository,
+            environment=environment,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ReleaseWorkflowError(
+            "cannot authenticate executable Git filter configuration"
+        ) from error
+    _assert_no_executable_git_filters(configured.stdout)
+
+
+def _git_filter_config_probe_command(executable: Path) -> list[str]:
+    return _hardened_git_command(
+        executable,
+        "config",
+        "--includes",
+        "--show-scope",
+        "--name-only",
+        "--list",
+    )
+
+
+def _assert_no_executable_git_filters(configured: str) -> None:
+    for line in configured.splitlines():
+        fields = line.split(maxsplit=1)
+        if len(fields) != 2:
+            raise ReleaseWorkflowError(
+                "Git filter configuration probe returned malformed output"
+            )
+        scope, key = fields[0].casefold(), fields[1].casefold()
+        if (
+            scope in {"local", "worktree"}
+            and key.startswith("filter.")
+            and key.rsplit(".", maxsplit=1)[-1]
+            in {"clean", "smudge", "process"}
+        ):
+            raise ReleaseWorkflowError(
+                "repository config contains an executable Git filter"
+            )
+
+
+def _gitlink_paths(index: str) -> tuple[PurePosixPath, ...]:
+    paths: list[PurePosixPath] = []
+    for record in index.split("\0"):
+        if not record:
+            continue
+        header, separator, raw_path = record.partition("\t")
+        fields = header.split()
+        if (
+            not separator
+            or len(fields) != 3
+            or not raw_path
+            or "\\" in raw_path
+            or "\ufffd" in raw_path
+        ):
+            raise ReleaseWorkflowError("Git index probe returned malformed output")
+        if fields[0] != "160000" or fields[2] != "0":
+            continue
+        path = PurePosixPath(raw_path)
+        if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+            raise ReleaseWorkflowError("Git index contains an unsafe gitlink path")
+        paths.append(path)
+    return tuple(paths)
+
+
+def _preflight_recursive_git_filters(
+    executable: Path,
+    *,
+    repository: Path,
+    environment: Mapping[str, str],
+) -> tuple[Path, ...]:
+    """Reject executable filters in every checked-out nested worktree."""
+
+    try:
+        root = repository.resolve(strict=True)
+    except OSError as error:
+        raise ReleaseWorkflowError(
+            "cannot resolve repository for Git preflight"
+        ) from error
+    pending = [root]
+    repositories: list[Path] = []
+    seen: set[Path] = set()
+    while pending:
+        current = pending.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        try:
+            top_level = _run_capture_process(
+                _hardened_git_command(
+                    executable, "rev-parse", "--show-toplevel"
+                ),
+                cwd=current,
+                environment=environment,
+                timeout=GIT_TIMEOUT_SECONDS,
+            ).stdout.strip()
+            authenticated_current = Path(top_level).resolve(strict=True)
+        except (OSError, subprocess.SubprocessError, ValueError) as error:
+            raise ReleaseWorkflowError(
+                "cannot authenticate repository worktree root"
+            ) from error
+        if authenticated_current != current:
+            raise ReleaseWorkflowError(
+                "repository resolves to a different worktree root"
+            )
+        _reject_executable_git_filters(
+            executable,
+            repository=current,
+            environment=environment,
+        )
+        try:
+            index = _run_capture_process(
+                _hardened_git_command(executable, "ls-files", "--stage", "-z"),
+                cwd=current,
+                environment=environment,
+                timeout=GIT_TIMEOUT_SECONDS,
+            ).stdout
+        except (OSError, subprocess.SubprocessError) as error:
+            raise ReleaseWorkflowError(
+                "cannot enumerate repository gitlinks"
+            ) from error
+        repositories.append(current)
+        for relative in reversed(_gitlink_paths(index)):
+            candidate = current.joinpath(*relative.parts)
+            metadata = candidate / ".git"
+            try:
+                if not candidate.exists():
+                    continue
+                if (
+                    not candidate.is_dir()
+                    or candidate.is_symlink()
+                ):
+                    raise ReleaseWorkflowError(
+                        "checked-out gitlink has an unsafe worktree boundary"
+                    )
+                if not metadata.exists():
+                    continue
+                if metadata.is_symlink():
+                    raise ReleaseWorkflowError(
+                        "checked-out gitlink has unsafe Git metadata"
+                    )
+                resolved = candidate.resolve(strict=True)
+                metadata_resolved = metadata.resolve(strict=True)
+            except OSError as error:
+                raise ReleaseWorkflowError(
+                    "cannot authenticate checked-out gitlink worktree"
+                ) from error
+            if (
+                resolved != Path(os.path.abspath(candidate))
+                or not resolved.is_relative_to(root)
+                or (
+                    metadata.is_dir()
+                    and metadata_resolved != Path(os.path.abspath(metadata))
+                )
+            ):
+                raise ReleaseWorkflowError(
+                    "checked-out gitlink escapes the repository worktree"
+                )
+            try:
+                top_level = _run_capture_process(
+                    _hardened_git_command(
+                        executable, "rev-parse", "--show-toplevel"
+                    ),
+                    cwd=resolved,
+                    environment=environment,
+                    timeout=GIT_TIMEOUT_SECONDS,
+                ).stdout.strip()
+                authenticated = Path(top_level).resolve(strict=True)
+            except (OSError, subprocess.SubprocessError) as error:
+                raise ReleaseWorkflowError(
+                    "cannot authenticate checked-out gitlink repository"
+                ) from error
+            if authenticated != resolved:
+                raise ReleaseWorkflowError(
+                    "checked-out gitlink resolves to a different worktree"
+                )
+            pending.append(resolved)
+    return tuple(repositories)
 
 
 def run(
@@ -705,10 +1420,12 @@ def run(
             raise ReleaseWorkflowError(
                 "one or more declared release outputs already exist"
             )
+        external_references = _external_tools(workflow)
         external = {
             name: _authenticate_external(reference, f"external {name}")
-            for name, reference in _external_tools(workflow).items()
+            for name, reference in external_references.items()
         }
+        git_identity = _stable_file_identity(external["git"])
         environment = _closed_environment(root, external)
         for executable_name in ("git", "node", "pnpm"):
             resolved = shutil.which(
@@ -722,31 +1439,46 @@ def run(
                 raise ReleaseWorkflowError(
                     f"closed PATH resolves the wrong {executable_name}"
                 )
-        revision = subprocess.run(
-            [str(external["git"]), "rev-parse", "HEAD"],
+        revision = _run_capture_process(
+            _hardened_git_command(
+                external["git"], "rev-parse", "HEAD"
+            ),
             cwd=root,
-            check=True,
-            capture_output=True, text=True,
-            env=environment,
+            environment=environment,
+            timeout=GIT_TIMEOUT_SECONDS,
         ).stdout.strip()
         if revision != workflow["sourceRevision"]:
             raise ReleaseWorkflowError("source revision differs from workflow")
-        dirty = subprocess.run(
-            [
-                str(external["git"]),
+        _preflight_recursive_git_filters(
+            external["git"],
+            repository=root,
+            environment=environment,
+        )
+        dirty = _run_capture_process(
+            _hardened_git_command(
+                external["git"],
                 "status",
                 "--porcelain",
                 "--untracked-files=all",
-            ],
+                "--ignore-submodules=none",
+            ),
             cwd=root,
-            check=True,
-            capture_output=True,
-            text=True,
-            env=environment,
+            environment=environment,
+            timeout=GIT_TIMEOUT_SECONDS,
         ).stdout
         if dirty:
             raise ReleaseWorkflowError(
                 "tracked source changes are present during release execution"
+            )
+        if (
+            _authenticate_external(
+                external_references["git"], "external git"
+            )
+            != external["git"]
+            or _stable_file_identity(external["git"]) != git_identity
+        ):
+            raise ReleaseWorkflowError(
+                "external git identity changed during source authentication"
             )
         for reference in _input_references(workflow):
             _authenticate_input(root, reference)
@@ -761,6 +1493,11 @@ def run(
             step
             for step in plan
             if step.stage == "selection-fit-evaluation"
+        )
+        selection_output_paths = tuple(
+            _confined(root, output, must_exist=False)
+            for step in selection_steps
+            for output in step.outputs
         )
         futures: dict[
             Future[
@@ -807,12 +1544,28 @@ def run(
                 future.cancel()
             executor.shutdown(wait=True, cancel_futures=True)
             primary_failure = wave.primary_failure()
+            reported_error = error
             if (
                 failure_from_future
                 and primary_failure is not None
                 and primary_failure is not error
             ):
-                raise primary_failure
+                reported_error = primary_failure
+            elif primary_failure is not None and primary_failure is not error:
+                reported_error.add_note(
+                    "a selection worker also failed during cancellation: "
+                    f"{primary_failure!r}"
+                )
+            cleanup_failures = _rollback_new_selection_outputs(
+                selection_output_paths
+            )
+            if cleanup_failures:
+                reported_error.add_note(
+                    "selection output rollback was incomplete: "
+                    + "; ".join(cleanup_failures)
+                )
+            if reported_error is not error:
+                raise reported_error
             raise
         else:
             executor.shutdown(wait=True)
@@ -875,15 +1628,12 @@ def run(
         "steps": records,
     }
     if execute:
-        relative = _relative(
-            workflow["transcriptOutput"], "transcriptOutput"
-        )
         output = transcript_path
         rendered = json.dumps(
             transcript, sort_keys=True, separators=(",", ":"), allow_nan=False
         ).encode() + b"\n"
         output.parent.mkdir(parents=False, exist_ok=True)
-        output.write_bytes(rendered)
+        publish_bytes_durable(output, rendered)
     return transcript
 
 
@@ -904,6 +1654,7 @@ def _execute_selection_step(
             workflow,
             root,
             environment,
+            wave.stop,
         )
     except BaseException as error:
         wave.record_failure(error)
@@ -915,6 +1666,7 @@ def _execute_step(
     workflow: Mapping[str, object],
     root: Path,
     environment: Mapping[str, str],
+    cancel: threading.Event | None = None,
 ) -> tuple[tuple[str, ...], dict[Path, str], list[dict[str, str]]]:
     output_paths = [
         _confined(root, item, must_exist=False)
@@ -939,12 +1691,11 @@ def _execute_step(
             and item.epoch == step.epoch
         )
     )
-    subprocess.run(
+    _run_step_process(
         current.argv,
         cwd=root,
-        check=True,
-        shell=False,
-        env=environment,
+        environment=environment,
+        cancel=cancel,
     )
     for reference in step.inputs:
         _authenticate_input(root, reference)

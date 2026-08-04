@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
+from unittest.mock import patch
 
 from ml.evaluation.browser_parity import (
     EVIDENCE_FORMAT,
@@ -15,10 +20,25 @@ from ml.evaluation.browser_parity import (
     load_authenticated_input,
     publish_evidence,
     verify_transcript_bindings,
+    _authenticated_git,
+    main as browser_parity_main,
+    _publish_browser_outputs,
+    _preflight_recursive_git_filters,
     _public_feature_record,
+    _reauthenticate_git,
+    _reject_executable_git_filters,
+    _run_process,
+    _sanitized_git_environment,
+    _windows_runtime_paths,
+    _windows_taskkill,
+)
+from ml.evaluation.tests.test_release_workflow import (
+    _nested_filter_fixture,
+    _redirected_worktree_fixture,
 )
 from ml.evaluation.validation_gate import PROTOCOL_ID, _canonical_pretty
 from ml.training.drawback_ml.symbolic_schema import SYMBOLIC_RULE_IDS
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable
 
 PUBLIC_GENERATOR_PROTOCOL = {
     "id": "drawbacktrainer-public-pgn-parity-v1",
@@ -30,7 +50,537 @@ PUBLIC_GENERATOR_PROTOCOL = {
 }
 
 
+def _authenticated_git_environment() -> dict[str, str]:
+    located = shutil.which("git")
+    if located is None:
+        raise unittest.SkipTest("Git is unavailable")
+    git = Path(located).resolve(strict=True)
+    return {
+        "DRAWBACK_AUTHENTICATED_GIT": str(git),
+        "DRAWBACK_AUTHENTICATED_GIT_SHA256": hashlib.sha256(
+            git.read_bytes()
+        ).hexdigest(),
+    }
+
+
 class BrowserParityTest(unittest.TestCase):
+    def test_browser_preflight_rejects_redirected_root_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            git, repository, _redirected, environment = (
+                _redirected_worktree_fixture(Path(temporary))
+            )
+            with self.assertRaisesRegex(ValueError, "different worktree root"):
+                _preflight_recursive_git_filters(
+                    git,
+                    repository=repository,
+                    environment=environment,
+                )
+
+    def test_browser_preflight_rejects_nested_worktree_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            git, repository, _nested, marker, environment = (
+                _nested_filter_fixture(Path(temporary))
+            )
+            with self.assertRaisesRegex(ValueError, "executable Git filter"):
+                _preflight_recursive_git_filters(
+                    git,
+                    repository=repository,
+                    environment=environment,
+                )
+            self.assertFalse(marker.exists())
+
+    def test_browser_nonzero_preserves_child_error_when_cleanup_fails(
+        self,
+    ) -> None:
+        process = type(
+            "Process",
+            (),
+            {
+                "returncode": 11,
+                "communicate": lambda self, *, timeout: (
+                    "output",
+                    "browser failed",
+                ),
+            },
+        )()
+        with (
+            patch(
+                "ml.evaluation.browser_parity._popen_contained",
+                return_value=(process, None),
+            ),
+            patch(
+                "ml.evaluation.browser_parity._terminate_process_tree",
+                side_effect=OSError("cleanup failed"),
+            ),
+            self.assertRaises(subprocess.CalledProcessError) as raised,
+        ):
+            _run_process(
+                ["child"],
+                check=True,
+                capture_output=True,
+                timeout=10,
+            )
+        self.assertEqual(raised.exception.returncode, 11)
+        self.assertEqual(raised.exception.stderr, "browser failed")
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertIn(
+            "cleanup failed",
+            " ".join(getattr(raised.exception, "__notes__", ())),
+        )
+
+    def test_unchecked_browser_nonzero_preserves_error_when_cleanup_fails(
+        self,
+    ) -> None:
+        process = type(
+            "Process",
+            (),
+            {
+                "returncode": 12,
+                "communicate": lambda self, *, timeout: (
+                    "output",
+                    "unchecked browser failed",
+                ),
+            },
+        )()
+        with (
+            patch(
+                "ml.evaluation.browser_parity._popen_contained",
+                return_value=(process, None),
+            ),
+            patch(
+                "ml.evaluation.browser_parity._terminate_process_tree",
+                side_effect=OSError("cleanup failed"),
+            ),
+            self.assertRaises(subprocess.CalledProcessError) as raised,
+        ):
+            _run_process(
+                ["child"],
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+        self.assertEqual(raised.exception.returncode, 12)
+        self.assertEqual(raised.exception.stderr, "unchecked browser failed")
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertIn(
+            "cleanup failed",
+            " ".join(getattr(raised.exception, "__notes__", ())),
+        )
+
+    def test_browser_git_probe_blocks_local_filter_command(self) -> None:
+        located = shutil.which("git")
+        if located is None:
+            self.skipTest("Git is unavailable")
+        git = Path(located).resolve(strict=True)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            repository.mkdir()
+            marker = root / "filter-ran"
+            hook = root / "filter-hook"
+            hook.write_text(
+                "#!/bin/sh\n"
+                'printf x > "$DRAWBACK_TEST_FILTER_MARKER"\n'
+                "cat\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            hook.chmod(0o755)
+            subprocess.run(
+                [str(git), "init"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+            )
+            (repository / ".gitattributes").write_text(
+                "*.txt filter=marker\n", encoding="utf-8"
+            )
+            tracked = repository / "tracked.txt"
+            tracked.write_text("tracked\n", encoding="utf-8")
+            subprocess.run(
+                [str(git), "add", ".gitattributes", "tracked.txt"],
+                cwd=repository,
+                check=True,
+            )
+            subprocess.run(
+                [
+                    str(git),
+                    "-c",
+                    "user.name=test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-m",
+                    "fixture",
+                ],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+            )
+            subprocess.run(
+                [
+                    str(git),
+                    "config",
+                    "--local",
+                    "filter.marker.clean",
+                    f'"{hook.as_posix()}"',
+                ],
+                cwd=repository,
+                check=True,
+            )
+            tracked.write_text("changed\n", encoding="utf-8")
+            environment = dict(os.environ)
+            environment["DRAWBACK_TEST_FILTER_MARKER"] = str(marker)
+            subprocess.run(
+                [str(git), "status", "--porcelain"],
+                cwd=repository,
+                env=environment,
+                check=True,
+                capture_output=True,
+            )
+            self.assertTrue(marker.exists(), "filter fixture did not run")
+            marker.unlink()
+            sanitized = dict(_sanitized_git_environment())
+            sanitized["DRAWBACK_TEST_FILTER_MARKER"] = str(marker)
+            with self.assertRaisesRegex(ValueError, "executable Git filter"):
+                _reject_executable_git_filters(
+                    git,
+                    repository=repository,
+                    environment=sanitized,
+                )
+            self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows-only cleanup contract")
+    def test_taskkill_nonzero_fails_closed(self) -> None:
+        hostile = str(Path.cwd() / "attacker-windows")
+        with (
+            patch.dict(
+                os.environ,
+                {"SystemRoot": hostile, "PATH": hostile, "PATHEXT": ".EVIL"},
+                clear=False,
+            ),
+            patch(
+                "ml.evaluation.browser_parity._stat_identity",
+                return_value=(1, 2, 3, 4, 5),
+            ),
+            patch(
+                "ml.evaluation.browser_parity.subprocess.run",
+                return_value=subprocess.CompletedProcess([], 7),
+            ) as run_process,
+            self.assertRaisesRegex(OSError, "exit code 7"),
+        ):
+            _windows_taskkill(12345)
+        environment = run_process.call_args.kwargs["env"]
+        windows, system, command = _windows_runtime_paths()
+        self.assertEqual(environment["SystemRoot"], str(windows))
+        self.assertEqual(environment["WINDIR"], str(windows))
+        self.assertEqual(environment["ComSpec"], str(command))
+        self.assertEqual(environment["PATH"], str(system))
+        self.assertEqual(environment["PATHEXT"], ".COM;.EXE;.BAT;.CMD")
+
+    def test_browser_timeout_terminates_descendant_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            heartbeat = root / "heartbeat"
+            child = (
+                "from pathlib import Path; import sys,time\n"
+                "path=Path(sys.argv[1])\n"
+                "while True:\n"
+                " path.open('ab', buffering=0).write(b'x')\n"
+                " time.sleep(0.02)\n"
+            )
+            parent = (
+                "import subprocess,sys,time\n"
+                "subprocess.Popen([sys.executable,'-c',sys.argv[1],sys.argv[2]])\n"
+                "while True: time.sleep(1)\n"
+            )
+            with self.assertRaises(subprocess.TimeoutExpired):
+                _run_process(
+                    [sys.executable, "-c", parent, child, str(heartbeat)],
+                    cwd=root,
+                    check=True,
+                    capture_output=True,
+                    timeout=1,
+                    environment=dict(os.environ),
+                )
+            self.assertTrue(heartbeat.exists(), "descendant never started")
+            time.sleep(0.2)
+            settled_size = heartbeat.stat().st_size
+            time.sleep(0.3)
+            self.assertEqual(heartbeat.stat().st_size, settled_size)
+
+    def test_browser_fast_parent_success_terminates_grandchild(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            heartbeat = root / "fast-parent-heartbeat"
+            child = (
+                "from pathlib import Path; import sys,time\n"
+                "path=Path(sys.argv[1])\n"
+                "while True:\n"
+                " path.open('ab', buffering=0).write(b'x')\n"
+                " time.sleep(0.02)\n"
+            )
+            parent = (
+                "import os,subprocess,sys,time\n"
+                "subprocess.Popen([sys.executable,'-c',sys.argv[1],sys.argv[2]],"
+                "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+                "stderr=subprocess.DEVNULL)\n"
+                "deadline=time.monotonic()+5\n"
+                "while not os.path.exists(sys.argv[2]) and time.monotonic()<deadline:"
+                " time.sleep(0.01)\n"
+            )
+            completed = _run_process(
+                [sys.executable, "-c", parent, child, str(heartbeat)],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                timeout=10,
+                environment=dict(os.environ),
+            )
+            self.assertEqual(completed.returncode, 0)
+            self.assertTrue(heartbeat.exists(), "grandchild never started")
+            time.sleep(0.2)
+            settled_size = heartbeat.stat().st_size
+            time.sleep(0.3)
+            self.assertEqual(heartbeat.stat().st_size, settled_size)
+
+    def test_git_binding_ignores_path_and_sanitizes_git_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            trusted = root / "trusted-git"
+            forged_directory = root / "forged"
+            forged_directory.mkdir()
+            (forged_directory / "git").write_bytes(b"forged")
+            trusted.write_bytes(b"trusted")
+            environment = {
+                "DRAWBACK_AUTHENTICATED_GIT": str(trusted.resolve()),
+                "DRAWBACK_AUTHENTICATED_GIT_SHA256": hashlib.sha256(
+                    trusted.read_bytes()
+                ).hexdigest(),
+                "GIT_DIR": str(root / "attacker-repository"),
+                "GIT_CONFIG_GLOBAL": str(root / "attacker-config"),
+                "SSH_ASKPASS": str(root / "attacker-askpass"),
+                "LD_PRELOAD": str(root / "attacker-preload.so"),
+                "LD_LIBRARY_PATH": str(root / "attacker-libraries"),
+                "DYLD_INSERT_LIBRARIES": str(root / "attacker-insert.dylib"),
+                "DYLD_LIBRARY_PATH": str(root / "attacker-dyld-libraries"),
+                "PATH": str(forged_directory),
+            }
+            with patch.dict(os.environ, environment, clear=False):
+                identity = _authenticated_git()
+                sanitized = _sanitized_git_environment()
+                self.assertEqual(identity.path, trusted.resolve())
+                self.assertNotIn("GIT_DIR", sanitized)
+                self.assertEqual(sanitized["GIT_CONFIG_GLOBAL"], os.devnull)
+                self.assertEqual(sanitized["GIT_ASKPASS"], os.devnull)
+                self.assertEqual(sanitized["SSH_ASKPASS"], os.devnull)
+                self.assertEqual(sanitized["GCM_INTERACTIVE"], "never")
+                self.assertNotEqual(sanitized["PATH"], str(forged_directory))
+                self.assertNotIn("LD_PRELOAD", sanitized)
+                self.assertNotIn("LD_LIBRARY_PATH", sanitized)
+                self.assertNotIn("DYLD_INSERT_LIBRARIES", sanitized)
+                self.assertNotIn("DYLD_LIBRARY_PATH", sanitized)
+                trusted.write_bytes(b"changed")
+                with self.assertRaisesRegex(ValueError, "digest differs"):
+                    _reauthenticate_git(identity)
+
+    def test_browser_output_interruption_retains_exact_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            transcript = root / "transcript.json"
+            evidence = root / "evidence.json"
+            calls = 0
+
+            def interrupted(path: Path, payload: bytes) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    publish_bytes_durable(path, payload)
+                    return
+                raise KeyboardInterrupt("injected publication interruption")
+
+            with (
+                patch(
+                    "ml.evaluation.browser_parity.publish_bytes_durable",
+                    side_effect=interrupted,
+                ),
+                self.assertRaisesRegex(
+                    KeyboardInterrupt, "publication interruption"
+                ) as raised,
+            ):
+                _publish_browser_outputs(
+                    transcript, b"transcript\n", evidence, b"evidence\n"
+                )
+            self.assertEqual(transcript.read_bytes(), b"transcript\n")
+            self.assertFalse(evidence.exists())
+            self.assertEqual(list(root.glob("*.tmp-*")), [])
+            self.assertIn(
+                "exact partial publication",
+                " ".join(getattr(raised.exception, "__notes__", ())),
+            )
+
+    def test_browser_output_race_preserves_competing_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            transcript = root / "transcript.json"
+            evidence = root / "evidence.json"
+            competitor = b"competing evidence\n"
+            calls = 0
+
+            def racing(path: Path, payload: bytes) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    publish_bytes_durable(path, payload)
+                    return
+                path.write_bytes(competitor)
+                raise FileExistsError("competing publisher won")
+
+            with (
+                patch(
+                    "ml.evaluation.browser_parity.publish_bytes_durable",
+                    side_effect=racing,
+                ),
+                self.assertRaisesRegex(ValueError, "bytes do not match"),
+            ):
+                _publish_browser_outputs(
+                    transcript, b"transcript\n", evidence, b"evidence\n"
+                )
+            self.assertEqual(transcript.read_bytes(), b"transcript\n")
+            self.assertEqual(evidence.read_bytes(), competitor)
+
+    def test_browser_output_rollback_retains_pathname_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            transcript = root / "transcript.json"
+            evidence = root / "evidence.json"
+            replacement = b"replacement transcript\n"
+            calls = 0
+
+            def racing(path: Path, payload: bytes) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    publish_bytes_durable(path, payload)
+                    return
+                transcript.write_bytes(replacement)
+                raise RuntimeError("second publication failed")
+
+            with (
+                patch(
+                    "ml.evaluation.browser_parity.publish_bytes_durable",
+                    side_effect=racing,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError, "second publication failed"
+                ) as raised,
+            ):
+                _publish_browser_outputs(
+                    transcript, b"transcript\n", evidence, b"evidence\n"
+                )
+            self.assertEqual(transcript.read_bytes(), replacement)
+            self.assertFalse(evidence.exists())
+            self.assertIn(
+                "changed after publication",
+                " ".join(getattr(raised.exception, "__notes__", ())),
+            )
+
+    def test_browser_output_recovers_exact_crash_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            transcript = root / "transcript.json"
+            evidence = root / "evidence.json"
+            transcript_payload = b"transcript\n"
+            evidence_payload = b"evidence\n"
+            publish_bytes_durable(transcript, transcript_payload)
+
+            _publish_browser_outputs(
+                transcript,
+                transcript_payload,
+                evidence,
+                evidence_payload,
+            )
+            self.assertEqual(transcript.read_bytes(), transcript_payload)
+            self.assertEqual(evidence.read_bytes(), evidence_payload)
+            # A completed exact pair is idempotent and remains no-clobber.
+            _publish_browser_outputs(
+                transcript,
+                transcript_payload,
+                evidence,
+                evidence_payload,
+            )
+
+    def test_browser_cli_recovers_an_exact_partial_output_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            transcript = root / "transcript.json"
+            evidence = root / "evidence.json"
+            transcript_payload = b"transcript\n"
+            evidence_payload = b"evidence\n"
+            browser_artifact = root / "browser.json"
+            calibration = root / "calibration.json"
+            browser_artifact.write_bytes(b"browser artifact\n")
+            calibration.write_bytes(b"calibration\n")
+            publish_bytes_durable(transcript, transcript_payload)
+            with (
+                patch(
+                    "ml.evaluation.browser_parity.load_authenticated_input",
+                    return_value={},
+                ),
+                patch(
+                    "ml.evaluation.browser_parity.authenticate_runtime_bindings"
+                ),
+                patch(
+                    "ml.evaluation.browser_parity.run_real_worker",
+                    return_value=transcript_payload,
+                ),
+                patch(
+                    "ml.evaluation.browser_parity.verify_transcript_bindings"
+                ),
+                patch(
+                    "ml.evaluation.browser_parity._build_evidence_payload",
+                    return_value=({}, evidence_payload),
+                ),
+            ):
+                result = browser_parity_main([
+                    "--repository",
+                    str(root),
+                    "--browser",
+                    str(root / "browser.exe"),
+                    "--browser-artifact",
+                    str(browser_artifact),
+                    "--calibration",
+                    str(calibration),
+                    "--input",
+                    str(root / "input.json"),
+                    "--input-sha256",
+                    "b" * 64,
+                    "--transcript-output",
+                    str(transcript),
+                    "--evidence-output",
+                    str(evidence),
+                ])
+            self.assertEqual(result, 0)
+            self.assertEqual(transcript.read_bytes(), transcript_payload)
+            self.assertEqual(evidence.read_bytes(), evidence_payload)
+
+    def test_browser_output_rejects_mismatched_crash_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            transcript = root / "transcript.json"
+            evidence = root / "evidence.json"
+            transcript.write_bytes(b"different transcript\n")
+
+            with self.assertRaisesRegex(ValueError, "bytes do not match"):
+                _publish_browser_outputs(
+                    transcript,
+                    b"transcript\n",
+                    evidence,
+                    b"evidence\n",
+                )
+            self.assertEqual(transcript.read_bytes(), b"different transcript\n")
+            self.assertFalse(evidence.exists())
+
     def test_authenticated_input_rejects_hidden_truth(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "input.json"
@@ -336,6 +886,39 @@ class BrowserParityTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
             ).stdout.strip()
+            marker = repository / "fsmonitor-ran"
+            hook = repository / "fsmonitor-hook"
+            hook.write_text(
+                "#!/bin/sh\n"
+                'printf x > "$DRAWBACK_TEST_FSMONITOR_MARKER"\n',
+                encoding="utf-8",
+                newline="\n",
+            )
+            hook.chmod(0o755)
+            subprocess.run(
+                [
+                    "git",
+                    "config",
+                    "--local",
+                    "core.fsmonitor",
+                    hook.as_posix(),
+                ],
+                cwd=repository,
+                check=True,
+            )
+            baseline_environment = dict(os.environ)
+            baseline_environment["DRAWBACK_TEST_FSMONITOR_MARKER"] = str(
+                marker
+            )
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=repository,
+                env=baseline_environment,
+                check=True,
+                capture_output=True,
+            )
+            self.assertTrue(marker.exists(), "fsmonitor fixture did not run")
+            marker.unlink()
             parity_input = {
                 "bindings": {
                     "ensembleSha256": "a" * 64,
@@ -350,10 +933,21 @@ class BrowserParityTest(unittest.TestCase):
             (repository / "ml" / "untracked.py").write_text(
                 "raise SystemExit\n", encoding="utf-8"
             )
-            with self.assertRaisesRegex(ValueError, "clean HEAD"):
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        **_authenticated_git_environment(),
+                        "DRAWBACK_TEST_FSMONITOR_MARKER": str(marker),
+                    },
+                    clear=False,
+                ),
+                self.assertRaisesRegex(ValueError, "clean HEAD"),
+            ):
                 authenticate_runtime_bindings(
                     repository, artifact, calibration, parity_input
                 )
+            self.assertFalse(marker.exists())
 
     def test_public_observation_rejects_replay_and_symbolic_mutations(self) -> None:
         count = len(SYMBOLIC_RULE_IDS)

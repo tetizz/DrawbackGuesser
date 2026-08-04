@@ -132,6 +132,13 @@ def _resign_ledger(artifact: dict[str, object]) -> str:
     return hashlib.sha256(_canonical_json(artifact)).hexdigest()
 
 
+def _resign_runtime(identity: dict[str, object]) -> None:
+    identity.pop("aggregateSha256", None)
+    identity["aggregateSha256"] = hashlib.sha256(
+        _canonical_json(identity)
+    ).hexdigest()
+
+
 def _ledger_artifact() -> dict[str, object]:
     component = {
         "entrypoint": "fixture-code",
@@ -154,6 +161,33 @@ def _ledger_artifact() -> dict[str, object]:
     }
     execution["aggregateSha256"] = hashlib.sha256(
         _canonical_json(execution)
+    ).hexdigest()
+    runtime_component = {
+        "componentId": "schema9-coordinator/v1",
+        "files": 17,
+        "bytes": 1_234,
+        "sha256": "1" * 64,
+    }
+    producer_runtime: dict[str, object] = {
+        "format": "drawbackengine-schema9-producer-runtime",
+        "version": 1,
+        "algorithm": "sha256-engine-runtime-tree-v1",
+        "runtime": {
+            "nodeVersion": "v24.0.0",
+            "platform": "win32",
+            "architecture": "x64",
+            "execArgv": [],
+        },
+        "coordinator": runtime_component,
+        "parallelWorker": {
+            "componentId": "player-private-parallel-worker/v1",
+            "files": 13,
+            "bytes": 987,
+            "sha256": "2" * 64,
+        },
+    }
+    producer_runtime["aggregateSha256"] = hashlib.sha256(
+        _canonical_json(producer_runtime)
     ).hexdigest()
     splits: list[dict[str, object]] = []
     for split_index, split_name in enumerate(CORPUS_LEDGER_SPLITS):
@@ -181,6 +215,7 @@ def _ledger_artifact() -> dict[str, object]:
                 "scheduleId": f"schema9-{split_name}",
                 "seedRoots": list(SPLIT_SEED_ROOTS[workflow_split]),
                 "producerEngineCommit": _CONVERTER_COMMIT,
+                "producerRuntimeIdentity": deepcopy(producer_runtime),
                 "generatorReceipts": {
                     "launch": {
                         "sha256": _sha(f"{split_name}-launch"),
@@ -231,6 +266,7 @@ def _ledger_artifact() -> dict[str, object]:
             "converterEngineCommit": _CONVERTER_COMMIT,
             "producerConverterPolicy": "exact/v1",
             "execution": execution,
+            "producerRuntimeIdentity": producer_runtime,
         },
         "scheduleContract": {
             "authorityId": "capturable25-schema9-opportunity/v1",
@@ -319,6 +355,9 @@ class _LedgerFixture:
             "executionAggregateSha256": identity["execution"][
                 "aggregateSha256"
             ],
+            "producerRuntimeAggregateSha256": identity[
+                "producerRuntimeIdentity"
+            ]["aggregateSha256"],
             "sealedCorpusIdentitySha256": self._sealed_identity(),
         }
 
@@ -811,27 +850,56 @@ class OpportunityWorkflowTests(unittest.TestCase):
     def test_stage_b_aliases_share_one_sealed_corpus_marker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            ledger = _LedgerFixture(root)
-            first_path = root / "stage-b-one.json"
-            second_path = root / "stage-b-two.json"
+            first_root = root / "copy-a"
+            second_root = root / "copy-b"
+            first_root.mkdir()
+            second_root.mkdir()
+            first_ledger = _LedgerFixture(first_root)
+            second_ledger = _LedgerFixture(second_root)
+            self.assertEqual(
+                first_ledger.reference["sealedCorpusIdentitySha256"],
+                second_ledger.reference["sealedCorpusIdentitySha256"],
+            )
+            registry = root / "consumption-registry"
+            first_path = first_root / "stage-b.json"
+            second_path = second_root / "stage-b.json"
             first_payload = _canonical_json({"alias": "one"})
             second_payload = _canonical_json({"alias": "two"})
             first_path.write_bytes(first_payload)
             second_path.write_bytes(second_payload)
             first_sha = hashlib.sha256(first_payload).hexdigest()
             second_sha = hashlib.sha256(second_payload).hexdigest()
-            first = _stage_b_fixture(ledger, first_path, first_sha)
-            second = deepcopy(first)
+            first = _stage_b_fixture(
+                first_ledger,
+                first_path,
+                first_sha,
+            )
+            second = _stage_b_fixture(
+                second_ledger,
+                second_path,
+                second_sha,
+            )
             second["stageA"]["file"] = "stage-a-alias.json"
             second["frozenPair"]["file"] = "pair-two.json"
             second["frozenPair"]["control"]["checkpointSha256"] = "3" * 64
             second["frozenPair"]["treatment"]["checkpointSha256"] = "4" * 64
             marker = consumption_marker_path(
                 first_path,
-                ledger.reference["sealedCorpusIdentitySha256"],
+                first_ledger.reference["sealedCorpusIdentitySha256"],
+                consumption_registry=registry,
+            )
+            self.assertEqual(
+                marker,
+                consumption_marker_path(
+                    second_path,
+                    second_ledger.reference[
+                        "sealedCorpusIdentitySha256"
+                    ],
+                    consumption_registry=registry,
+                ),
             )
             artifact = _sealed_artifact(
-                ledger,
+                first_ledger,
                 first_path,
                 first_sha,
                 first,
@@ -843,7 +911,7 @@ class OpportunityWorkflowTests(unittest.TestCase):
                     return_value=(
                         first,
                         first_sha,
-                        ledger.rows("validation-b"),
+                        first_ledger.rows("validation-b"),
                     ),
                 ),
                 patch(
@@ -854,11 +922,12 @@ class OpportunityWorkflowTests(unittest.TestCase):
             ):
                 run_sealed_test(
                     first_path,
-                    root / "validation-b.ndjson",
-                    root / "sealed-test.ndjson",
-                    root / "first-report.json",
-                    corpus_ledger_path=ledger.path,
-                    **ledger.workflow_auth_kwargs,
+                    first_root / "validation-b.ndjson",
+                    first_root / "sealed-test.ndjson",
+                    first_root / "report.json",
+                    corpus_ledger_path=first_ledger.path,
+                    consumption_registry=registry,
+                    **first_ledger.workflow_auth_kwargs,
                 )
             self.assertTrue(marker.exists())
             with (
@@ -868,7 +937,7 @@ class OpportunityWorkflowTests(unittest.TestCase):
                     return_value=(
                         second,
                         second_sha,
-                        ledger.rows("validation-b"),
+                        second_ledger.rows("validation-b"),
                     ),
                 ),
                 patch(
@@ -879,11 +948,12 @@ class OpportunityWorkflowTests(unittest.TestCase):
                 with self.assertRaises(FileExistsError):
                     run_sealed_test(
                         second_path,
-                        root / "validation-b.ndjson",
-                        root / "sealed-test.ndjson",
-                        root / "second-report.json",
-                        corpus_ledger_path=ledger.path,
-                        **ledger.workflow_auth_kwargs,
+                        second_root / "validation-b.ndjson",
+                        second_root / "sealed-test.ndjson",
+                        second_root / "report.json",
+                        corpus_ledger_path=second_ledger.path,
+                        consumption_registry=registry,
+                        **second_ledger.workflow_auth_kwargs,
                     )
             test_access.assert_not_called()
 
@@ -1154,6 +1224,150 @@ class OpportunityWorkflowTests(unittest.TestCase):
                     ledger.path,
                     ledger.sha256,
                     ledger.verification_receipt_sha256,
+                )
+
+    def test_ledger_accepts_typescript_runtime_string_domain(self) -> None:
+        platform = "WIN_32.test-" + ("A9_.-" * 64)
+        architecture = "X64_beta." + ("z0-_." * 64)
+
+        def use_typescript_runtime_strings(artifact):
+            identities = [
+                artifact["identity"]["producerRuntimeIdentity"],
+                *(
+                    split["producerRuntimeIdentity"]
+                    for split in artifact["splits"]
+                ),
+            ]
+            for identity in identities:
+                identity["runtime"]["platform"] = platform
+                identity["runtime"]["architecture"] = architecture
+                _resign_runtime(identity)
+
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = _LedgerFixture(
+                Path(directory),
+                use_typescript_runtime_strings,
+            )
+            loaded = _load_corpus_ledger(
+                ledger.path,
+                ledger.sha256,
+                ledger.verification_receipt_sha256,
+            )
+
+        runtime = loaded.artifact["identity"]["producerRuntimeIdentity"][
+            "runtime"
+        ]
+        self.assertEqual(runtime["platform"], platform)
+        self.assertEqual(runtime["architecture"], architecture)
+
+    def test_ledger_rejects_invalid_producer_runtime_identity(self) -> None:
+        def valid_split_mismatch(artifact):
+            runtime = artifact["splits"][0]["producerRuntimeIdentity"]
+            runtime["coordinator"]["sha256"] = "3" * 64
+            _resign_runtime(runtime)
+
+        mutations = (
+            (
+                "missing-global",
+                lambda artifact: artifact["identity"].pop(
+                    "producerRuntimeIdentity"
+                ),
+                "fields are invalid",
+            ),
+            (
+                "old-ledger",
+                lambda artifact: artifact.__setitem__("version", 2),
+                "format or version is invalid",
+            ),
+            (
+                "runtime-extra",
+                lambda artifact: artifact["identity"][
+                    "producerRuntimeIdentity"
+                ]["runtime"].__setitem__("hook", "blocked"),
+                "fields are invalid",
+            ),
+            (
+                "runtime-flags",
+                lambda artifact: artifact["identity"][
+                    "producerRuntimeIdentity"
+                ]["runtime"].__setitem__("execArgv", ["--inspect"]),
+                "runtime is invalid",
+            ),
+            (
+                "component-id",
+                lambda artifact: artifact["identity"][
+                    "producerRuntimeIdentity"
+                ]["coordinator"].__setitem__(
+                    "componentId",
+                    "wrong/v1",
+                ),
+                "componentId is unsupported",
+            ),
+            (
+                "component-count",
+                lambda artifact: artifact["identity"][
+                    "producerRuntimeIdentity"
+                ]["parallelWorker"].__setitem__("files", False),
+                "positive integer",
+            ),
+            (
+                "component-count-above-max-safe",
+                lambda artifact: artifact["identity"][
+                    "producerRuntimeIdentity"
+                ]["parallelWorker"].__setitem__(
+                    "files",
+                    9_007_199_254_740_992,
+                ),
+                "positive integer",
+            ),
+            (
+                "aggregate",
+                lambda artifact: artifact["identity"][
+                    "producerRuntimeIdentity"
+                ].__setitem__("aggregateSha256", "0" * 64),
+                "aggregate is inconsistent",
+            ),
+            (
+                "split-mismatch",
+                valid_split_mismatch,
+                "differs across splits",
+            ),
+        )
+        for name, mutate, message in mutations:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as directory:
+                    ledger = _LedgerFixture(Path(directory), mutate)
+                    with self.assertRaisesRegex(
+                        CapturableDatasetError,
+                        message,
+                    ):
+                        _load_corpus_ledger(
+                            ledger.path,
+                            ledger.sha256,
+                            ledger.verification_receipt_sha256,
+                        )
+
+    def test_ledger_rejects_old_verification_receipt_version(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = _LedgerFixture(Path(directory))
+            receipt = json.loads(
+                ledger.verification_receipt_path.read_text("utf8")
+            )
+            receipt["version"] = 1
+            receipt.pop("contentSha256")
+            receipt["contentSha256"] = hashlib.sha256(
+                _canonical_json(receipt)
+            ).hexdigest()
+            payload = _canonical_json(receipt)
+            ledger.verification_receipt_path.write_bytes(payload)
+            with self.assertRaisesRegex(
+                CapturableDatasetError,
+                "does not bind the authenticated ledger",
+            ):
+                _load_corpus_ledger(
+                    ledger.path,
+                    ledger.sha256,
+                    hashlib.sha256(payload).hexdigest(),
                 )
 
     def test_ledger_rejects_cross_stream_parameter_seed_overlap(self) -> None:
@@ -1507,6 +1721,7 @@ class OpportunityWorkflowTests(unittest.TestCase):
                         UntouchablePath(),  # type: ignore[arg-type]
                         root / "sealed.json",
                         corpus_ledger_path=ledger.path,
+                        consumption_registry=root / "consumption-registry",
                         **ledger.workflow_auth_kwargs,
                     )
 
@@ -1536,6 +1751,7 @@ class OpportunityWorkflowTests(unittest.TestCase):
             marker = consumption_marker_path(
                 stage_b_path,
                 ledger.reference["sealedCorpusIdentitySha256"],
+                consumption_registry=root / "consumption-registry",
             )
             with (
                 patch(
@@ -1559,6 +1775,7 @@ class OpportunityWorkflowTests(unittest.TestCase):
                     root / "sealed-test.ndjson",
                     report_one,
                     corpus_ledger_path=ledger.path,
+                    consumption_registry=root / "consumption-registry",
                     **ledger.workflow_auth_kwargs,
                 )
                 self.assertEqual(
@@ -1573,6 +1790,7 @@ class OpportunityWorkflowTests(unittest.TestCase):
                         root / "sealed-test.ndjson",
                         report_two,
                         corpus_ledger_path=ledger.path,
+                        consumption_registry=root / "consumption-registry",
                         **ledger.workflow_auth_kwargs,
                     )
                 self.assertEqual(authorization.call_count, 2)
@@ -1597,6 +1815,7 @@ class OpportunityWorkflowTests(unittest.TestCase):
             marker = consumption_marker_path(
                 stage_b_path,
                 ledger.reference["sealedCorpusIdentitySha256"],
+                consumption_registry=root / "consumption-registry",
             )
             with (
                 patch(
@@ -1624,6 +1843,7 @@ class OpportunityWorkflowTests(unittest.TestCase):
                         root / "sealed-test.ndjson",
                         root / "report-one.json",
                         corpus_ledger_path=ledger.path,
+                        consumption_registry=root / "consumption-registry",
                         **ledger.workflow_auth_kwargs,
                     )
                 self.assertTrue(marker.exists())
@@ -1634,6 +1854,7 @@ class OpportunityWorkflowTests(unittest.TestCase):
                         root / "sealed-test.ndjson",
                         root / "report-two.json",
                         corpus_ledger_path=ledger.path,
+                        consumption_registry=root / "consumption-registry",
                         **ledger.workflow_auth_kwargs,
                     )
                 self.assertEqual(test_access.call_count, 1)
@@ -1681,6 +1902,7 @@ class OpportunityWorkflowTests(unittest.TestCase):
                         root / "sealed-test.ndjson",
                         root / "sealed.json",
                         corpus_ledger_path=ledger.path,
+                        consumption_registry=root / "consumption-registry",
                         **ledger.workflow_auth_kwargs,
                     )
                 test_access.assert_not_called()
@@ -1708,6 +1930,7 @@ class OpportunityWorkflowTests(unittest.TestCase):
                 "file": consumption_marker_path(
                     stage_b_path,
                     ledger.reference["sealedCorpusIdentitySha256"],
+                    consumption_registry=root / "consumption-registry",
                 ).name,
                 "sha256": "a" * 64,
             }
@@ -1728,6 +1951,7 @@ class OpportunityWorkflowTests(unittest.TestCase):
                         root / "validation-b.ndjson",
                         report_sha256=report_sha,
                         corpus_ledger_path=ledger.path,
+                        consumption_registry=root / "consumption-registry",
                         **ledger.workflow_auth_kwargs,
                     )
 
@@ -1775,6 +1999,7 @@ class OpportunityWorkflowTests(unittest.TestCase):
                     root / "sealed-test.ndjson",
                     report,
                     corpus_ledger_path=ledger.path,
+                    consumption_registry=root / "consumption-registry",
                     **ledger.workflow_auth_kwargs,
                 )
             with patch(
@@ -1787,6 +2012,7 @@ class OpportunityWorkflowTests(unittest.TestCase):
                     root / "validation-b.ndjson",
                     report_sha256=created["artifactSha256"],
                     corpus_ledger_path=ledger.path,
+                    consumption_registry=root / "consumption-registry",
                     **ledger.workflow_auth_kwargs,
                 )
                 self.assertEqual(digest, created["artifactSha256"])
@@ -1803,6 +2029,7 @@ class OpportunityWorkflowTests(unittest.TestCase):
                         root / "validation-b.ndjson",
                         report_sha256=created["artifactSha256"],
                         corpus_ledger_path=ledger.path,
+                        consumption_registry=root / "consumption-registry",
                         **ledger.workflow_auth_kwargs,
                     )
 
@@ -1848,6 +2075,9 @@ class OpportunityWorkflowTests(unittest.TestCase):
                             root / "validation-b.ndjson",
                             report_sha256=digest,
                             corpus_ledger_path=ledger.path,
+                            consumption_registry=(
+                                root / "consumption-registry"
+                            ),
                             **ledger.workflow_auth_kwargs,
                         )
 

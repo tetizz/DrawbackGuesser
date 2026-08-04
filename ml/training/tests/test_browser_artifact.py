@@ -232,6 +232,32 @@ class BrowserArtifactTests(unittest.TestCase):
             self.assertNotIn("legal_mask.weight", artifact["tensors"])
             self.assertNotIn("white_parameters.weight", artifact["tensors"])
 
+    def test_export_accepts_exact_retry_without_replacing_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            checkpoint = self._checkpoint(directory)
+            output = directory / "artifact.json"
+
+            export_browser_artifact(checkpoint, output)
+            first_stat = output.stat()
+            first_bytes = output.read_bytes()
+            export_browser_artifact(checkpoint, output)
+
+            self.assertEqual(output.read_bytes(), first_bytes)
+            self.assertEqual(output.stat().st_ino, first_stat.st_ino)
+
+    def test_export_preserves_different_existing_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            checkpoint = self._checkpoint(directory)
+            output = directory / "artifact.json"
+            output.write_bytes(b"pre-existing artifact\n")
+
+            with self.assertRaisesRegex(BrowserArtifactError, "cannot write"):
+                export_browser_artifact(checkpoint, output)
+
+            self.assertEqual(output.read_bytes(), b"pre-existing artifact\n")
+
     def test_cli_exports_the_same_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

@@ -8,7 +8,7 @@
     "node": ">=22.15"
   },
   "scripts": {
-    "engine:build": "node scripts/require-engine.mjs && pnpm --filter @drawbackengine/chess-evaluator... --filter @drawbackengine/simulation-arena... --filter @drawbackengine/simulation-trace... build",
+    "engine:build": "node scripts/require-engine.mjs && pnpm --filter @drawbackengine/chess-evaluator... --filter @drawbackengine/simulation-arena... --filter @drawbackengine/simulation-trace... --filter @drawbackengine/cli build",
     "build": "pnpm engine:build && pnpm --filter @drawbackguesser/dataset-contract build && pnpm --filter @drawbackguesser/predictor build && pnpm --filter @drawbackguesser/trace-to-dataset build && pnpm --filter @drawbackguesser/dataset-cli build && pnpm --filter @drawbackguesser/web build",
     "typecheck": "pnpm engine:build && pnpm --filter @drawbackguesser/dataset-contract typecheck && pnpm --filter @drawbackguesser/predictor typecheck && pnpm --filter @drawbackguesser/trace-to-dataset typecheck && pnpm --filter @drawbackguesser/dataset-cli typecheck && pnpm --filter @drawbackguesser/web typecheck",
     "lint": "eslint . --max-warnings 0",

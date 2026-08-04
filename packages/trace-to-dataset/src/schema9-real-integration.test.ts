@@ -21,10 +21,14 @@ import {
   authenticateSchema9SplitWithRuleContract,
 } from "./schema9-ledger-authentication.js";
 import {
+  canonicalJsonBytes,
   SCHEMA9_GENERATION_CONFIG,
   SCHEMA9_GENERATOR_COMPLETION_FORMAT,
   SCHEMA9_GENERATOR_LAUNCH_FORMAT,
   SCHEMA9_GENERATOR_RECEIPT_VERSION,
+  SCHEMA9_PRODUCER_RUNTIME_IDENTITY_FORMAT,
+  SCHEMA9_PRODUCER_RUNTIME_IDENTITY_VERSION,
+  SCHEMA9_PRODUCER_RUNTIME_MANIFEST_ALGORITHM,
   SCHEMA9_SCHEDULE_PROFILE,
   SCHEMA9_SPLIT_SEED_ROOTS,
   type Schema9SplitFiles,
@@ -32,6 +36,35 @@ import {
 import { schema9AssignmentScheduler } from "./schema9-schedule-replay.js";
 
 const ENGINE_COMMIT = "b".repeat(40);
+const PRODUCER_RUNTIME_PAYLOAD = Object.freeze({
+  format: SCHEMA9_PRODUCER_RUNTIME_IDENTITY_FORMAT,
+  version: SCHEMA9_PRODUCER_RUNTIME_IDENTITY_VERSION,
+  algorithm: SCHEMA9_PRODUCER_RUNTIME_MANIFEST_ALGORITHM,
+  runtime: Object.freeze({
+    nodeVersion: "v24.0.0",
+    platform: "win32",
+    architecture: "x64",
+    execArgv: Object.freeze([] as const),
+  }),
+  coordinator: Object.freeze({
+    componentId: "schema9-coordinator/v1",
+    files: 1,
+    bytes: 1,
+    sha256: "1".repeat(64),
+  }),
+  parallelWorker: Object.freeze({
+    componentId: "player-private-parallel-worker/v1",
+    files: 1,
+    bytes: 1,
+    sha256: "2".repeat(64),
+  }),
+});
+const PRODUCER_RUNTIME_IDENTITY = Object.freeze({
+  ...PRODUCER_RUNTIME_PAYLOAD,
+  aggregateSha256: createHash("sha256")
+    .update(canonicalJsonBytes(PRODUCER_RUNTIME_PAYLOAD))
+    .digest("hex"),
+});
 const GENERATION_SEARCH_POLICY = Object.freeze({
   policyId: SCHEMA9_SCHEDULE_PROFILE.policyId,
   evaluatorId: SCHEMA9_GENERATION_CONFIG.evaluator.evaluatorId,
@@ -100,6 +133,7 @@ describe("schema-9 real parser/converter integration", () => {
       scheduleProfile: SCHEMA9_SCHEDULE_PROFILE,
       generationConfig: SCHEMA9_GENERATION_CONFIG,
       producerEngineCommit: ENGINE_COMMIT,
+      producerRuntimeIdentity: PRODUCER_RUNTIME_IDENTITY,
     })}\n`, "utf8");
     await writeFile(launchReceiptPath, launchPayload);
     await writeFile(completionReceiptPath, `${JSON.stringify({
@@ -109,6 +143,7 @@ describe("schema-9 real parser/converter integration", () => {
       ledgerSplit: "train",
       state: "completed",
       producerEngineCommit: ENGINE_COMMIT,
+      producerRuntimeIdentity: PRODUCER_RUNTIME_IDENTITY,
       launchReceiptSha256: createHash("sha256")
         .update(launchPayload)
         .digest("hex"),

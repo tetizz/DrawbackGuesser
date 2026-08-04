@@ -1,7 +1,16 @@
 import { execFileSync } from "node:child_process";
 import console from "node:console";
-import { readdir, stat } from "node:fs/promises";
-import { extname, relative, resolve, sep } from "node:path";
+import { lstat, readdir, realpath, stat } from "node:fs/promises";
+import {
+  dirname,
+  extname,
+  isAbsolute,
+  join,
+  parse,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
 import process from "node:process";
 
 const root = resolve(import.meta.dirname, "..");
@@ -40,6 +49,103 @@ const forbiddenGeneratedDirectories = new Set([
   "node_modules",
 ]);
 const failures = [];
+const WINDOWS_SYSTEM_ROOT_ALIAS = String.raw`\\?\GLOBALROOT\SystemRoot`;
+
+function isNodeError(error, code) {
+  return error instanceof Error && "code" in error && error.code === code;
+}
+
+async function authenticatedSystemGit() {
+  let path;
+  let systemRoot;
+  let system32;
+  if (process.platform === "win32") {
+    systemRoot = await realpath(WINDOWS_SYSTEM_ROOT_ALIAS);
+    system32 = await realpath(join(WINDOWS_SYSTEM_ROOT_ALIAS, "System32"));
+    if (
+      !isAbsolute(systemRoot)
+      || relative(systemRoot, system32).toLocaleLowerCase("en-US") !== "system32"
+    ) {
+      throw new TypeError("The OS Windows-directory alias resolved unexpectedly.");
+    }
+    const programFiles = await realpath(join(parse(systemRoot).root, "Program Files"));
+    path = await realpath(join(programFiles, "Git", "cmd", "git.exe"));
+    const child = relative(programFiles, path);
+    if (
+      child === ""
+      || child === ".."
+      || child.startsWith(`..${sep}`)
+      || isAbsolute(child)
+    ) {
+      throw new TypeError("System Git escaped the fixed Program Files root.");
+    }
+  } else {
+    const candidates = new Set();
+    for (const candidate of ["/usr/bin/git", "/bin/git"]) {
+      try {
+        const canonical = await realpath(candidate);
+        if ((await lstat(canonical)).isFile()) {
+          candidates.add(canonical);
+        }
+      } catch (error) {
+        if (!isNodeError(error, "ENOENT")) {
+          throw error;
+        }
+      }
+    }
+    if (candidates.size !== 1) {
+      throw new TypeError("Exactly one fixed system Git executable is required.");
+    }
+    path = [...candidates][0];
+  }
+  const metadata = await lstat(path, { bigint: true });
+  if (!metadata.isFile()) {
+    throw new TypeError("Authenticated system Git is not a regular file.");
+  }
+  const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
+  const environment = Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => {
+      const normalized = name.toUpperCase();
+      return normalized === "TEMP" || normalized === "TMP";
+    }),
+  );
+  Object.assign(environment, {
+    PATH: process.platform === "win32"
+      ? `${dirname(path)};${system32}`
+      : "/usr/bin:/bin",
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_CONFIG_COUNT: "0",
+    GIT_CONFIG_GLOBAL: nullDevice,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_OPTIONAL_LOCKS: "0",
+    GIT_PAGER: "",
+    GIT_TERMINAL_PROMPT: "0",
+    LC_ALL: "C",
+  });
+  if (process.platform === "win32") {
+    Object.assign(environment, {
+      SystemRoot: systemRoot,
+      WINDIR: systemRoot,
+      ComSpec: join(system32, "cmd.exe"),
+      PATHEXT: ".COM;.EXE;.BAT;.CMD",
+    });
+  }
+  return Object.freeze({ path, metadata, environment });
+}
+
+async function assertSystemGitUnchanged(expected) {
+  const actual = await lstat(expected.path, { bigint: true });
+  if (
+    !actual.isFile()
+    || actual.dev !== expected.metadata.dev
+    || actual.ino !== expected.metadata.ino
+    || actual.size !== expected.metadata.size
+    || actual.mtimeNs !== expected.metadata.mtimeNs
+    || actual.ctimeNs !== expected.metadata.ctimeNs
+  ) {
+    throw new Error("Authenticated system Git changed during use.");
+  }
+}
 
 async function exists(path) {
   try {
@@ -59,16 +165,44 @@ for (const path of forbiddenPaths) {
   }
 }
 
-function repositoryCandidatePaths() {
-  const output = execFileSync(
-    "git",
-    ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-    { cwd: root, encoding: "utf8" },
-  );
-  return output.split("\0").filter((path) => path.length > 0);
+async function repositoryCandidatePaths() {
+  const git = await authenticatedSystemGit();
+  const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
+  try {
+    const output = execFileSync(
+      git.path,
+      [
+        "--no-replace-objects",
+        "--no-pager",
+        "-c",
+        "credential.helper=",
+        "-c",
+        "credential.interactive=false",
+        "-c",
+        `core.hooksPath=${nullDevice}`,
+        "-c",
+        "core.fsmonitor=false",
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+      ],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: git.environment,
+        timeout: 30_000,
+        windowsHide: true,
+      },
+    );
+    return output.split("\0").filter((path) => path.length > 0);
+  } finally {
+    await assertSystemGitUnchanged(git);
+  }
 }
 
-for (const projectPath of repositoryCandidatePaths()) {
+for (const projectPath of await repositoryCandidatePaths()) {
   if (projectPath === "engine" || projectPath.startsWith("engine/")) {
     continue;
   }

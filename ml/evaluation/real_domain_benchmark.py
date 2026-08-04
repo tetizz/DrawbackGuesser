@@ -35,6 +35,7 @@ from ml.training.drawback_ml.training_corpus_set import (
     TrainingCorpusSetError,
     verify_training_corpus_set,
 )
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable_exact
 
 
 CORPUS_FORMAT = "drawbacktrainer-real-domain-completed-pgn-corpus"
@@ -85,6 +86,7 @@ STANDARD_PGN_UNAVAILABLE_IDS = frozenset(
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 RELEASE_CLAIM_MINIMUM_GAMES = 2_000
 RELEASE_CLAIM_MINIMUM_PLAYER_GAMES_PER_RULE = 10
+PROCESS_TERMINATION_GRACE_SECONDS = 5.0
 
 
 class RealDomainBenchmarkError(ValueError):
@@ -335,7 +337,7 @@ class ApprovedSubprocessAnalyzer:
                     str(launcher_finished),
                 ]
             environment = {
-                "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
+                **_trusted_windows_runtime_environment(),
                 "TEMP": str(directory),
                 "TMP": str(directory),
                 "PYTHONHASHSEED": "0",
@@ -393,82 +395,91 @@ class ApprovedSubprocessAnalyzer:
             reader.start()
             deadline = time.monotonic() + self.timeout_seconds
             launcher_returncode: int | None = None
-            while process.poll() is None:
-                if time.monotonic() >= deadline:
-                    _kill_process_tree(process)
-                    kill_job.close()
-                    reader.join(timeout=1)
+            tree_cleanup_attempted = False
+            try:
+                while process.poll() is None:
+                    if time.monotonic() >= deadline:
+                        raise RealDomainBenchmarkError(
+                            "approved post-game analyzer timed out"
+                        )
+                    if (
+                        stdout_oversized.is_set()
+                        or (
+                            output_path.exists()
+                            and output_path.stat().st_size
+                            > self.maximum_output_bytes
+                        )
+                    ):
+                        raise RealDomainBenchmarkError(
+                            "approved analyzer output exceeds its bound"
+                        )
+                    if (
+                        launcher_finished is not None
+                        and launcher_finished.is_file()
+                    ):
+                        status = launcher_finished.read_bytes()
+                        if status not in {b"0\n", b"1\n"}:
+                            raise RealDomainBenchmarkError(
+                                "approved analyzer launcher status is invalid"
+                            )
+                        launcher_returncode = int(status.strip())
+                        break
+                    time.sleep(0.01)
+                # A launcher can exit while one of its descendants still holds
+                # the inherited stdout pipe. Terminate the secured process tree
+                # before waiting for that pipe. On Windows the live bootstrap
+                # root lets taskkill enumerate descendants, while the kill job
+                # remains the fail-closed fallback.
+                tree_cleanup_attempted = True
+                _kill_process_tree(process, kill_job)
+                reader.join(timeout=1)
+                if reader.is_alive():
                     raise RealDomainBenchmarkError(
-                        "approved post-game analyzer timed out"
+                        "approved analyzer stdout did not close"
                     )
-                if (
-                    stdout_oversized.is_set()
-                    or (
-                        output_path.exists()
-                        and output_path.stat().st_size
-                        > self.maximum_output_bytes
-                    )
-                ):
-                    _kill_process_tree(process)
-                    kill_job.close()
-                    reader.join(timeout=1)
+                if stdout_oversized.is_set():
                     raise RealDomainBenchmarkError(
                         "approved analyzer output exceeds its bound"
                     )
-                if launcher_finished is not None and launcher_finished.is_file():
-                    status = launcher_finished.read_bytes()
-                    if status not in {b"0\n", b"1\n"}:
-                        _kill_process_tree(process)
-                        kill_job.close()
-                        reader.join(timeout=1)
-                        raise RealDomainBenchmarkError(
-                            "approved analyzer launcher status is invalid"
+                effective_returncode = (
+                    launcher_returncode
+                    if launcher_returncode is not None
+                    else process.returncode
+                )
+                if effective_returncode != 0:
+                    raise RealDomainBenchmarkError(
+                        "approved post-game analyzer process failed"
+                    )
+                if (
+                    not output_path.is_file()
+                    or output_path.stat().st_size
+                    > self.maximum_output_bytes
+                ):
+                    raise RealDomainBenchmarkError(
+                        "approved analyzer output is missing or exceeds its bound"
+                    )
+                output_payload = output_path.read_bytes()
+            except BaseException as primary_error:
+                cleanup_errors: list[BaseException] = []
+                if not tree_cleanup_attempted:
+                    tree_cleanup_attempted = True
+                    try:
+                        _kill_process_tree(process, kill_job)
+                    except BaseException as cleanup_error:
+                        cleanup_errors.append(cleanup_error)
+                reader.join(timeout=1)
+                if reader.is_alive():
+                    cleanup_errors.append(
+                        RealDomainBenchmarkError(
+                            "approved analyzer stdout remained open after cleanup"
                         )
-                    launcher_returncode = int(status.strip())
-                    # The bootstrap deliberately keeps the assigned root alive
-                    # after the launcher returns. Kill by that live root first
-                    # so taskkill can still enumerate every descendant.
-                    _kill_process_tree(process)
-                    kill_job.close()
-                    break
-                time.sleep(0.01)
-            # A launcher can exit while one of its descendants still holds the
-            # inherited stdout pipe. Terminate the secured process tree before
-            # waiting for that pipe, otherwise the descendant gets the entire
-            # reader timeout in which to outlive the approved launcher.
-            kill_job.close()
-            if os.name != "nt":
-                _kill_process_tree(process)
-            reader.join(timeout=1)
-            if reader.is_alive():
-                kill_job.close()
-                _kill_process_tree(process)
-                raise RealDomainBenchmarkError(
-                    "approved analyzer stdout did not close"
-                )
-            if stdout_oversized.is_set():
-                kill_job.close()
-                _kill_process_tree(process)
-                raise RealDomainBenchmarkError(
-                    "approved analyzer output exceeds its bound"
-                )
-            effective_returncode = (
-                launcher_returncode
-                if launcher_returncode is not None
-                else process.returncode
-            )
-            if effective_returncode != 0:
-                raise RealDomainBenchmarkError(
-                    "approved post-game analyzer process failed"
-                )
-            if (
-                not output_path.is_file()
-                or output_path.stat().st_size > self.maximum_output_bytes
-            ):
-                raise RealDomainBenchmarkError(
-                    "approved analyzer output is missing or exceeds its bound"
-                )
-            output_payload = output_path.read_bytes()
+                    )
+                if cleanup_errors:
+                    _raise_primary_with_cleanup(
+                        primary_error,
+                        cleanup_errors,
+                    )
+                raise
         value = _strict_json(output_payload, "approved analyzer output")
         if value.get("pgnSha256") != pgn_sha256:
             raise RealDomainBenchmarkError(
@@ -492,39 +503,207 @@ def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _kill_process_tree(process: subprocess.Popen[bytes]) -> None:
-    if os.name == "nt":
-        system_root = os.environ.get("SystemRoot")
-        taskkill = (
-            Path(system_root) / "System32" / "taskkill.exe"
-            if system_root
-            else None
+def _stable_file_identity(path: Path) -> tuple[int, int, int, int, int, str]:
+    before = path.stat()
+    payload = path.read_bytes()
+    after = path.stat()
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if before_identity != after_identity:
+        raise OSError("executable identity changed while it was authenticated")
+    return (*after_identity, _sha256(payload))
+
+
+def _windows_system_directory() -> Path:
+    import ctypes
+    from ctypes import wintypes
+
+    buffer = ctypes.create_unicode_buffer(32_768)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_system_directory = kernel32.GetSystemDirectoryW
+    get_system_directory.argtypes = (wintypes.LPWSTR, wintypes.UINT)
+    get_system_directory.restype = wintypes.UINT
+    length = get_system_directory(buffer, len(buffer))
+    if length == 0 or length >= len(buffer):
+        raise OSError("Windows system directory is unavailable")
+    unresolved = Path(buffer.value)
+    if not unresolved.is_absolute() or unresolved.is_symlink():
+        raise OSError("Windows system directory identity is invalid")
+    directory = unresolved.resolve(strict=True)
+    if not directory.is_dir():
+        raise OSError("Windows system directory is unavailable")
+    return directory
+
+
+def _trusted_windows_runtime_environment() -> Mapping[str, str]:
+    if os.name != "nt":
+        return {}
+    system_directory = _windows_system_directory()
+    windows_directory = system_directory.parent.resolve(strict=True)
+    command_processor = (system_directory / "cmd.exe").resolve(strict=True)
+    if (
+        command_processor.parent != system_directory
+        or not command_processor.is_file()
+    ):
+        raise OSError(
+            "Windows command processor is outside the system directory"
         )
-        if taskkill is not None and taskkill.is_file():
-            subprocess.run(
-                [
-                    str(taskkill),
-                    "/PID",
-                    str(process.pid),
-                    "/T",
-                    "/F",
-                ],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                env={"SystemRoot": system_root},
+    return {
+        "SystemRoot": str(windows_directory),
+        "WINDIR": str(windows_directory),
+        "ComSpec": str(command_processor),
+        "PATH": str(system_directory),
+        "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+    }
+
+
+def _windows_taskkill(process_id: int) -> None:
+    system_directory = _windows_system_directory()
+    unresolved = system_directory / "taskkill.exe"
+    if unresolved.is_symlink():
+        raise OSError("taskkill must not be a symbolic link")
+    taskkill = unresolved.resolve(strict=True)
+    if taskkill.parent != system_directory or not taskkill.is_file():
+        raise OSError("taskkill resolved outside the Windows system directory")
+    taskkill_identity = _stable_file_identity(taskkill)
+    completed: subprocess.CompletedProcess[bytes] | None = None
+    invocation_error: BaseException | None = None
+    try:
+        completed = subprocess.run(
+            [str(taskkill), "/PID", str(process_id), "/T", "/F"],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=PROCESS_TERMINATION_GRACE_SECONDS,
+            env={
+                "SystemRoot": str(system_directory.parent),
+                "WINDIR": str(system_directory.parent),
+            },
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except BaseException as error:
+        invocation_error = error
+    identity_error: BaseException | None = None
+    try:
+        if _stable_file_identity(taskkill) != taskkill_identity:
+            raise OSError(
+                "taskkill identity changed during process-tree cleanup"
             )
-        else:
-            process.kill()
+    except OSError as error:
+        identity_error = error
+    if identity_error is not None:
+        if invocation_error is not None:
+            identity_error.add_note(
+                "taskkill invocation also failed: "
+                f"{type(invocation_error).__name__}: {invocation_error}"
+            )
+        raise identity_error from invocation_error
+    if invocation_error is not None:
+        raise invocation_error
+    assert completed is not None
+    if completed.returncode != 0:
+        raise OSError(
+            f"taskkill failed with exit code {completed.returncode}"
+        )
+
+
+def _raise_primary_with_cleanup(
+    primary_error: BaseException,
+    cleanup_errors: Sequence[BaseException],
+) -> None:
+    cleanup_failure = RealDomainBenchmarkError(
+        "approved analyzer cleanup also failed: "
+        + "; ".join(
+            f"{type(error).__name__}: {error}"
+            for error in cleanup_errors
+        )
+    )
+    primary_error.add_note(str(cleanup_failure))
+    raise primary_error from cleanup_failure
+
+
+def _kill_process_tree(
+    process: subprocess.Popen[bytes],
+    kill_job: _WindowsKillJob | None = None,
+) -> None:
+    cleanup_errors: list[BaseException] = []
+    if os.name == "nt":
+        if process.poll() is None:
+            try:
+                _windows_taskkill(process.pid)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        # Closing the kill-on-close job must happen before waiting for the
+        # direct child. It is the trusted fallback that terminates descendants
+        # when taskkill fails or times out.
+        if kill_job is not None:
+            try:
+                kill_job.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
     else:
         import signal
 
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (OSError, ProcessLookupError):
             pass
-    process.wait()
+        if kill_job is not None:
+            try:
+                kill_job.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
+    try:
+        process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        try:
+            process.kill()
+        except BaseException as kill_error:
+            if process.poll() is None:
+                cleanup_errors.append(kill_error)
+        try:
+            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired as final_error:
+            cleanup_errors.extend((error, final_error))
+        except BaseException as final_error:
+            cleanup_errors.append(final_error)
+    except BaseException as wait_error:
+        cleanup_errors.append(wait_error)
+        try:
+            process.kill()
+        except BaseException as kill_error:
+            if process.poll() is None:
+                cleanup_errors.append(kill_error)
+        try:
+            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        except BaseException as final_error:
+            cleanup_errors.append(final_error)
+    if cleanup_errors:
+        failure = RealDomainBenchmarkError(
+            "approved analyzer process-tree cleanup failed: "
+            + "; ".join(
+                f"{type(error).__name__}: {error}"
+                for error in cleanup_errors
+            )
+        )
+        for error in cleanup_errors[1:]:
+            failure.add_note(
+                f"additional cleanup failure: {type(error).__name__}: {error}"
+            )
+        raise failure from cleanup_errors[0]
 
 
 class _WindowsKillJob:
@@ -587,8 +766,17 @@ class _WindowsKillJob:
         kernel32.CloseHandle.restype = wintypes.BOOL
         handle = kernel32.CreateJobObjectW(None, None)
         if not handle:
-            process.kill()
-            raise RealDomainBenchmarkError("could not create analyzer kill job")
+            primary_error = RealDomainBenchmarkError(
+                "could not create analyzer kill job"
+            )
+            try:
+                _kill_process_tree(process)
+            except BaseException as cleanup_error:
+                _raise_primary_with_cleanup(
+                    primary_error,
+                    (cleanup_error,),
+                )
+            raise primary_error
         limits = ExtendedLimit()
         limits.BasicLimitInformation.LimitFlags = 0x00002000
         if not kernel32.SetInformationJobObject(
@@ -598,12 +786,18 @@ class _WindowsKillJob:
         ):
             error_code = ctypes.get_last_error()
             kernel32.CloseHandle(handle)
-            process.kill()
-            process.wait()
-            raise RealDomainBenchmarkError(
+            primary_error = RealDomainBenchmarkError(
                 "could not secure analyzer process tree "
                 f"(Windows error {error_code})"
             )
+            try:
+                _kill_process_tree(process)
+            except BaseException as cleanup_error:
+                _raise_primary_with_cleanup(
+                    primary_error,
+                    (cleanup_error,),
+                )
+            raise primary_error
         self._handle = int(handle)
 
     def close(self) -> None:
@@ -672,8 +866,12 @@ def _temporary_analysis_directory() -> Iterator[Path]:
     directory = Path(
         tempfile.mkdtemp(prefix="drawback-real-domain-analysis-")
     )
+    primary_error: BaseException | None = None
     try:
         yield directory
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
         deadline = time.monotonic() + 5.0
         while True:
@@ -684,9 +882,15 @@ def _temporary_analysis_directory() -> Iterator[Path]:
                 break
             except OSError as error:
                 if time.monotonic() >= deadline:
-                    raise RealDomainBenchmarkError(
+                    cleanup_error = RealDomainBenchmarkError(
                         "approved analyzer temporary files remained locked"
-                    ) from error
+                    )
+                    if primary_error is not None:
+                        _raise_primary_with_cleanup(
+                            primary_error,
+                            (cleanup_error,),
+                        )
+                    raise cleanup_error from error
                 time.sleep(0.05)
 
 
@@ -1637,10 +1841,11 @@ def _jsonable(value: object) -> object:
 
 def _publish_no_clobber(output: Path, value: Mapping[str, object]) -> bytes:
     payload = _canonical(_jsonable(value))
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    descriptor = os.open(output, flags, 0o644)
-    with os.fdopen(descriptor, "wb") as destination:
-        destination.write(payload)
+    publish_bytes_durable_exact(
+        output,
+        payload,
+        label="real-domain benchmark artifact",
+    )
     return payload
 
 
@@ -1663,8 +1868,6 @@ def create_real_domain_prediction_bundle(
     process and access domain where the reveal file/path is absent.
     """
 
-    if output.exists():
-        raise FileExistsError("real-domain prediction bundle already exists")
     _titles, supported_ids, _unsupported_ids = load_catalog(observed_catalog)
     games = load_corpus(corpus)
     training_identity = audit_released_training(
@@ -1853,8 +2056,6 @@ def publish_real_domain_benchmark_report(
 ) -> Mapping[str, object]:
     """Stage B: score an authenticated prediction bundle without inference."""
 
-    if output.exists():
-        raise FileExistsError("real-domain benchmark report already exists")
     titles, supported_ids, unsupported_ids = load_catalog(observed_catalog)
     cases, bundle_provenance = _load_prediction_bundle(
         prediction_bundle,

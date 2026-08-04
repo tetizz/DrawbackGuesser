@@ -6,10 +6,12 @@ import math
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from ml.evaluation.selection import (
     ContentAddressedSummary,
     FusionGridEpochScorer,
+    _write_atomic_no_clobber,
     choose_epoch,
     fusion_grid_selection_objective_metadata,
     load_selection_artifact,
@@ -21,6 +23,7 @@ from ml.evaluation.validation_partition import VALIDATION_PARTITION_IDENTITY
 from ml.training.drawback_ml.rank_preserving_fusion import (
     rank_preserving_fusion,
 )
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable_exact
 from ml.training.drawback_ml.symbolic import FUSION_AWARE_LOSS_ALPHA_GRID
 
 
@@ -91,6 +94,31 @@ def write_summary(
 
 
 class EpochSelectionTest(unittest.TestCase):
+    def test_publication_retry_accepts_only_exact_committed_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            output = Path(raw) / "selection.json"
+            rendered = '{"selection":true}\n'
+
+            def fail_after_publication(
+                path: Path,
+                value: bytes,
+                *,
+                label: str,
+            ) -> None:
+                publish_bytes_durable_exact(path, value, label=label)
+                raise OSError("simulated post-publication failure")
+
+            with patch(
+                "ml.evaluation.selection.publish_bytes_durable_exact",
+                side_effect=fail_after_publication,
+            ):
+                with self.assertRaisesRegex(OSError, "post-publication"):
+                    _write_atomic_no_clobber(output, rendered)
+
+            _write_atomic_no_clobber(output, rendered)
+            with self.assertRaisesRegex(ValueError, "overwrite"):
+                _write_atomic_no_clobber(output, "different\n")
+
     def test_fusion_grid_counts_fail_closed(self) -> None:
         validate_fusion_grid_head_counts(
             {"observation_count": 3, "player_game_count": 2},
@@ -374,9 +402,15 @@ class EpochSelectionTest(unittest.TestCase):
                 [f"{epoch:064x}" for epoch in (101, 102)],
             )
             original = output.read_bytes()
+            self.assertEqual(
+                write_selection_artifact(output, references),
+                output,
+            )
+            self.assertEqual(output.read_bytes(), original)
+            output.write_bytes(b"competitor\n")
             with self.assertRaisesRegex(ValueError, "overwrite"):
                 write_selection_artifact(output, references)
-            self.assertEqual(output.read_bytes(), original)
+            self.assertEqual(output.read_bytes(), b"competitor\n")
 
     def test_loader_rejects_rehashed_selected_and_metric_tampering(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

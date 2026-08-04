@@ -25,6 +25,7 @@ from .capturable_records import (
     CapturableDatasetError,
 )
 from .capturable_reliability import validation_reliability_checks
+from .path_validation import is_portable_safe_basename, portable_basename_key
 
 CAPTURABLE_TREATMENT_COMPARISON_FORMAT = (
     "drawbackguesser-capturable-treatment-comparison"
@@ -118,6 +119,13 @@ def _bounded_metric(
 def _validated_candidate(
     path: Path,
 ) -> tuple[dict[str, Any], Mapping[str, Any]]:
+    resolved_path = path.resolve()
+    selection_directory = resolved_path.parent.name
+    selection_report = resolved_path.name
+    if not is_portable_safe_basename(
+        selection_directory
+    ) or not is_portable_safe_basename(selection_report):
+        raise CapturableDatasetError("selection path is not portable")
     report, report_sha256 = _selection_report(path)
     report_version = report.get("version")
     if (
@@ -203,16 +211,16 @@ def _validated_candidate(
     checkpoint_file = checkpoint.get("file")
     checkpoint_sha256 = checkpoint.get("sha256")
     if (
-        not isinstance(checkpoint_file, str)
-        or not checkpoint_file
-        or Path(checkpoint_file).name != checkpoint_file
+        not is_portable_safe_basename(checkpoint_file)
+        or portable_basename_key(checkpoint_file)
+        == portable_basename_key(selection_report)
         or not isinstance(checkpoint_sha256, str)
         or len(checkpoint_sha256) != 64
     ):
         raise CapturableDatasetError(
             f"{path.name} checkpoint identity is invalid"
         )
-    checkpoint_path = path.resolve().parent / checkpoint_file
+    checkpoint_path = resolved_path.parent / checkpoint_file
     _, checkpoint_metadata, measured_checkpoint_sha256 = (
         _load_selection_checkpoint(checkpoint_path)
     )
@@ -271,8 +279,8 @@ def _validated_candidate(
         )
     return (
         {
-            "selectionDirectory": path.resolve().parent.name,
-            "selectionReport": path.resolve().name,
+            "selectionDirectory": selection_directory,
+            "selectionReport": selection_report,
             "selectionReportSha256": report_sha256,
             "checkpointFile": checkpoint_file,
             "checkpointSha256": checkpoint_sha256,
@@ -616,22 +624,43 @@ def load_treatment_comparison(
             f"{path.name} comparison candidates are invalid"
         )
 
-    def authenticate(
+    def candidate_location(
         entry: Mapping[str, Any],
-    ) -> tuple[dict[str, Any], Mapping[str, Any]]:
+    ) -> tuple[str, str]:
         directory = entry.get("selectionDirectory")
         report_name = entry.get("selectionReport")
         if (
-            not isinstance(directory, str)
-            or not directory
-            or Path(directory).name != directory
-            or not isinstance(report_name, str)
-            or not report_name
-            or Path(report_name).name != report_name
+            not is_portable_safe_basename(directory)
+            or not is_portable_safe_basename(report_name)
         ):
             raise CapturableDatasetError(
                 f"{path.name} contains an invalid candidate path"
             )
+        return directory, report_name
+
+    control_location = candidate_location(control_entry)
+    treatment_locations = [
+        candidate_location(entry) for entry in treatment_entries
+    ]
+    seen_locations: dict[tuple[str, str], tuple[str, str]] = {}
+    for directory, report_name in (control_location, *treatment_locations):
+        location = (directory, report_name)
+        location_key = (
+            portable_basename_key(directory),
+            portable_basename_key(report_name),
+        )
+        prior_location = seen_locations.get(location_key)
+        if prior_location is not None and prior_location != location:
+            raise CapturableDatasetError(
+                f"{path.name} contains a portable-colliding candidate path"
+            )
+        seen_locations[location_key] = location
+
+    def authenticate(
+        entry: Mapping[str, Any],
+        location: tuple[str, str],
+    ) -> tuple[dict[str, Any], Mapping[str, Any]]:
+        directory, report_name = location
         candidate, report = _validated_candidate(
             path.resolve().parent / directory / report_name
         )
@@ -642,9 +671,14 @@ def load_treatment_comparison(
             )
         return candidate, report
 
-    control, control_report = authenticate(control_entry)
+    control, control_report = authenticate(control_entry, control_location)
     treatments_with_reports = [
-        authenticate(entry) for entry in treatment_entries
+        authenticate(entry, location)
+        for entry, location in zip(
+            treatment_entries,
+            treatment_locations,
+            strict=True,
+        )
     ]
     treatments = [item[0] for item in treatments_with_reports]
     identities = {

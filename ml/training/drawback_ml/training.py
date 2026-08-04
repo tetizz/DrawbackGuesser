@@ -91,12 +91,17 @@ class TrainingConfig:
             raise ValueError(
                 "execution_source_revision must be a full lowercase Git SHA"
             )
-        if self.seed < 0:
-            raise ValueError("seed must be non-negative")
+        if isinstance(self.seed, bool) or not isinstance(self.seed, int) or self.seed < 0:
+            raise ValueError("seed must be a non-negative integer")
         if self.epochs <= 0 or self.batch_size <= 0 or self.hidden_dimension <= 0:
             raise ValueError("epochs, batch_size, and hidden_dimension must be positive")
-        if self.learning_rate <= 0:
-            raise ValueError("learning_rate must be positive")
+        if (
+            isinstance(self.learning_rate, bool)
+            or not isinstance(self.learning_rate, (int, float))
+            or not math.isfinite(self.learning_rate)
+            or self.learning_rate <= 0
+        ):
+            raise ValueError("learning_rate must be finite and positive")
         if self.device not in {"cpu", "cuda"}:
             raise ValueError("device must be cpu or cuda")
         if self.shuffle_buffer_size <= 0:
@@ -404,6 +409,12 @@ def train_baseline(
 ) -> Path:
     """Train and checkpoint without evaluating or reporting invented metrics."""
 
+    try:
+        output_directory.mkdir(parents=True, exist_ok=False)
+    except FileExistsError as error:
+        raise FileExistsError(
+            f"training output directory already exists: {output_directory}"
+        ) from error
     prepared = prepare_training_labels(
         examples,
         config.split,

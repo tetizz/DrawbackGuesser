@@ -1,8 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { once } from "node:events";
-import { createWriteStream } from "node:fs";
-import { link, rm } from "node:fs/promises";
-import { finished } from "node:stream/promises";
+import type { BigIntStats } from "node:fs";
+import { link, lstat, open, type FileHandle } from "node:fs/promises";
+import { dirname } from "node:path";
 import {
   convertTraceToDatasetRows,
   type TrainingDatasetRow,
@@ -14,6 +13,14 @@ import {
   parseTrustedSimulationTraceRecord,
   type TrustedSimulationTraceRecord,
 } from "./trusted-trace.js";
+import {
+  cleanupSchema9TemporaryPublication,
+  Schema9AtomicPublicationCleanupError,
+  Schema9AtomicPublicationError,
+  schema9PublicationMayBeCommitted,
+  syncSchema9PublicationParentDirectory,
+  type Schema9TemporaryPublicationIdentity,
+} from "./schema9-atomic-publication.js";
 
 export interface DatasetOutputPolicy {
   /**
@@ -134,39 +141,83 @@ function encodeDatasetRow(row: TrainingDatasetRow): string {
   return `${JSON.stringify(row)}\n`;
 }
 
-async function removeIfPresent(path: string): Promise<void> {
-  try {
-    await rm(path);
-  } catch (error: unknown) {
-    if (
-      typeof error === "object"
-      && error !== null
-      && "code" in error
-      && error.code === "ENOENT"
-    ) {
-      return;
-    }
-    throw error;
-  }
+function temporaryIdentity(
+  metadata: BigIntStats,
+): Schema9TemporaryPublicationIdentity {
+  return Object.freeze({
+    dev: metadata.dev,
+    ino: metadata.ino,
+    birthtimeNs: metadata.birthtimeNs,
+  });
 }
 
-async function publishNoClobber(
+function isSameTemporaryObject(
+  metadata: BigIntStats,
+  expected: Schema9TemporaryPublicationIdentity,
+): boolean {
+  return metadata.isFile()
+    && !metadata.isSymbolicLink()
+    && metadata.dev === expected.dev
+    && metadata.ino === expected.ino
+    && metadata.birthtimeNs === expected.birthtimeNs;
+}
+
+/** Exposed only so the replacement-race behavior can be regression tested. */
+export async function publishTrainingDatasetNoClobberForTesting(
   temporaryPath: string,
   outputPath: string,
+  expected: Schema9TemporaryPublicationIdentity,
+  afterQuarantine?: (quarantine: string) => Promise<void>,
+  afterDirectorySync?: (directory: string) => Promise<void>,
 ): Promise<void> {
   await link(temporaryPath, outputPath);
   try {
-    await rm(temporaryPath);
-  } catch (error: unknown) {
-    try {
-      await removeIfPresent(outputPath);
-    } catch (cleanupError: unknown) {
-      throw new AggregateError(
-        [error, cleanupError],
-        "Dataset cleanup failed for both temporary and published paths.",
-      );
+    const linked = await lstat(outputPath, { bigint: true });
+    if (!isSameTemporaryObject(linked, expected)) {
+      throw new Error("Published dataset is not the authenticated temporary file.");
     }
-    throw error;
+    await cleanupSchema9TemporaryPublication(
+      temporaryPath,
+      expected,
+      "Dataset publication",
+      afterQuarantine,
+    );
+    const published = await lstat(outputPath, { bigint: true });
+    if (!isSameTemporaryObject(published, expected)) {
+      throw new Error("Published dataset changed after temporary cleanup.");
+    }
+    await syncSchema9PublicationParentDirectory(
+      outputPath,
+      "Dataset publication",
+    );
+    await afterDirectorySync?.(dirname(outputPath));
+  } catch (error: unknown) {
+    throw error instanceof Schema9AtomicPublicationCleanupError
+      ? error
+      : new Schema9AtomicPublicationError(
+        "Dataset publication committed but verification or cleanup failed.",
+        true,
+        { cause: error },
+      );
+  }
+}
+
+async function writeAll(
+  handle: FileHandle,
+  bytes: Buffer,
+): Promise<void> {
+  let offset = 0;
+  while (offset < bytes.byteLength) {
+    const result = await handle.write(
+      bytes,
+      offset,
+      bytes.byteLength - offset,
+      null,
+    );
+    if (result.bytesWritten <= 0) {
+      throw new Error("Private dataset temporary output stopped accepting bytes.");
+    }
+    offset += result.bytesWritten;
   }
 }
 
@@ -183,11 +234,9 @@ export async function writeTrainingDatasetNdjsonFileAtomic(
 ): Promise<WrittenTrainingDataset> {
   const temporaryPath =
     `${outputPath}.tmp-${String(process.pid)}-${randomUUID()}`;
-  const stream = createWriteStream(temporaryPath, {
-    encoding: "utf8",
-    flags: "wx",
-    mode: 0o600,
-  });
+  let handle: FileHandle | undefined;
+  let temporaryCreated = false;
+  let ownedTemporary: Schema9TemporaryPublicationIdentity | undefined;
   const hash = createHash("sha256");
   const gameIds = new Set<string>();
   let games = 0;
@@ -196,6 +245,9 @@ export async function writeTrainingDatasetNdjsonFileAtomic(
   let identity: EvaluatorIdentity | null = null;
 
   try {
+    handle = await open(temporaryPath, "wx", 0o600);
+    temporaryCreated = true;
+    ownedTemporary = temporaryIdentity(await handle.stat({ bigint: true }));
     for await (const traceInput of traces) {
       const trace = parseTrustedSimulationTraceRecord(traceInput);
       if (gameIds.has(trace.gameId)) {
@@ -211,21 +263,25 @@ export async function writeTrainingDatasetNdjsonFileAtomic(
       const converted = convertTrustedTrace(trace);
       for (const row of converted) {
         const chunk = encodeDatasetRow(row);
-        hash.update(chunk, "utf8");
-        bytes += Buffer.byteLength(chunk, "utf8");
+        const encoded = Buffer.from(chunk, "utf8");
+        hash.update(encoded);
+        bytes += encoded.byteLength;
         rows += 1;
-        if (!stream.write(chunk, "utf8")) {
-          await once(stream, "drain");
-        }
+        await writeAll(handle, encoded);
       }
       games += 1;
     }
     if (games === 0) {
       throw new TypeError("At least one private Engine trace is required.");
     }
-    stream.end();
-    await finished(stream);
-    await publishNoClobber(temporaryPath, outputPath);
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await publishTrainingDatasetNoClobberForTesting(
+      temporaryPath,
+      outputPath,
+      ownedTemporary,
+    );
     return {
       games,
       rows,
@@ -237,16 +293,41 @@ export async function writeTrainingDatasetNdjsonFileAtomic(
       authorityId: identity?.authorityId ?? null,
     };
   } catch (error: unknown) {
-    stream.destroy();
-    await finished(stream).catch(() => undefined);
-    try {
-      await removeIfPresent(temporaryPath);
-    } catch (cleanupError: unknown) {
+    const cleanupFailures: unknown[] = [];
+    if (handle !== undefined) {
+      try {
+        await handle.close();
+      } catch (cleanupError: unknown) {
+        cleanupFailures.push(cleanupError);
+      }
+    }
+    if (
+      temporaryCreated
+      && !schema9PublicationMayBeCommitted(error)
+    ) {
+      try {
+        if (ownedTemporary === undefined) {
+          throw new Error(
+            "Private dataset temporary identity is unavailable for cleanup.",
+          );
+        }
+        await cleanupSchema9TemporaryPublication(
+          temporaryPath,
+          ownedTemporary,
+          "Private dataset conversion",
+        );
+      } catch (cleanupError: unknown) {
+        cleanupFailures.push(cleanupError);
+      }
+    }
+    if (cleanupFailures.length > 0) {
       throw new AggregateError(
-        [error, cleanupError],
+        [error, ...cleanupFailures],
         "Dataset conversion failed and its private temporary file could not be removed.",
       );
     }
-    throw error;
+    throw error instanceof Error
+      ? error
+      : new Error("Private dataset conversion failed.", { cause: error });
   }
 }

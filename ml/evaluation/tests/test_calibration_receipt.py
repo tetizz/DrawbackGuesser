@@ -130,6 +130,27 @@ class CalibrationReceiptTest(unittest.TestCase):
                 )["run_id"],
             )
 
+    def test_writer_recovers_an_exact_completed_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            inputs = build_inputs(directory)
+            output = directory / "calibration-receipt.json"
+            first = write_calibration_receipt(output, inputs)
+            second = write_calibration_receipt(
+                output,
+                inputs,
+                recover_exact=True,
+            )
+            self.assertEqual(second, first)
+
+            output.write_bytes(b"different\n")
+            with self.assertRaisesRegex(ValueError, "do not match"):
+                write_calibration_receipt(
+                    output,
+                    inputs,
+                    recover_exact=True,
+                )
+
     def test_loader_rejects_duplicate_keys_and_noncanonical_bytes(self) -> None:
         for mutation, expected in (
             (

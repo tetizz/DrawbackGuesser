@@ -11,6 +11,12 @@ from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING, Iterable, Mapping
 
+from ml.training.drawback_ml.durable_publish import (
+    abort_staged_file_safely,
+    publish_bytes_durable,
+    publish_staged_file_durable,
+)
+
 from .calibration import (
     MAXIMUM_CALIBRATION_TEMPERATURE,
     MINIMUM_CALIBRATION_TEMPERATURE,
@@ -165,33 +171,55 @@ class CalibrationSidecarStream:
         )
         self._index += 1
 
-    def finalize(self) -> ContentAddressedFile:
+    def finalize(self, *, recover_exact: bool = False) -> ContentAddressedFile:
         if self._closed:
             raise ValueError("calibration sidecar stream is closed")
         if any(count == 0 for count in self._counts.values()):
-            self.abort()
-            raise ValueError(
+            error = ValueError(
                 "calibration sidecar requires White and Black observations"
             )
+            try:
+                self.abort()
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "calibration sidecar cleanup also failed: "
+                    f"{cleanup_error!r}"
+                )
+            raise error
         self._file.flush()
         os.fsync(self._file.fileno())
         self._file.close()
+        expected_sha256 = self._hash.hexdigest()
         try:
-            os.link(self._temporary, self.output)
+            publish_staged_file_durable(
+                self.output,
+                self._temporary,
+                expected_sha256,
+                label="calibration observation sidecar",
+                recover_exact=recover_exact,
+            )
         except FileExistsError as error:
-            self.abort()
+            self._closed = True
             raise ValueError(
-                f"refusing to overwrite calibration observation sidecar: {self.output}"
+                "refusing to overwrite calibration observation sidecar: "
+                f"{self.output}"
             ) from error
-        self._temporary.unlink(missing_ok=True)
+        except BaseException:
+            self._closed = True
+            raise
         self._closed = True
-        return ContentAddressedFile(self.output, self._hash.hexdigest())
+        return ContentAddressedFile(self.output, expected_sha256)
 
     def abort(self) -> None:
         if not self._closed:
-            self._file.close()
-            self._temporary.unlink(missing_ok=True)
-            self._closed = True
+            try:
+                abort_staged_file_safely(
+                    self._temporary,
+                    self._file,
+                    label="calibration sidecar",
+                )
+            finally:
+                self._closed = True
 
 
 def write_calibration_observation_sidecar(
@@ -610,22 +638,7 @@ def _write_atomic_no_clobber(
     name: str,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=path.parent,
-    )
-    temporary = Path(temporary_name)
     try:
-        with os.fdopen(
-            descriptor, "w", encoding="utf-8", newline="\n"
-        ) as target:
-            target.write(rendered)
-            target.flush()
-            os.fsync(target.fileno())
-        try:
-            os.link(temporary, path)
-        except FileExistsError as error:
-            raise ValueError(f"refusing to overwrite {name}: {path}") from error
-    finally:
-        temporary.unlink(missing_ok=True)
+        publish_bytes_durable(path, rendered.encode("utf-8"))
+    except FileExistsError as error:
+        raise ValueError(f"refusing to overwrite {name}: {path}") from error

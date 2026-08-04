@@ -23,6 +23,7 @@ from ml.training.drawback_ml.inference import (
     CheckpointPredictor,
     load_checkpoint_predictor,
 )
+from ml.training.drawback_ml.path_validation import is_portable_safe_basename
 
 from .selection import (
     ContentAddressedSummary,
@@ -486,8 +487,8 @@ def _local_file(directory: Path, value: object, name: str) -> Path:
 
 
 def _basename(value: object, name: str) -> str:
-    if not isinstance(value, str) or not value or Path(value).name != value:
-        raise ValueError(f"{name} must be a non-empty basename")
+    if not is_portable_safe_basename(value):
+        raise ValueError(f"{name} must be a safe basename")
     return value
 
 

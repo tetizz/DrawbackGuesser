@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,17 +17,26 @@ from ml.evaluation.post_selection_continuation import (
     RESUME_VERSION,
     _authenticate_calibration_prefix,
     _exclusive_copy,
+    _preflight_recursive_git_filters,
+    _run_capture_process,
+    _stable_external_git,
     _continued_workflow,
     _stage_seed,
     load_manifest,
     run,
 )
 from ml.evaluation.release_workflow import (
+    ExternalRef,
     ReleaseWorkflowError,
     Step,
     build_plan,
 )
-from ml.evaluation.tests.test_release_workflow import _workflow
+from ml.evaluation.tests.test_release_workflow import (
+    _nested_filter_fixture,
+    _redirected_worktree_fixture,
+    _workflow,
+)
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable_exact
 
 
 def write(path: Path, value: object) -> str:
@@ -33,6 +46,95 @@ def write(path: Path, value: object) -> str:
 
 
 class PostSelectionContinuationTests(unittest.TestCase):
+    def test_contained_git_timeout_preserves_primary_and_terminates_descendant(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            heartbeat = root / "git-descendant-heartbeat"
+            child = (
+                "from pathlib import Path; import sys,time\n"
+                "path=Path(sys.argv[1])\n"
+                "while True:\n"
+                " path.open('ab', buffering=0).write(b'x')\n"
+                " time.sleep(0.02)\n"
+            )
+            parent = (
+                "import subprocess,sys,time\n"
+                "subprocess.Popen([sys.executable,'-c',sys.argv[1],sys.argv[2]])\n"
+                "while True: time.sleep(1)\n"
+            )
+            with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                _run_capture_process(
+                    [sys.executable, "-c", parent, child, str(heartbeat)],
+                    cwd=root,
+                    environment=dict(os.environ),
+                    timeout=1,
+                )
+            self.assertEqual(raised.exception.timeout, 1)
+            self.assertTrue(heartbeat.exists(), "descendant never started")
+            time.sleep(0.2)
+            settled_size = heartbeat.stat().st_size
+            time.sleep(0.3)
+            self.assertEqual(heartbeat.stat().st_size, settled_size)
+
+    def test_continuation_preflight_rejects_redirected_root_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            git, repository, _redirected, environment = (
+                _redirected_worktree_fixture(Path(directory))
+            )
+            with self.assertRaisesRegex(
+                ReleaseWorkflowError, "different worktree root"
+            ):
+                _preflight_recursive_git_filters(
+                    git,
+                    repository=repository,
+                    environment=environment,
+                )
+
+    def test_continuation_preflight_rejects_nested_worktree_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            git, repository, _nested, marker, environment = (
+                _nested_filter_fixture(Path(directory))
+            )
+            with self.assertRaisesRegex(
+                ReleaseWorkflowError, "executable Git filter"
+            ):
+                _preflight_recursive_git_filters(
+                    git,
+                    repository=repository,
+                    environment=environment,
+                )
+            self.assertFalse(marker.exists())
+
+    def test_external_git_replacement_is_detected_without_masking_primary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / "git.exe"
+            replacement = root / "replacement.exe"
+            executable.write_bytes(b"trusted git")
+            digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+            reference = ExternalRef(executable, digest)
+            authenticated = executable.resolve(strict=True)
+            replacement.write_bytes(executable.read_bytes())
+            with self.assertRaisesRegex(
+                ReleaseWorkflowError, "identity changed"
+            ):
+                with _stable_external_git(reference, authenticated):
+                    replacement.replace(executable)
+
+            executable.write_bytes(b"trusted git")
+            replacement.write_bytes(executable.read_bytes())
+            reference = ExternalRef(executable, digest)
+            with self.assertRaisesRegex(RuntimeError, "primary failure") as raised:
+                with _stable_external_git(reference, executable.resolve(strict=True)):
+                    replacement.replace(executable)
+                    raise RuntimeError("primary failure")
+            self.assertIn(
+                "external Git reauthentication also failed",
+                " ".join(getattr(raised.exception, "__notes__", ())),
+            )
+
     def test_loads_narrow_resume_manifest_with_exact_prefix_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "resume.json"
@@ -344,7 +446,7 @@ class PostSelectionContinuationTests(unittest.TestCase):
             with self.assertRaisesRegex(ReleaseWorkflowError, "escapes"):
                 load_manifest(path)
 
-    def test_authenticated_staging_is_no_clobber(self) -> None:
+    def test_authenticated_staging_recovers_only_an_exact_copy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "source.json"
@@ -352,15 +454,45 @@ class PostSelectionContinuationTests(unittest.TestCase):
             expected = write(source, {"evidence": True})
             _exclusive_copy(source, destination, expected)
             self.assertEqual(destination.read_bytes(), source.read_bytes())
-            with self.assertRaisesRegex(
-                ReleaseWorkflowError, "already exists"
-            ):
+            _exclusive_copy(source, destination, expected)
+            destination.write_bytes(b"competitor")
+            with self.assertRaisesRegex(ReleaseWorkflowError, "cannot publish"):
                 _exclusive_copy(source, destination, expected)
             destination.unlink()
             with self.assertRaisesRegex(
                 ReleaseWorkflowError, "authentication failed"
             ):
                 _exclusive_copy(source, destination, "0" * 64)
+
+    def test_staging_retry_converges_after_post_publication_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.json"
+            destination = root / "staged" / "source.json"
+            expected = write(source, {"evidence": True})
+
+            def fail_after_publication(
+                path: Path,
+                payload: bytes,
+                *,
+                label: str,
+            ) -> None:
+                publish_bytes_durable_exact(path, payload, label=label)
+                raise OSError("simulated failure after publication")
+
+            with patch(
+                "ml.evaluation.post_selection_continuation."
+                "publish_bytes_durable_exact",
+                side_effect=fail_after_publication,
+            ):
+                with self.assertRaisesRegex(
+                    ReleaseWorkflowError,
+                    "cannot publish",
+                ):
+                    _exclusive_copy(source, destination, expected)
+
+            _exclusive_copy(source, destination, expected)
+            self.assertEqual(destination.read_bytes(), source.read_bytes())
 
     def test_stages_only_archived_evidence_and_records_checkpoint_source(
         self,
@@ -551,6 +683,7 @@ class PostSelectionContinuationTests(unittest.TestCase):
                 {"frequency": True},
             )
             events: list[str] = []
+            git_commands: list[tuple[str, ...]] = []
             workflow = {
                 "sourceRevision": "1" * 40,
                 "trainingFrequency": {
@@ -591,6 +724,7 @@ class PostSelectionContinuationTests(unittest.TestCase):
             )
 
             def process(arguments, **_kwargs):
+                git_commands.append(tuple(arguments))
                 if "rev-parse" in arguments:
                     events.append("revision")
                     return SimpleNamespace(stdout="2" * 40 + "\n")
@@ -638,8 +772,20 @@ class PostSelectionContinuationTests(unittest.TestCase):
                     side_effect=lambda name, **_kwargs: str(binaries[name]),
                 ),
                 patch(
-                    "ml.evaluation.post_selection_continuation.subprocess.run",
+                    "ml.evaluation.post_selection_continuation._run_capture_process",
                     side_effect=process,
+                ),
+                patch(
+                    "ml.evaluation.post_selection_continuation."
+                    "_preflight_recursive_git_filters",
+                    side_effect=lambda *_args, **_kwargs: events.append(
+                        "filters"
+                    ),
+                ),
+                patch(
+                    "ml.evaluation.post_selection_continuation."
+                    "_stable_file_identity",
+                    return_value=(1, 2, 3, 4, 5),
                 ),
                 patch(
                     "ml.evaluation.post_selection_continuation._input_references",
@@ -678,8 +824,13 @@ class PostSelectionContinuationTests(unittest.TestCase):
             for name in ("browser", "git", "node", "pnpm"):
                 self.assertLess(events.index(f"tool-{name}"), first_verify)
             self.assertLess(events.index("revision"), first_verify)
+            self.assertLess(events.index("filters"), first_verify)
             self.assertLess(events.index("dirty"), first_verify)
             self.assertLess(events.index("input"), first_verify)
+            self.assertEqual(len(git_commands), 2)
+            for command in git_commands:
+                self.assertIn("core.fsmonitor=false", command)
+                self.assertIn("credential.helper=", command)
             first_execute = events.index("execute-ensemble-release")
             self.assertTrue(
                 all(
@@ -818,8 +969,18 @@ class PostSelectionContinuationTests(unittest.TestCase):
                     side_effect=lambda name, **_kwargs: str(binaries[name]),
                 ),
                 patch(
-                    "ml.evaluation.post_selection_continuation.subprocess.run",
+                    "ml.evaluation.post_selection_continuation._run_capture_process",
                     side_effect=process,
+                ),
+                patch(
+                    "ml.evaluation.post_selection_continuation."
+                    "_preflight_recursive_git_filters",
+                    return_value=(root,),
+                ),
+                patch(
+                    "ml.evaluation.post_selection_continuation."
+                    "_stable_file_identity",
+                    return_value=(1, 2, 3, 4, 5),
                 ),
                 patch(
                     "ml.evaluation.post_selection_continuation._input_references",
@@ -951,8 +1112,13 @@ class PostSelectionContinuationTests(unittest.TestCase):
                     side_effect=lambda name, **_kwargs: str(binaries[name]),
                 ),
                 patch(
-                    "ml.evaluation.post_selection_continuation.subprocess.run",
+                    "ml.evaluation.post_selection_continuation._run_capture_process",
                     return_value=SimpleNamespace(stdout="3" * 40 + "\n"),
+                ),
+                patch(
+                    "ml.evaluation.post_selection_continuation."
+                    "_stable_file_identity",
+                    return_value=(1, 2, 3, 4, 5),
                 ),
                 patch(
                     "ml.evaluation.post_selection_continuation._stage_seed"

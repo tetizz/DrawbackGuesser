@@ -1,14 +1,18 @@
 import { execFile } from "node:child_process";
 import {
   access,
+  chmod,
+  copyFile,
   mkdir,
   mkdtemp,
+  rename,
   readdir,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
 import {
@@ -20,10 +24,14 @@ import { describe, expect, it } from "vitest";
 import {
   assertEngineRuntimeCheckout,
   assertExactReproducibleExecutionIdentity,
+  assertNoSchema9GitConfigOverrides,
   cloneRepositoryAtCommit,
   createGitRepositoryVerifier,
+  discoverRuntimeModulePaths,
+  IncompleteOwnedSchema9CleanupError,
   moduleGraphIdentity,
   parseSchema9LedgerCliArguments,
+  requireCleanCheckout,
   requireNoSubmoduleIgnoreConfiguration,
   schema9RuntimeIdentity,
   withSchema9TemporaryCheckout,
@@ -212,6 +220,51 @@ describe("schema-9 corpus ledger CLI arguments", () => {
       const verifier = createGitRepositoryVerifier(guesser, engineCheckout);
       await expect(verifier.pinnedEngineCommitAt(guesserHead))
         .resolves.toBe(engineHead);
+      let acceptReproductionStarted: (() => void) | undefined;
+      const reproductionStarted = new Promise<void>((accept) => {
+        acceptReproductionStarted = accept;
+      });
+      let observedSignal: AbortSignal | undefined;
+      const cancellingVerifier = createGitRepositoryVerifier(
+        guesser,
+        engineCheckout,
+        {
+          reproduceProducerRuntimeIdentity: async (request) => {
+            observedSignal = request.signal;
+            acceptReproductionStarted?.();
+            const signal = request.signal;
+            if (signal === undefined) {
+              throw new Error("Runtime reproduction did not receive a signal.");
+            }
+            await new Promise<void>((_accept, reject) => {
+              if (signal.aborted) {
+                reject(signal.reason instanceof Error
+                  ? signal.reason
+                  : new Error("Runtime reproduction was cancelled."));
+                return;
+              }
+              signal.addEventListener("abort", () => {
+                reject(signal.reason instanceof Error
+                  ? signal.reason
+                  : new Error("Runtime reproduction was cancelled."));
+              }, { once: true });
+            });
+            throw new Error("Cancelled runtime reproduction unexpectedly resumed.");
+          },
+        },
+      );
+      await expect(cancellingVerifier.pinnedEngineCommitAt(guesserHead))
+        .resolves.toBe(engineHead);
+      const controller = new AbortController();
+      const cancellation = new Error("injected runtime reproduction cancellation");
+      const reproduction = cancellingVerifier.producerRuntimeIdentityAt(
+        engineHead,
+        controller.signal,
+      );
+      await reproductionStarted;
+      controller.abort(cancellation);
+      await expect(reproduction).rejects.toBe(cancellation);
+      expect(observedSignal).toBe(controller.signal);
       await expect(
         createGitRepositoryVerifier(guesser, engineSource)
           .pinnedEngineCommitAt(guesserHead),
@@ -571,6 +624,9 @@ describe("schema-9 corpus ledger CLI arguments", () => {
       .toThrow("without runtime hooks");
     expect(() => schema9RuntimeIdentity({ NODE_PATH: "elsewhere" }, []))
       .toThrow("without runtime hooks");
+    expect(() => schema9RuntimeIdentity({
+      NODE_PRESERVE_SYMLINKS_MAIN: "1",
+    }, [])).toThrow("without runtime hooks");
     expect(schema9RuntimeIdentity({}, [])).toMatchObject({
       nodeVersion: process.version,
       platform: process.platform,
@@ -578,6 +634,175 @@ describe("schema-9 corpus ledger CLI arguments", () => {
       execArgv: [],
     });
   });
+
+  it("times out a module graph whose entrypoint never settles", async () => {
+    const root = await mkdtemp(join(tmpdir(), "schema9-module-timeout-"));
+    const entry = join(root, "hang.mjs");
+    try {
+      await writeFile(
+        entry,
+        "setInterval(() => undefined, 1000);\n"
+          + "await new Promise(() => undefined);\n",
+        "utf8",
+      );
+      await expect(discoverRuntimeModulePaths(
+        pathToFileURL(entry).href,
+        250,
+      )).rejects.toThrow("module graph probe exceeded its time limit");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  it("retains ownership and refuses a replacement checkout junction", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "schema9-owner-swap-"));
+    const replacement = join(parent, "replacement");
+    const displaced = join(parent, "displaced");
+    await mkdir(replacement);
+    await writeFile(join(replacement, "sentinel"), "keep\n", "utf8");
+    let failure: unknown;
+    try {
+      try {
+        await withSchema9TemporaryCheckout(async (checkout) => {
+          await rename(checkout, displaced);
+          await symlink(
+            replacement,
+            checkout,
+            process.platform === "win32" ? "junction" : "dir",
+          );
+        }, parent);
+      } catch (error: unknown) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(IncompleteOwnedSchema9CleanupError);
+      if (!(failure instanceof IncompleteOwnedSchema9CleanupError)) {
+        throw new Error("Expected retained schema-9 cleanup failure.");
+      }
+      await expect(failure.retryCleanup()).rejects.toBeInstanceOf(
+        IncompleteOwnedSchema9CleanupError,
+      );
+      await expect(access(join(replacement, "sentinel"))).resolves.toBeUndefined();
+    } finally {
+      const entries = await readdir(parent);
+      for (const entry of entries) {
+        await rm(join(parent, entry), { recursive: true, force: true });
+      }
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("treats an unexplained owner disappearance as incomplete cleanup", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "schema9-owner-missing-"));
+    let failure: unknown;
+    try {
+      try {
+        await withSchema9TemporaryCheckout(async (checkout) => {
+          await rm(dirname(checkout), { recursive: true, force: true });
+        }, parent);
+      } catch (error: unknown) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(IncompleteOwnedSchema9CleanupError);
+      if (!(failure instanceof IncompleteOwnedSchema9CleanupError)) {
+        throw new Error("Expected an incomplete cleanup owner.");
+      }
+      await expect(failure.retryCleanup()).rejects.toBeInstanceOf(
+        IncompleteOwnedSchema9CleanupError,
+      );
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  it("does not install or execute hooks from a caller Git template", async () => {
+    const root = await mkdtemp(join(tmpdir(), "schema9-git-template-"));
+    const source = join(root, "source");
+    const target = join(root, "target");
+    const template = join(root, "template");
+    const hook = join(template, "hooks", "post-checkout");
+    const previousTemplate = process.env["GIT_TEMPLATE_DIR"];
+    try {
+      await mkdir(join(template, "hooks"), { recursive: true });
+      await writeFile(
+        hook,
+        "#!/bin/sh\nprintf injected > hook-ran\n",
+        "utf8",
+      );
+      await chmod(hook, 0o755);
+      await execFileAsync("git", ["init", source], { windowsHide: true });
+      await git(source, "config", "user.name", "tetizz");
+      await git(
+        source,
+        "config",
+        "user.email",
+        "104690265+tetizz@users.noreply.github.com",
+      );
+      await writeFile(join(source, "README.md"), "fixture\n", "utf8");
+      await git(source, "add", "README.md");
+      await git(source, "commit", "-m", "Template fixture");
+      const commit = (await git(source, "rev-parse", "HEAD")).stdout.trim();
+
+      process.env["GIT_TEMPLATE_DIR"] = template;
+      await cloneRepositoryAtCommit(source, target, commit);
+      await expect(access(join(target, "hook-ran")))
+        .rejects.toMatchObject({ code: "ENOENT" });
+      await expect(access(join(target, ".git", "hooks", "post-checkout")))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      if (previousTemplate === undefined) {
+        delete process.env["GIT_TEMPLATE_DIR"];
+      } else {
+        process.env["GIT_TEMPLATE_DIR"] = previousTemplate;
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it("ignores a caller PATH that shadows the system Git executable", async () => {
+    const root = await mkdtemp(join(tmpdir(), "schema9-git-shadow-"));
+    const source = join(root, "source");
+    const target = join(root, "target");
+    const shadow = join(root, "shadow");
+    const previousPath = process.env["PATH"];
+    const previousGitDirectory = process.env["GIT_DIR"];
+    try {
+      await execFileAsync("git", ["init", source], { windowsHide: true });
+      await git(source, "config", "user.name", "tetizz");
+      await git(
+        source,
+        "config",
+        "user.email",
+        "104690265+tetizz@users.noreply.github.com",
+      );
+      await writeFile(join(source, "README.md"), "fixture\n", "utf8");
+      await git(source, "add", "README.md");
+      await git(source, "commit", "-m", "Shadow fixture");
+      const commit = (await git(source, "rev-parse", "HEAD")).stdout.trim();
+      await mkdir(shadow);
+      const fakeGit = join(shadow, process.platform === "win32" ? "git.exe" : "git");
+      await copyFile(process.execPath, fakeGit);
+      if (process.platform !== "win32") {
+        await chmod(fakeGit, 0o755);
+      }
+      process.env["PATH"] = shadow;
+      process.env["GIT_DIR"] = join(root, "attacker-git-dir");
+
+      await cloneRepositoryAtCommit(source, target, commit);
+      await expect(access(join(target, "README.md"))).resolves.toBeUndefined();
+    } finally {
+      if (previousPath === undefined) {
+        delete process.env["PATH"];
+      } else {
+        process.env["PATH"] = previousPath;
+      }
+      if (previousGitDirectory === undefined) {
+        delete process.env["GIT_DIR"];
+      } else {
+        process.env["GIT_DIR"] = previousGitDirectory;
+      }
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it("rejects deferred file and non-file module loads", async () => {
     const root = await mkdtemp(join(tmpdir(), "schema9-load-guard-"));
@@ -632,6 +857,108 @@ process.stdout.write(JSON.stringify(messages));
         "Schema-9 verification rejected a deferred runtime module load.",
         "Schema-9 verification rejected a non-file runtime module.",
       ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("schema-9 authenticated Git configuration", () => {
+  it("rejects caller config overrides before invoking Git", () => {
+    expect(() => {
+      assertNoSchema9GitConfigOverrides([
+        "-c",
+        "core.fsmonitor=attacker",
+        "status",
+      ]);
+    }).toThrow("reject caller config overrides");
+    expect(() => {
+      assertNoSchema9GitConfigOverrides([
+        "--config-env=filter.marker.clean=ATTACKER",
+        "status",
+      ]);
+    }).toThrow("reject caller config overrides");
+  });
+
+  it("disables and rejects a command-bearing local fsmonitor", async () => {
+    const root = await mkdtemp(join(tmpdir(), "schema9-fsmonitor-"));
+    const repository = join(root, "repository");
+    const marker = join(root, "fsmonitor-ran");
+    const monitor = join(
+      root,
+      process.platform === "win32" ? "monitor.cmd" : "monitor.sh",
+    );
+    try {
+      await execFileAsync("git", ["init", repository], { windowsHide: true });
+      await git(repository, "config", "user.name", "tetizz");
+      await git(
+        repository,
+        "config",
+        "user.email",
+        "104690265+tetizz@users.noreply.github.com",
+      );
+      await writeFile(join(repository, "README.md"), "fixture\n", "utf8");
+      await git(repository, "add", "README.md");
+      await git(repository, "commit", "-m", "Fixture");
+      const monitorBody = process.platform === "win32"
+        ? `@echo off\r\n> "${marker}" echo invoked\r\nexit /b 0\r\n`
+        : `#!/bin/sh\nprintf invoked > '${marker}'\nexit 0\n`;
+      await writeFile(monitor, monitorBody, "utf8");
+      if (process.platform !== "win32") {
+        await chmod(monitor, 0o755);
+      }
+      await git(repository, "config", "core.fsmonitor", monitor);
+      const head = (await git(repository, "rev-parse", "HEAD")).stdout.trim();
+
+      await expect(
+        requireCleanCheckout(repository, head, "fixture checkout"),
+      ).rejects.toThrow("command-bearing core.fsmonitor");
+      await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a command-bearing clean filter before it can run", async () => {
+    const root = await mkdtemp(join(tmpdir(), "schema9-filter-"));
+    const repository = join(root, "repository");
+    const marker = join(root, "filter-ran");
+    const filter = join(
+      root,
+      process.platform === "win32" ? "filter.cmd" : "filter.sh",
+    );
+    try {
+      await execFileAsync("git", ["init", repository], { windowsHide: true });
+      await git(repository, "config", "user.name", "tetizz");
+      await git(
+        repository,
+        "config",
+        "user.email",
+        "104690265+tetizz@users.noreply.github.com",
+      );
+      await writeFile(join(repository, "README.md"), "fixture\n", "utf8");
+      await writeFile(
+        join(repository, ".gitattributes"),
+        "README.md filter=schema9-marker\n",
+        "utf8",
+      );
+      await git(repository, "add", "README.md", ".gitattributes");
+      await git(repository, "commit", "-m", "Fixture");
+      const filterBody = process.platform === "win32"
+        ? `@echo off\r\n> "${marker}" echo invoked\r\nmore\r\n`
+        : `#!/bin/sh\nprintf invoked > '${marker}'\ncat\n`;
+      await writeFile(filter, filterBody, "utf8");
+      if (process.platform !== "win32") {
+        await chmod(filter, 0o755);
+      }
+      const command = `"${filter.replaceAll("\\", "/")}"`;
+      await git(repository, "config", "filter.schema9-marker.clean", command);
+      const head = (await git(repository, "rev-parse", "HEAD")).stdout.trim();
+
+      await expect(
+        requireCleanCheckout(repository, head, "fixture checkout"),
+      ).rejects.toThrow("command-bearing Git filter");
+      await expect(access(marker)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await rm(root, { recursive: true, force: true });
     }

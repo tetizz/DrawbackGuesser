@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -18,9 +19,11 @@ from ml.evaluation.review_authorization import (
     REPRODUCTION_FORMAT,
     SIGNATURE_NAMESPACE,
     ReviewAuthorizationError,
+    _write_atomic_no_clobber,
     authorize_review,
     main,
 )
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable_exact
 
 
 def canonical(value: object) -> bytes:
@@ -32,6 +35,23 @@ def canonical(value: object) -> bytes:
 
 def validation_canonical(value: object) -> bytes:
     return (json.dumps(value, sort_keys=True, indent=2) + "\n").encode("utf-8")
+
+
+def authenticated_runtime_closure() -> dict[str, object]:
+    modules = [{"name": "builtins", "kind": "built-in", "files": []}]
+    encoded = json.dumps(
+        modules,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return {
+        "algorithm": "sha256-canonical-loaded-python-modules-v1",
+        "module_count": len(modules),
+        "file_count": 0,
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "modules": modules,
+    }
 
 
 def write(root: Path, name: str, payload: bytes) -> dict[str, str]:
@@ -211,10 +231,17 @@ def fixture(root: Path) -> tuple[Path, Path, list[tuple[str, Path]], dict[str, o
                     "pnpm_lock_sha256": pnpm["sha256"],
                     "python_requirements_sha256": requirements["sha256"],
                     "python_project_sha256": python_project["sha256"],
+                    "git_executable_path_sha256": "70" * 32,
+                    "git_executable_sha256": "71" * 32,
+                    "git_version": "git version fixture",
+                    "python_executable_path_sha256": "72" * 32,
                     "python_executable_sha256": hashlib.sha256(
                         Path(sys.executable).read_bytes()
                     ).hexdigest(),
                     "python_version": sys.version,
+                    "python_import_roots_sha256": "73" * 32,
+                    "python_distributions_sha256": "74" * 32,
+                    "python_runtime": authenticated_runtime_closure(),
                 },
                 "evaluator": {
                     "engine_binary_sha256": engine["sha256"],
@@ -314,6 +341,73 @@ def fixture(root: Path) -> tuple[Path, Path, list[tuple[str, Path]], dict[str, o
 
 
 class ReviewAuthorizationTests(unittest.TestCase):
+    def test_publication_retry_accepts_only_exact_committed_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            output = Path(raw) / "authorization.json"
+            payload = b'{"authorized":true}\n'
+
+            def fail_after_publication(
+                path: Path,
+                value: bytes,
+                *,
+                label: str,
+            ) -> None:
+                publish_bytes_durable_exact(path, value, label=label)
+                raise OSError("simulated post-publication failure")
+
+            with patch(
+                "ml.evaluation.review_authorization."
+                "publish_bytes_durable_exact",
+                side_effect=fail_after_publication,
+            ):
+                with self.assertRaisesRegex(OSError, "post-publication"):
+                    _write_atomic_no_clobber(output, payload)
+
+            _write_atomic_no_clobber(output, payload)
+            with self.assertRaisesRegex(ReviewAuthorizationError, "overwrite"):
+                _write_atomic_no_clobber(output, b"different\n")
+
+    def test_rejects_legacy_reproduction_environment_before_authorization(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            approval, allowed, _reviewers, value = fixture(root)
+            reproduction_path = root / "reproduction.json"
+            reproduction = json.loads(reproduction_path.read_text("utf-8"))
+            environment = reproduction["environment"]
+            for key in (
+                "git_executable_path_sha256",
+                "git_executable_sha256",
+                "git_version",
+                "python_executable_path_sha256",
+                "python_import_roots_sha256",
+                "python_distributions_sha256",
+                "python_runtime",
+            ):
+                del environment[key]
+            reproduction_payload = validation_canonical(reproduction)
+            reproduction_path.write_bytes(reproduction_payload)
+            value["reproduction_receipt"]["sha256"] = hashlib.sha256(
+                reproduction_payload
+            ).hexdigest()
+            approval.write_bytes(canonical(value))
+
+            with self.assertRaisesRegex(
+                ReviewAuthorizationError,
+                "reproduction environment fields are not exact",
+            ):
+                authorize_review(
+                    approval_path=approval,
+                    approval_sha256=hashlib.sha256(
+                        approval.read_bytes()
+                    ).hexdigest(),
+                    allowed_signers_path=allowed,
+                    allowed_signers_sha256=hashlib.sha256(
+                        allowed.read_bytes()
+                    ).hexdigest(),
+                    reviewers=(),
+                    output=root / "authorization.json",
+                )
+
     def test_rejects_authoritative_reproduction_dependency_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -415,6 +509,16 @@ class ReviewAuthorizationTests(unittest.TestCase):
                 reviewers=reviewers,
                 output=output,
             )
+            recovered = authorize_review(
+                approval_path=approval,
+                approval_sha256=approval_sha,
+                allowed_signers_path=allowed,
+                allowed_signers_sha256=allowed_sha,
+                reviewers=reviewers,
+                output=output,
+            )
+            self.assertEqual(recovered["format"], RECEIPT_FORMAT)
+            output.write_bytes(b"competitor\n")
             with self.assertRaisesRegex(ReviewAuthorizationError, "overwrite"):
                 authorize_review(
                     approval_path=approval,
@@ -545,6 +649,153 @@ class ReviewAuthorizationTests(unittest.TestCase):
             )
             self.assertEqual(result, 0)
             self.assertTrue((root / "authorization.json").is_file())
+
+    def test_forged_path_verifier_cannot_accept_corrupt_signatures(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            approval, allowed, reviewers, _value = fixture(root)
+            reviewers[0][1].write_bytes(b"corrupt-alice-signature\n")
+            reviewers[1][1].write_bytes(b"corrupt-bob-signature\n")
+            real_run = subprocess.run
+            authenticated_calls: list[tuple[object, dict[str, str]]] = []
+
+            def forged_path_runner(command, *args, **kwargs):
+                executable = str(command[0])
+                if not Path(executable).is_absolute():
+                    identity = str(command[command.index("-I") + 1])
+                    fingerprint = (
+                        "A" * 43 if identity == "alice" else "B" * 43
+                    )
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        (
+                            "Good signature for "
+                            f"{identity} with ED25519 key SHA256:{fingerprint}"
+                        ).encode("utf-8"),
+                        b"",
+                    )
+                environment = kwargs.get("env")
+                self.assertIsInstance(environment, dict)
+                authenticated_calls.append((command, dict(environment)))
+                return real_run(command, *args, **kwargs)
+
+            poison = root / "forged-tools"
+            poison.mkdir()
+            with patch.dict(
+                os.environ,
+                {
+                    "PATH": str(poison),
+                    "PYTHONPATH": str(poison),
+                    "GIT_DIR": str(poison),
+                    "SSH_AUTH_SOCK": str(poison / "agent.sock"),
+                },
+            ), patch(
+                "ml.evaluation.review_authorization.subprocess.run",
+                side_effect=forged_path_runner,
+            ):
+                with self.assertRaisesRegex(
+                    ReviewAuthorizationError,
+                    "verification failed",
+                ):
+                    authorize_review(
+                        approval_path=approval,
+                        approval_sha256=hashlib.sha256(
+                            approval.read_bytes()
+                        ).hexdigest(),
+                        allowed_signers_path=allowed,
+                        allowed_signers_sha256=hashlib.sha256(
+                            allowed.read_bytes()
+                        ).hexdigest(),
+                        reviewers=reviewers,
+                        output=root / "authorization.json",
+                    )
+
+            self.assertEqual(len(authenticated_calls), 1)
+            command, environment = authenticated_calls[0]
+            self.assertTrue(Path(str(command[0])).is_absolute())
+            self.assertNotEqual(environment["PATH"], str(poison))
+            for key in ("PYTHONPATH", "GIT_DIR", "SSH_AUTH_SOCK"):
+                self.assertNotIn(key, environment)
+            self.assertFalse((root / "authorization.json").exists())
+
+    def test_rejects_portable_aliases_before_authorization(self) -> None:
+        unsafe_names = (
+            "sealed-report.json.",
+            "sealed-report.json ",
+            "sealed-report.json:secret",
+            "NUL",
+            "con.json",
+            r"nested\sealed-report.json",
+            "nested/sealed-report.json",
+        )
+        for unsafe_name in unsafe_names:
+            with self.subTest(
+                unsafe_name=unsafe_name
+            ), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                approval, allowed, _reviewers, value = fixture(root)
+                value["test_plan"]["output_basenames"]["report"] = unsafe_name
+                approval.write_bytes(canonical(value))
+                with self.assertRaisesRegex(
+                    ReviewAuthorizationError,
+                    "safe basename",
+                ):
+                    authorize_review(
+                        approval_path=approval,
+                        approval_sha256=hashlib.sha256(
+                            approval.read_bytes()
+                        ).hexdigest(),
+                        allowed_signers_path=allowed,
+                        allowed_signers_sha256=hashlib.sha256(
+                            allowed.read_bytes()
+                        ).hexdigest(),
+                        reviewers=(),
+                        output=root / "authorization.json",
+                    )
+
+    def test_rejects_case_insensitive_plan_name_collisions(self) -> None:
+        for label, mutate, expected in (
+            (
+                "inputs",
+                lambda value: value["test_plan"]["inputs"]["dataset"].__setitem__(
+                    "file", "RELEASE.PUBLIC.JSON"
+                ),
+                "input basenames must be distinct",
+            ),
+            (
+                "outputs",
+                lambda value: value["test_plan"]["output_basenames"].__setitem__(
+                    "decision", "SEALED-REPORT.JSON"
+                ),
+                "output basenames must be distinct",
+            ),
+            (
+                "input-output",
+                lambda value: value["test_plan"]["output_basenames"].__setitem__(
+                    "report", "TEST.NDJSON"
+                ),
+                "input and output basenames must not overlap",
+            ),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                approval, allowed, _reviewers, value = fixture(root)
+                mutate(value)
+                approval.write_bytes(canonical(value))
+                with self.assertRaisesRegex(ReviewAuthorizationError, expected):
+                    authorize_review(
+                        approval_path=approval,
+                        approval_sha256=hashlib.sha256(
+                            approval.read_bytes()
+                        ).hexdigest(),
+                        allowed_signers_path=allowed,
+                        allowed_signers_sha256=hashlib.sha256(
+                            allowed.read_bytes()
+                        ).hexdigest(),
+                        reviewers=(),
+                        output=root / "authorization.json",
+                    )
 
     def test_rejects_parity_release_binding_mutations(self) -> None:
         for field, replacement in (

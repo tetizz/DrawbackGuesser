@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import {
   appendFile,
   mkdtemp,
+  readdir,
   readFile,
   rm,
   writeFile,
@@ -40,14 +41,20 @@ import {
   assembleSchema9CorpusLedger,
   assertSchema9CorpusLedgerByteLength,
   assertSchema9SplitsDisjoint,
+  createSchema9CorpusLedger,
+  publishOrAuthenticateSchema9CorpusLedgerArtifactAtomic,
   publishSchema9CorpusLedgerArtifactAtomic,
   schema9CorpusLedgerFileSha256,
+  SCHEMA9_CORPUS_LEDGER_VERSION,
   SCHEMA9_LEDGER_SPLITS,
   SCHEMA9_EXECUTION_MANIFEST_ALGORITHM,
   SCHEMA9_GENERATION_CONFIG,
   SCHEMA9_GENERATOR_COMPLETION_FORMAT,
   SCHEMA9_GENERATOR_LAUNCH_FORMAT,
   SCHEMA9_GENERATOR_RECEIPT_VERSION,
+  SCHEMA9_PRODUCER_RUNTIME_IDENTITY_FORMAT,
+  SCHEMA9_PRODUCER_RUNTIME_IDENTITY_VERSION,
+  SCHEMA9_PRODUCER_RUNTIME_MANIFEST_ALGORITHM,
   SCHEMA9_SCHEDULE_PROFILE,
   SCHEMA9_SEED_STREAMS,
   SCHEMA9_SPLIT_SEED_ROOTS,
@@ -58,6 +65,7 @@ import {
   type Schema9AssignmentScheduler,
   type Schema9ExecutionIdentity,
   type Schema9LedgerSplit,
+  type Schema9ProducerRuntimeIdentity,
   type Schema9RepositoryVerifier,
   type Schema9SplitFiles,
 } from "./schema9-corpus-ledger.js";
@@ -70,12 +78,17 @@ import {
 import {
   assertPathFreeJson,
   canonicalJsonBytes,
+  checkedGitCommit,
+  checkedSchema9ProducerRuntimeIdentity,
   checkedSchema9SeedRoots,
   checkedScheduleId,
+  checkedSha256,
   parseJsonWithoutDuplicateKeys,
 } from "./schema9-ledger-types.js";
 import {
   createSchema9LedgerVerificationReceipt,
+  publishOrAuthenticateSchema9LedgerVerificationReceipt,
+  SCHEMA9_LEDGER_VERIFICATION_RECEIPT_VERSION,
   writeSchema9LedgerVerificationReceiptAtomic,
 } from "./schema9-ledger-verification-receipt.js";
 
@@ -107,6 +120,75 @@ const EXECUTION_IDENTITY: Schema9ExecutionIdentity = Object.freeze({
     .update(canonicalJsonBytes(EXECUTION_PAYLOAD))
     .digest("hex"),
 });
+const PRODUCER_RUNTIME_PAYLOAD = Object.freeze({
+  format: SCHEMA9_PRODUCER_RUNTIME_IDENTITY_FORMAT,
+  version: SCHEMA9_PRODUCER_RUNTIME_IDENTITY_VERSION,
+  algorithm: SCHEMA9_PRODUCER_RUNTIME_MANIFEST_ALGORITHM,
+  runtime: Object.freeze({
+    nodeVersion: "v24.0.0",
+    platform: "win32",
+    architecture: "x64",
+    execArgv: Object.freeze([] as const),
+  }),
+  coordinator: Object.freeze({
+    componentId: "schema9-coordinator/v1" as const,
+    files: 11,
+    bytes: 12_345,
+    sha256: "6".repeat(64),
+  }),
+  parallelWorker: Object.freeze({
+    componentId: "player-private-parallel-worker/v1" as const,
+    files: 7,
+    bytes: 8_765,
+    sha256: "7".repeat(64),
+  }),
+});
+const PRODUCER_RUNTIME_IDENTITY: Schema9ProducerRuntimeIdentity =
+  Object.freeze({
+    ...PRODUCER_RUNTIME_PAYLOAD,
+    aggregateSha256: createHash("sha256")
+      .update(canonicalJsonBytes(PRODUCER_RUNTIME_PAYLOAD))
+      .digest("hex"),
+  });
+const ALTERNATE_PRODUCER_RUNTIME_PAYLOAD = Object.freeze({
+  ...PRODUCER_RUNTIME_PAYLOAD,
+  parallelWorker: Object.freeze({
+    ...PRODUCER_RUNTIME_PAYLOAD.parallelWorker,
+    sha256: "9".repeat(64),
+  }),
+});
+const ALTERNATE_PRODUCER_RUNTIME_IDENTITY: Schema9ProducerRuntimeIdentity =
+  Object.freeze({
+    ...ALTERNATE_PRODUCER_RUNTIME_PAYLOAD,
+    aggregateSha256: createHash("sha256")
+      .update(canonicalJsonBytes(ALTERNATE_PRODUCER_RUNTIME_PAYLOAD))
+      .digest("hex"),
+  });
+const PRODUCER_RUNTIME_GOLDEN_PAYLOAD = Object.freeze({
+  format: SCHEMA9_PRODUCER_RUNTIME_IDENTITY_FORMAT,
+  version: SCHEMA9_PRODUCER_RUNTIME_IDENTITY_VERSION,
+  algorithm: SCHEMA9_PRODUCER_RUNTIME_MANIFEST_ALGORITHM,
+  runtime: Object.freeze({
+    nodeVersion: "v22.17.0",
+    platform: "win32",
+    architecture: "x64",
+    execArgv: Object.freeze([] as const),
+  }),
+  coordinator: Object.freeze({
+    componentId: "schema9-coordinator/v1" as const,
+    files: 17,
+    bytes: 1_234,
+    sha256: "1".repeat(64),
+  }),
+  parallelWorker: Object.freeze({
+    componentId: "player-private-parallel-worker/v1" as const,
+    files: 13,
+    bytes: 987,
+    sha256: "2".repeat(64),
+  }),
+});
+const PRODUCER_RUNTIME_GOLDEN_SHA256 =
+  "8ae516a9c7dd38ec645f79036806fceb9f75e9e4860426d53b83befee5a0347d";
 const cleanupDirectories: string[] = [];
 const execFileAsync = promisify(execFile);
 
@@ -289,6 +371,8 @@ function repositoryVerifier(
     pinnedEngineCommitAt: () => Promise.resolve(CONVERTER_ENGINE_COMMIT),
     isEngineAncestor: () => Promise.resolve(ancestorAccepted),
     executingCodeIdentity: () => Promise.resolve(EXECUTION_IDENTITY),
+    producerRuntimeIdentityAt: () =>
+      Promise.resolve(PRODUCER_RUNTIME_IDENTITY),
   });
 }
 
@@ -370,6 +454,7 @@ async function splitFixture(): Promise<{
     scheduleProfile: SCHEMA9_SCHEDULE_PROFILE,
     generationConfig: SCHEMA9_GENERATION_CONFIG,
     producerEngineCommit: CONVERTER_ENGINE_COMMIT,
+    producerRuntimeIdentity: PRODUCER_RUNTIME_IDENTITY,
   })}\n`, "utf8");
   await writeFile(launchReceiptPath, launchPayload);
   await writeFile(
@@ -381,6 +466,7 @@ async function splitFixture(): Promise<{
       ledgerSplit: "train",
       state: "completed",
       producerEngineCommit: CONVERTER_ENGINE_COMMIT,
+      producerRuntimeIdentity: PRODUCER_RUNTIME_IDENTITY,
       launchReceiptSha256: createHash("sha256")
         .update(launchPayload)
         .digest("hex"),
@@ -428,6 +514,15 @@ function generationConfigOf(
   );
 }
 
+function producerRuntimeIdentityOf(
+  receipt: Record<string, unknown>,
+): Record<string, unknown> {
+  return mutableFixtureObject(
+    receipt["producerRuntimeIdentity"],
+    "producerRuntimeIdentity",
+  );
+}
+
 function setFixturePath(
   root: Record<string, unknown>,
   path: readonly string[],
@@ -463,6 +558,22 @@ async function mutateLaunchReceipt(
   );
 }
 
+async function mutateCompletionReceipt(
+  files: Schema9SplitFiles,
+  mutate: (receipt: Record<string, unknown>) => void,
+): Promise<void> {
+  const receipt = mutableFixtureObject(
+    JSON.parse(await readFile(files.completionReceiptPath, "utf8")) as unknown,
+    "completion receipt",
+  );
+  mutate(receipt);
+  await writeFile(
+    files.completionReceiptPath,
+    `${JSON.stringify(receipt)}\n`,
+    "utf8",
+  );
+}
+
 async function mutateSourceTrace(
   files: Schema9SplitFiles,
   mutate: (trace: Record<string, unknown>) => void,
@@ -477,10 +588,10 @@ async function mutateSourceTrace(
 
 const GENERATION_CONFIG_FIELD_MUTATIONS = Object.freeze([
   {
-    name: "legacy receipt version",
+    name: "legacy version-2 receipt",
     expectedError: "launch receipt identity is inconsistent",
     mutate: (receipt) => {
-      receipt["version"] = 1;
+      receipt["version"] = 2;
     },
   },
   {
@@ -566,6 +677,142 @@ const GENERATION_CONFIG_FIELD_MUTATIONS = Object.freeze([
   },
 ] satisfies readonly ReceiptMutationCase[]);
 
+const PRODUCER_RUNTIME_IDENTITY_MUTATIONS = Object.freeze([
+  {
+    name: "missing identity",
+    mutate: (receipt: Record<string, unknown>) => {
+      delete receipt["producerRuntimeIdentity"];
+    },
+  },
+  {
+    name: "unknown identity field",
+    mutate: (receipt: Record<string, unknown>) => {
+      producerRuntimeIdentityOf(receipt)["unexpected"] = true;
+    },
+  },
+  {
+    name: "wrong format",
+    mutate: (receipt: Record<string, unknown>) => {
+      producerRuntimeIdentityOf(receipt)["format"] = "alternate-runtime";
+    },
+  },
+  {
+    name: "wrong version",
+    mutate: (receipt: Record<string, unknown>) => {
+      producerRuntimeIdentityOf(receipt)["version"] = 2;
+    },
+  },
+  {
+    name: "wrong algorithm",
+    mutate: (receipt: Record<string, unknown>) => {
+      producerRuntimeIdentityOf(receipt)["algorithm"] = "sha256-source-tree-v1";
+    },
+  },
+  {
+    name: "runtime field missing",
+    mutate: (receipt: Record<string, unknown>) => {
+      delete mutableFixtureObject(
+        producerRuntimeIdentityOf(receipt)["runtime"],
+        "runtime",
+      )["architecture"];
+    },
+  },
+  {
+    name: "runtime field added",
+    mutate: (receipt: Record<string, unknown>) => {
+      mutableFixtureObject(
+        producerRuntimeIdentityOf(receipt)["runtime"],
+        "runtime",
+      )["hook"] = "enabled";
+    },
+  },
+  {
+    name: "runtime flags active",
+    mutate: (receipt: Record<string, unknown>) => {
+      mutableFixtureObject(
+        producerRuntimeIdentityOf(receipt)["runtime"],
+        "runtime",
+      )["execArgv"] = ["--inspect"];
+    },
+  },
+  ...(["coordinator", "parallelWorker"] as const).flatMap((component) => [
+    {
+      name: `${component} field missing`,
+      mutate: (receipt: Record<string, unknown>) => {
+        delete mutableFixtureObject(
+          producerRuntimeIdentityOf(receipt)[component],
+          component,
+        )["sha256"];
+      },
+    },
+    {
+      name: `${component} field added`,
+      mutate: (receipt: Record<string, unknown>) => {
+        mutableFixtureObject(
+          producerRuntimeIdentityOf(receipt)[component],
+          component,
+        )["path"] = "module.js";
+      },
+    },
+    {
+      name: `${component} id changed`,
+      mutate: (receipt: Record<string, unknown>) => {
+        mutableFixtureObject(
+          producerRuntimeIdentityOf(receipt)[component],
+          component,
+        )["componentId"] = "alternate-component/v1";
+      },
+    },
+    {
+      name: `${component} files zero`,
+      mutate: (receipt: Record<string, unknown>) => {
+        mutableFixtureObject(
+          producerRuntimeIdentityOf(receipt)[component],
+          component,
+        )["files"] = 0;
+      },
+    },
+    {
+      name: `${component} bytes zero`,
+      mutate: (receipt: Record<string, unknown>) => {
+        mutableFixtureObject(
+          producerRuntimeIdentityOf(receipt)[component],
+          component,
+        )["bytes"] = 0;
+      },
+    },
+    {
+      name: `${component} digest changed`,
+      mutate: (receipt: Record<string, unknown>) => {
+        mutableFixtureObject(
+          producerRuntimeIdentityOf(receipt)[component],
+          component,
+        )["sha256"] = "0".repeat(64);
+      },
+    },
+  ]),
+  {
+    name: "aggregate changed",
+    mutate: (receipt: Record<string, unknown>) => {
+      producerRuntimeIdentityOf(receipt)["aggregateSha256"] = "0".repeat(64);
+    },
+  },
+]);
+
+const COMPLETION_DIGEST_TYPE_MUTATIONS = Object.freeze(
+  ([
+    ["array", ["a".repeat(64)]],
+    ["object", { digest: "a".repeat(64) }],
+    ["number", 123],
+  ] as const).flatMap(([valueType, replacement]) =>
+    (["launchReceiptSha256", "output.sha256"] as const).map((field) => ({
+      name: `${field} ${valueType}`,
+      field,
+      replacement,
+    }))
+  ),
+);
+
 function fixtureScheduler(trace: FixtureTrace): Schema9AssignmentScheduler {
   return Object.freeze({
     assignments: () => Object.freeze([Object.freeze({
@@ -623,6 +870,7 @@ function fakeAuthenticatedSplit(
       scheduleId: `schema9-${split}`,
       seedRoots: SCHEMA9_SPLIT_SEED_ROOTS[split],
       producerEngineCommit: CONVERTER_ENGINE_COMMIT,
+      producerRuntimeIdentity: PRODUCER_RUNTIME_IDENTITY,
       generatorReceipts: Object.freeze({
         launch: Object.freeze({ sha256: "d".repeat(64), bytes: 10 }),
         completion: Object.freeze({ sha256: "e".repeat(64), bytes: 11 }),
@@ -696,6 +944,7 @@ function pythonCompatibleAuthenticatedSplit(
       scheduleId: `schema9-${split}`,
       seedRoots: SCHEMA9_SPLIT_SEED_ROOTS[split],
       producerEngineCommit: CONVERTER_ENGINE_COMMIT,
+      producerRuntimeIdentity: PRODUCER_RUNTIME_IDENTITY,
       generatorReceipts: Object.freeze({
         launch: Object.freeze({ sha256: "d".repeat(64), bytes: 100 }),
         completion: Object.freeze({ sha256: "e".repeat(64), bytes: 120 }),
@@ -761,8 +1010,10 @@ function metadataOptions(
 }
 
 describe("schema-9 corpus ledger", () => {
-  it("freezes the public generator receipt v2 configuration", () => {
-    expect(SCHEMA9_GENERATOR_RECEIPT_VERSION).toBe(2);
+  it("freezes the public generator receipt v3 configuration", () => {
+    expect(SCHEMA9_CORPUS_LEDGER_VERSION).toBe(3);
+    expect(SCHEMA9_GENERATOR_RECEIPT_VERSION).toBe(3);
+    expect(SCHEMA9_LEDGER_VERIFICATION_RECEIPT_VERSION).toBe(2);
     expect(SCHEMA9_GENERATION_CONFIG).toStrictEqual({
       maxPlies: 120,
       maxDepth: 2,
@@ -816,6 +1067,84 @@ describe("schema-9 corpus ledger", () => {
     },
   );
 
+  it.each(PRODUCER_RUNTIME_IDENTITY_MUTATIONS)(
+    "rejects launch producer runtime identity drift: $name",
+    async ({ mutate }) => {
+      const fixture = await splitFixture();
+      await mutateLaunchReceipt(fixture.files, mutate);
+      await expect(authenticateSchema9SplitWithRuleContract(
+        "train",
+        fixture.files,
+        ["vegan"],
+        fixtureScheduler(fixture.trace),
+      )).rejects.toThrow();
+    },
+  );
+
+  it.each(PRODUCER_RUNTIME_IDENTITY_MUTATIONS)(
+    "rejects completion producer runtime identity drift: $name",
+    async ({ mutate }) => {
+      const fixture = await splitFixture();
+      await mutateCompletionReceipt(fixture.files, mutate);
+      await expect(authenticateSchema9SplitWithRuleContract(
+        "train",
+        fixture.files,
+        ["vegan"],
+        fixtureScheduler(fixture.trace),
+      )).rejects.toThrow();
+    },
+  );
+
+  it("rejects a well-formed completion runtime that differs from launch", async () => {
+    const fixture = await splitFixture();
+    await mutateCompletionReceipt(fixture.files, (completion) => {
+      completion["producerRuntimeIdentity"] =
+        ALTERNATE_PRODUCER_RUNTIME_IDENTITY;
+    });
+    await expect(authenticateSchema9SplitWithRuleContract(
+      "train",
+      fixture.files,
+      ["vegan"],
+      fixtureScheduler(fixture.trace),
+    )).rejects.toThrow("completion producer runtime identity is inconsistent");
+  });
+
+  it.each(COMPLETION_DIGEST_TYPE_MUTATIONS)(
+    "rejects non-string completion digest: $name",
+    async ({ field, replacement }) => {
+      const fixture = await splitFixture();
+      await mutateCompletionReceipt(fixture.files, (completion) => {
+        if (field === "launchReceiptSha256") {
+          completion[field] = replacement;
+          return;
+        }
+        mutableFixtureObject(completion["output"], "completion output")[
+          "sha256"
+        ] = replacement;
+      });
+      await expect(authenticateSchema9SplitWithRuleContract(
+        "train",
+        fixture.files,
+        ["vegan"],
+        fixtureScheduler(fixture.trace),
+      )).rejects.toThrow("must be a lowercase SHA-256");
+    },
+  );
+
+  it("matches the Engine producer-runtime golden aggregate", () => {
+    expect(createHash("sha256")
+      .update(canonicalJsonBytes(PRODUCER_RUNTIME_GOLDEN_PAYLOAD))
+      .digest("hex"))
+      .toBe(PRODUCER_RUNTIME_GOLDEN_SHA256);
+    expect(checkedSchema9ProducerRuntimeIdentity({
+      ...PRODUCER_RUNTIME_GOLDEN_PAYLOAD,
+      aggregateSha256: PRODUCER_RUNTIME_GOLDEN_SHA256,
+    })).toEqual({
+      ...PRODUCER_RUNTIME_GOLDEN_PAYLOAD,
+      aggregateSha256: PRODUCER_RUNTIME_GOLDEN_SHA256,
+    });
+  });
+
   it.each(SOURCE_TRACE_CONFIG_MUTATIONS)(
     "rejects realized source config mutation: $name",
     async ({ path, replacement }) => {
@@ -834,7 +1163,7 @@ describe("schema-9 corpus ledger", () => {
     },
   );
 
-  it("rejects a version-1 completion receipt", async () => {
+  it("rejects a version-2 completion receipt", async () => {
     const fixture = await splitFixture();
     const completion = mutableFixtureObject(
       JSON.parse(
@@ -842,7 +1171,7 @@ describe("schema-9 corpus ledger", () => {
       ) as unknown,
       "completion receipt",
     );
-    completion["version"] = 1;
+    completion["version"] = 2;
     await writeFile(
       fixture.files.completionReceiptPath,
       `${JSON.stringify(completion)}\n`,
@@ -919,6 +1248,7 @@ describe("schema-9 corpus ledger", () => {
         guesserCommit: GUESSER_COMMIT,
         converterEngineCommit: CONVERTER_ENGINE_COMMIT,
         execution: EXECUTION_IDENTITY,
+        producerRuntimeIdentity: PRODUCER_RUNTIME_IDENTITY,
       },
       "exact/v1",
       canonicalAuthenticatedSplits(),
@@ -962,6 +1292,14 @@ describe("schema-9 corpus ledger", () => {
     await expect(
       publishSchema9CorpusLedgerArtifactAtomic(output, artifact),
     ).rejects.toThrow("already exists");
+    const recovered = await publishOrAuthenticateSchema9CorpusLedgerArtifactAtomic(
+      output,
+      artifact,
+    );
+    expect(recovered).toMatchObject({
+      created: false,
+      sha256: written.sha256,
+    });
     expect(await readFile(output)).toEqual(bytes);
     expect(() =>
       verifySchema9CorpusLedgerReconstruction(
@@ -969,6 +1307,174 @@ describe("schema-9 corpus ledger", () => {
         artifact,
       )
     ).toThrow("not canonical");
+  });
+
+  it("recovers an exact ledger and receipt pair but rejects mismatches", async () => {
+    const artifact = assembleSchema9CorpusLedger(
+      {
+        guesserCommit: GUESSER_COMMIT,
+        converterEngineCommit: CONVERTER_ENGINE_COMMIT,
+        execution: EXECUTION_IDENTITY,
+        producerRuntimeIdentity: PRODUCER_RUNTIME_IDENTITY,
+      },
+      "exact/v1",
+      canonicalAuthenticatedSplits(),
+    );
+    const root = await mkdtemp(join(tmpdir(), "schema9-pair-recovery-"));
+    cleanupDirectories.push(root);
+    const ledgerPath = join(root, "ledger.json");
+    const ledger = await publishOrAuthenticateSchema9CorpusLedgerArtifactAtomic(
+      ledgerPath,
+      artifact,
+    );
+    expect(ledger.created).toBe(true);
+    const receipt = createSchema9LedgerVerificationReceipt(
+      artifact,
+      ledger.sha256,
+    );
+    const receiptPath = join(root, "receipt.json");
+    const firstReceipt = await publishOrAuthenticateSchema9LedgerVerificationReceipt(
+      receiptPath,
+      receipt,
+    );
+    expect(firstReceipt.created).toBe(true);
+    await expect(
+      publishOrAuthenticateSchema9CorpusLedgerArtifactAtomic(
+        ledgerPath,
+        artifact,
+      ),
+    ).resolves.toMatchObject({ created: false, sha256: ledger.sha256 });
+    await expect(
+      publishOrAuthenticateSchema9LedgerVerificationReceipt(
+        receiptPath,
+        receipt,
+      ),
+    ).resolves.toMatchObject({
+      created: false,
+      sha256: firstReceipt.sha256,
+    });
+
+    await writeFile(join(root, "mismatch.json"), "{}", "utf8");
+    await expect(
+      publishOrAuthenticateSchema9CorpusLedgerArtifactAtomic(
+        join(root, "mismatch.json"),
+        artifact,
+      ),
+    ).rejects.toThrow("inconsistent");
+    expect(await readFile(join(root, "mismatch.json"), "utf8")).toBe("{}");
+  });
+
+  it("stops corpus authentication after delayed in-process cancellation", async () => {
+    const controller = new AbortController();
+    const cancellation = new Error("fixture corpus cancellation");
+    const options = metadataOptions(CONVERTER_ENGINE_COMMIT, "exact/v1");
+    const verifier: Schema9RepositoryVerifier = Object.freeze({
+      ...options.repositoryVerifier,
+      pinnedEngineCommitAt: async () => {
+        await new Promise<void>((resolveDelay) => {
+          setTimeout(resolveDelay, 0);
+        });
+        controller.abort(cancellation);
+        return CONVERTER_ENGINE_COMMIT;
+      },
+    });
+
+    await expect(createSchema9CorpusLedger({
+      ...options,
+      repositoryVerifier: verifier,
+      signal: controller.signal,
+    })).rejects.toBe(cancellation);
+  });
+
+  it("does not publish a ledger after delayed in-process cancellation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "schema9-ledger-cancel-"));
+    cleanupDirectories.push(root);
+    const output = join(root, "ledger.json");
+    const artifact = assembleSchema9CorpusLedger(
+      {
+        guesserCommit: GUESSER_COMMIT,
+        converterEngineCommit: CONVERTER_ENGINE_COMMIT,
+        execution: EXECUTION_IDENTITY,
+        producerRuntimeIdentity: PRODUCER_RUNTIME_IDENTITY,
+      },
+      "exact/v1",
+      canonicalAuthenticatedSplits(),
+    );
+    const controller = new AbortController();
+    const cancellation = new Error("fixture ledger publication cancellation");
+    const publication = publishSchema9CorpusLedgerArtifactAtomic(
+      output,
+      artifact,
+      controller.signal,
+    );
+    queueMicrotask(() => {
+      controller.abort(cancellation);
+    });
+
+    await expect(publication).rejects.toBe(cancellation);
+    await expect(readFile(output)).rejects.toThrow();
+    expect((await readdir(root)).filter((entry) => entry.includes(".tmp-")))
+      .toEqual([]);
+  });
+
+  it("does not publish a verification receipt after delayed cancellation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "schema9-receipt-cancel-"));
+    cleanupDirectories.push(root);
+    const output = join(root, "verification.json");
+    const artifact = assembleSchema9CorpusLedger(
+      {
+        guesserCommit: GUESSER_COMMIT,
+        converterEngineCommit: CONVERTER_ENGINE_COMMIT,
+        execution: EXECUTION_IDENTITY,
+        producerRuntimeIdentity: PRODUCER_RUNTIME_IDENTITY,
+      },
+      "exact/v1",
+      canonicalAuthenticatedSplits(),
+    );
+    const receipt = createSchema9LedgerVerificationReceipt(
+      artifact,
+      "9".repeat(64),
+    );
+    const controller = new AbortController();
+    const cancellation = new Error("fixture receipt publication cancellation");
+    const publication = writeSchema9LedgerVerificationReceiptAtomic(
+      output,
+      receipt,
+      controller.signal,
+    );
+    queueMicrotask(() => {
+      controller.abort(cancellation);
+    });
+
+    await expect(publication).rejects.toBe(cancellation);
+    await expect(readFile(output)).rejects.toThrow();
+    expect((await readdir(root)).filter((entry) => entry.includes(".tmp-")))
+      .toEqual([]);
+  });
+
+  it("rejects any split runtime that differs from the reproduced producer", () => {
+    const splits = [...canonicalAuthenticatedSplits()];
+    const first = splits[0];
+    if (first === undefined) {
+      throw new Error("Canonical split fixture is empty.");
+    }
+    splits[0] = Object.freeze({
+      ...first,
+      ledger: Object.freeze({
+        ...first.ledger,
+        producerRuntimeIdentity: ALTERNATE_PRODUCER_RUNTIME_IDENTITY,
+      }),
+    });
+    expect(() => assembleSchema9CorpusLedger(
+      {
+        guesserCommit: GUESSER_COMMIT,
+        converterEngineCommit: CONVERTER_ENGINE_COMMIT,
+        execution: EXECUTION_IDENTITY,
+        producerRuntimeIdentity: PRODUCER_RUNTIME_IDENTITY,
+      },
+      "exact/v1",
+      splits,
+    )).toThrow("does not match the reproduced producer build");
   });
 
   it("rejects cross-split game IDs and every seed-stream overlap", () => {
@@ -1040,6 +1546,7 @@ describe("schema-9 corpus ledger", () => {
       guesserCommit: GUESSER_COMMIT,
       converterEngineCommit: CONVERTER_ENGINE_COMMIT,
       execution: EXECUTION_IDENTITY,
+      producerRuntimeIdentity: PRODUCER_RUNTIME_IDENTITY,
     });
     await expect(
       verifySchema9RepositoryIdentity(
@@ -1050,9 +1557,42 @@ describe("schema-9 corpus ledger", () => {
         ),
       ),
     ).rejects.toThrow("unrelated producer commit");
+
+    const mixed = metadataOptions(
+      CONVERTER_ENGINE_COMMIT,
+      "converter-ancestor/v1",
+    );
+    const mixedSplits = {
+      ...mixed.splits,
+      test: Object.freeze({
+        ...mixed.splits.test,
+        producerEngineCommit: DESCENDANT_ENGINE_COMMIT,
+      }),
+    };
+    await expect(verifySchema9RepositoryIdentity(Object.freeze({
+      ...mixed,
+      splits: mixedSplits,
+      repositoryVerifier: Object.freeze({
+        ...mixed.repositoryVerifier,
+        producerRuntimeIdentityAt: (engineCommit: string) =>
+          Promise.resolve(
+            engineCommit === DESCENDANT_ENGINE_COMMIT
+              ? ALTERNATE_PRODUCER_RUNTIME_IDENTITY
+              : PRODUCER_RUNTIME_IDENTITY,
+          ),
+      }),
+    }))).rejects.toThrow(
+      "splits do not reproduce one exact producer runtime identity",
+    );
   });
 
   it("rejects paths, user tokens, duplicate keys, and zero-ply drift", () => {
+    expect(() => checkedSha256(["a".repeat(64)], "digest"))
+      .toThrow("must be a lowercase SHA-256");
+    expect(() => checkedGitCommit([GUESSER_COMMIT], "commit"))
+      .toThrow("must be a full lowercase Git commit");
+    expect(() => checkedScheduleId(["schema9-fixture"], "schedule"))
+      .toThrow("must be a canonical path-free schedule identifier");
     expect(() =>
       checkedSchema9SeedRoots(
         SCHEMA9_SPLIT_SEED_ROOTS["validation-b"],
@@ -1206,6 +1746,7 @@ describe("schema-9 corpus ledger", () => {
         guesserCommit: GUESSER_COMMIT,
         converterEngineCommit: CONVERTER_ENGINE_COMMIT,
         execution: EXECUTION_IDENTITY,
+        producerRuntimeIdentity: PRODUCER_RUNTIME_IDENTITY,
       },
       "exact/v1",
       canonicalAuthenticatedSplits(),
@@ -1225,6 +1766,7 @@ describe("schema-9 corpus ledger", () => {
         guesserCommit: GUESSER_COMMIT,
         converterEngineCommit: CONVERTER_ENGINE_COMMIT,
         execution: EXECUTION_IDENTITY,
+        producerRuntimeIdentity: PRODUCER_RUNTIME_IDENTITY,
       },
       "exact/v1",
       SCHEMA9_LEDGER_SPLITS.map(pythonCompatibleAuthenticatedSplit),

@@ -1,15 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
-import type { BigIntStats } from "node:fs";
-import {
-  link,
-  lstat,
-  open,
-  readFile,
-  realpath,
-  rm,
-  stat,
-} from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { createHash } from "node:crypto";
 import { TextDecoder } from "node:util";
 import {
   CAPTURABLE_HYPOTHESIS_RULE_IDS,
@@ -20,17 +9,27 @@ import {
   CAPTURABLE_SYMBOLIC_FEATURE_VERSION,
 } from "./player-private-converter.js";
 import {
-  assertDistinctExplicitFiles,
   assertExactSchema9LabelBalance,
   assertScheduledConversionAccounting,
-  authenticateSchema9Split,
+  authenticateSchema9SplitWithOwnedInputs,
   digestPartitionAssignments,
   type AuthenticatedSchema9Split,
 } from "./schema9-ledger-authentication.js";
 import {
+  readSchema9StableFileBytes,
+  withSchema9OwnedStableFiles,
+} from "./schema9-stable-file.js";
+import { runSchema9LinkedTaskGroup } from "./schema9-task-group.js";
+import {
+  publishSchema9BytesAtomicNoClobber,
+  schema9PublicationDestination,
+} from "./schema9-atomic-publication.js";
+import type { Schema9StableFileIdentity } from "./schema9-stable-file.js";
+import {
   assertPathFreeJson,
   canonicalJsonBytes,
   checkedGitCommit,
+  checkedSchema9ProducerRuntimeIdentity,
   checkedSchema9SeedRoots,
   checkedScheduleId,
   checkedSha256,
@@ -42,10 +41,12 @@ import {
   SCHEMA9_PRODUCER_CONVERTER_POLICIES,
   SCHEMA9_SEED_STREAMS,
   SCHEMA9_SCHEDULE_PROFILE,
+  throwIfSchema9Aborted,
   type Schema9CorpusLedger,
   type Schema9CorpusLedgerOptions,
   type Schema9LedgerSplit,
   type Schema9ExecutionIdentity,
+  type Schema9ProducerRuntimeIdentity,
 } from "./schema9-ledger-types.js";
 
 export type {
@@ -57,6 +58,9 @@ export type {
   Schema9GenerationConfig,
   Schema9LedgerSplit,
   Schema9ProducerConverterPolicy,
+  Schema9ProducerRuntimeIdentity,
+  Schema9ProducerRuntimeComponentIdentity,
+  Schema9ProducerRuntimeDescriptor,
   Schema9RepositoryVerifier,
   Schema9SeedRoots,
   Schema9SplitFiles,
@@ -71,6 +75,9 @@ export {
   SCHEMA9_GENERATOR_RECEIPT_VERSION,
   SCHEMA9_LEDGER_SPLITS,
   SCHEMA9_PRODUCER_CONVERTER_POLICIES,
+  SCHEMA9_PRODUCER_RUNTIME_IDENTITY_FORMAT,
+  SCHEMA9_PRODUCER_RUNTIME_IDENTITY_VERSION,
+  SCHEMA9_PRODUCER_RUNTIME_MANIFEST_ALGORITHM,
   SCHEMA9_SEED_STREAMS,
   SCHEMA9_SCHEDULE_PROFILE,
   SCHEMA9_SPLIT_SEED_ROOTS,
@@ -83,6 +90,7 @@ export interface WrittenSchema9CorpusLedger {
   readonly artifact: Schema9CorpusLedger;
   readonly bytes: number;
   readonly sha256: string;
+  readonly publicationIdentity: Schema9StableFileIdentity;
 }
 
 function exactSplitRecord(
@@ -101,16 +109,36 @@ function exactSplitRecord(
   }
 }
 
-function inputPaths(options: Schema9CorpusLedgerOptions): readonly string[] {
+function inputStableFileRequests(options: Schema9CorpusLedgerOptions) {
   return SCHEMA9_LEDGER_SPLITS.flatMap((split) => {
     const files = options.splits[split];
     return [
-      files.tracePath,
-      files.convertedPath,
-      files.launchReceiptPath,
-      files.completionReceiptPath,
+      Object.freeze({ path: files.tracePath, label: `${split} trace` }),
+      Object.freeze({
+        path: files.convertedPath,
+        label: `${split} converted dataset`,
+      }),
+      Object.freeze({
+        path: files.launchReceiptPath,
+        label: `${split} launch receipt`,
+      }),
+      Object.freeze({
+        path: files.completionReceiptPath,
+        label: `${split} completion receipt`,
+      }),
     ];
   });
+}
+
+export interface ReauthenticatedSchema9CorpusLedger {
+  readonly artifact: Schema9CorpusLedger;
+  readonly bytes: Buffer;
+  readonly sha256: string;
+}
+
+export interface PublishedOrAuthenticatedSchema9CorpusLedger
+  extends WrittenSchema9CorpusLedger {
+  readonly created: boolean;
 }
 
 export async function verifySchema9RepositoryIdentity(
@@ -119,7 +147,10 @@ export async function verifySchema9RepositoryIdentity(
   readonly guesserCommit: string;
   readonly converterEngineCommit: string;
   readonly execution: Schema9ExecutionIdentity;
+  readonly producerRuntimeIdentity: Schema9ProducerRuntimeIdentity;
 }> {
+  const { signal } = options;
+  throwIfSchema9Aborted(signal, "Schema-9 repository verification");
   const guesserCommit = checkedGitCommit(
     options.guesserCommit,
     "guesserCommit",
@@ -136,9 +167,13 @@ export async function verifySchema9RepositoryIdentity(
     throw new TypeError("Producer/converter policy is unsupported.");
   }
   const pinned = checkedGitCommit(
-    await options.repositoryVerifier.pinnedEngineCommitAt(guesserCommit),
+    await options.repositoryVerifier.pinnedEngineCommitAt(
+      guesserCommit,
+      signal,
+    ),
     "pinned Engine submodule commit",
   );
+  throwIfSchema9Aborted(signal, "Schema-9 repository verification");
   if (pinned !== converterEngineCommit) {
     throw new TypeError(
       "Guesser commit does not pin the declared converter Engine commit.",
@@ -164,18 +199,52 @@ export async function verifySchema9RepositoryIdentity(
         !(await options.repositoryVerifier.isEngineAncestor(
           converterEngineCommit,
           producer,
+          signal,
         ))
       ) {
         throw new TypeError(
           "Converter-ancestor policy rejects an unrelated producer commit.",
         );
       }
+      throwIfSchema9Aborted(signal, "Schema-9 repository verification");
     }
   }
   const execution = checkedExecutionIdentity(
-    await options.repositoryVerifier.executingCodeIdentity(),
+    await options.repositoryVerifier.executingCodeIdentity(signal),
   );
-  return Object.freeze({ guesserCommit, converterEngineCommit, execution });
+  throwIfSchema9Aborted(signal, "Schema-9 repository verification");
+  const reproducedProducerRuntimeIdentities = await runSchema9LinkedTaskGroup(
+    [...producers].sort().map((producerEngineCommit) => async (taskSignal) =>
+      checkedSchema9ProducerRuntimeIdentity(
+        await options.repositoryVerifier.producerRuntimeIdentityAt(
+          producerEngineCommit,
+          taskSignal,
+        ),
+        `reproduced producer runtime at ${producerEngineCommit}`,
+      )),
+    signal,
+    "Schema-9 producer runtime reproduction",
+  );
+  throwIfSchema9Aborted(signal, "Schema-9 producer runtime reproduction");
+  const producerRuntimeIdentity = reproducedProducerRuntimeIdentities[0];
+  if (producerRuntimeIdentity === undefined) {
+    throw new TypeError("Schema-9 corpus has no producer runtime identity.");
+  }
+  if (reproducedProducerRuntimeIdentities.some((identity) =>
+    !canonicalJsonBytes(identity).equals(
+      canonicalJsonBytes(producerRuntimeIdentity),
+    )
+  )) {
+    throw new TypeError(
+      "Schema-9 splits do not reproduce one exact producer runtime identity.",
+    );
+  }
+  return Object.freeze({
+    guesserCommit,
+    converterEngineCommit,
+    execution,
+    producerRuntimeIdentity,
+  });
 }
 
 function checkedExecutionIdentity(
@@ -367,6 +436,10 @@ function assertSplitLedgerIdentity(
     ledger.producerEngineCommit,
     `${ledger.split} producerEngineCommit`,
   );
+  checkedSchema9ProducerRuntimeIdentity(
+    ledger.producerRuntimeIdentity,
+    `${ledger.split} producerRuntimeIdentity`,
+  );
   assertExactValues(
     ledger.sourceTrace.gameIds,
     authenticated.gameIds,
@@ -449,31 +522,54 @@ function assertSplitLedgerIdentity(
 export async function createSchema9CorpusLedger(
   options: Schema9CorpusLedgerOptions,
 ): Promise<Schema9CorpusLedger> {
+  throwIfSchema9Aborted(options.signal, "Schema-9 corpus authentication");
   exactSplitRecord(options.splits);
   assertUniqueSchedules(options);
   const identity = await verifySchema9RepositoryIdentity(options);
-  await assertDistinctExplicitFiles(inputPaths(options));
-  const authenticated: AuthenticatedSchema9Split[] = [];
-  for (const split of SCHEMA9_LEDGER_SPLITS) {
-    authenticated.push(
-      await authenticateSchema9Split(
-        split,
-        options.splits[split],
-        options.assignmentScheduler,
-      ),
-    );
-  }
-  assertSchema9SplitsDisjoint(authenticated);
-  const finalIdentity = await verifySchema9RepositoryIdentity(options);
-  if (!canonicalJsonBytes(finalIdentity).equals(canonicalJsonBytes(identity))) {
-    throw new TypeError(
-      "Repository or executing code changed during corpus authentication.",
-    );
-  }
-  return assembleSchema9CorpusLedger(
-    finalIdentity,
-    options.producerConverterPolicy,
-    authenticated,
+  throwIfSchema9Aborted(options.signal, "Schema-9 corpus authentication");
+  return withSchema9OwnedStableFiles(
+    inputStableFileRequests(options),
+    async (ownedInputs) => {
+      const authenticated: AuthenticatedSchema9Split[] = [];
+      for (const split of SCHEMA9_LEDGER_SPLITS) {
+        throwIfSchema9Aborted(
+          options.signal,
+          `${split} corpus authentication`,
+        );
+        authenticated.push(
+          await authenticateSchema9SplitWithOwnedInputs(
+            split,
+            options.splits[split],
+            options.assignmentScheduler,
+            ownedInputs,
+            options.signal,
+          ),
+        );
+      }
+      throwIfSchema9Aborted(
+        options.signal,
+        "Schema-9 corpus authentication",
+      );
+      assertSchema9SplitsDisjoint(authenticated);
+      const finalIdentity = await verifySchema9RepositoryIdentity(options);
+      throwIfSchema9Aborted(
+        options.signal,
+        "Schema-9 corpus authentication",
+      );
+      if (
+        !canonicalJsonBytes(finalIdentity).equals(canonicalJsonBytes(identity))
+      ) {
+        throw new TypeError(
+          "Repository or executing code changed during corpus authentication.",
+        );
+      }
+      return assembleSchema9CorpusLedger(
+        finalIdentity,
+        options.producerConverterPolicy,
+        authenticated,
+      );
+    },
+    options.signal,
   );
 }
 
@@ -482,6 +578,7 @@ export function assembleSchema9CorpusLedger(
     readonly guesserCommit: string;
     readonly converterEngineCommit: string;
     readonly execution: Schema9ExecutionIdentity;
+    readonly producerRuntimeIdentity: Schema9ProducerRuntimeIdentity;
   }>,
   producerConverterPolicy:
     Schema9CorpusLedgerOptions["producerConverterPolicy"],
@@ -490,6 +587,10 @@ export function assembleSchema9CorpusLedger(
   checkedGitCommit(identity.guesserCommit, "guesserCommit");
   checkedGitCommit(identity.converterEngineCommit, "converterEngineCommit");
   checkedExecutionIdentity(identity.execution);
+  const producerRuntimeIdentity = checkedSchema9ProducerRuntimeIdentity(
+    identity.producerRuntimeIdentity,
+    "schema-9 reproduced producerRuntimeIdentity",
+  );
   if (
     !SCHEMA9_PRODUCER_CONVERTER_POLICIES.includes(
       producerConverterPolicy,
@@ -508,12 +609,22 @@ export function assembleSchema9CorpusLedger(
     );
   }
   authenticated.forEach(assertSplitLedgerIdentity);
+  if (authenticated.some((split) =>
+    !canonicalJsonBytes(split.ledger.producerRuntimeIdentity).equals(
+      canonicalJsonBytes(producerRuntimeIdentity),
+    )
+  )) {
+    throw new TypeError(
+      "Schema-9 receipt runtime identity does not match the reproduced producer build.",
+    );
+  }
   assertSchema9SplitsDisjoint(authenticated);
   const payload = Object.freeze({
     format: SCHEMA9_CORPUS_LEDGER_FORMAT,
     version: SCHEMA9_CORPUS_LEDGER_VERSION,
     identity: Object.freeze({
       ...identity,
+      producerRuntimeIdentity,
       producerConverterPolicy,
     }),
     scheduleContract: Object.freeze({
@@ -558,67 +669,6 @@ export function assembleSchema9CorpusLedger(
   });
 }
 
-async function outputDestination(path: string): Promise<string> {
-  if (path.length === 0) {
-    throw new TypeError("Ledger output path must not be empty.");
-  }
-  try {
-    await lstat(path);
-    throw new FileExistsError("Schema-9 ledger output already exists.");
-  } catch (error: unknown) {
-    if (
-      error instanceof FileExistsError
-      || (
-        typeof error === "object"
-        && error !== null
-        && "code" in error
-        && error.code !== "ENOENT"
-      )
-    ) {
-      throw error;
-    }
-  }
-  const parent = await realpath(dirname(path));
-  const parentInfo = await stat(parent);
-  if (!parentInfo.isDirectory()) {
-    throw new TypeError("Ledger output parent must be a directory.");
-  }
-  return join(parent, basename(path));
-}
-
-class FileExistsError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "FileExistsError";
-  }
-}
-
-async function publishAtomicNoClobber(
-  destination: string,
-  payload: Buffer,
-): Promise<void> {
-  const temporary = join(
-    dirname(destination),
-    `${basename(destination)}.tmp-${String(process.pid)}-${randomUUID()}`,
-  );
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
-  try {
-    handle = await open(temporary, "wx", 0o600);
-    await handle.writeFile(payload);
-    await handle.sync();
-    await handle.close();
-    handle = undefined;
-    await link(temporary, destination);
-    const published = await readFile(destination);
-    if (!published.equals(payload)) {
-      throw new Error("Published schema-9 ledger bytes changed.");
-    }
-  } finally {
-    await handle?.close().catch(() => undefined);
-    await rm(temporary, { force: true }).catch(() => undefined);
-  }
-}
-
 export function assertSchema9CorpusLedgerByteLength(bytes: Buffer): void {
   if (
     bytes.byteLength <= 0
@@ -636,70 +686,104 @@ export async function writeSchema9CorpusLedgerAtomic(
   outputPath: string,
   options: Schema9CorpusLedgerOptions,
 ): Promise<WrittenSchema9CorpusLedger> {
-  const destination = await outputDestination(outputPath);
   const artifact = await createSchema9CorpusLedger(options);
-  const bytes = canonicalJsonBytes(artifact);
-  assertSchema9CorpusLedgerByteLength(bytes);
-  await publishAtomicNoClobber(destination, bytes);
-  return writtenIdentity(artifact, bytes);
+  return publishSchema9CorpusLedgerArtifactAtomic(
+    outputPath,
+    artifact,
+    options.signal,
+  );
 }
 
 function writtenIdentity(
   artifact: Schema9CorpusLedger,
   bytes: Buffer,
+  publicationIdentity: Schema9StableFileIdentity,
 ): WrittenSchema9CorpusLedger {
   return Object.freeze({
     artifact,
     bytes: bytes.byteLength,
     sha256: createHash("sha256").update(bytes).digest("hex"),
+    publicationIdentity,
   });
 }
 
 export async function publishSchema9CorpusLedgerArtifactAtomic(
   outputPath: string,
   artifact: Schema9CorpusLedger,
+  signal?: AbortSignal,
 ): Promise<WrittenSchema9CorpusLedger> {
-  const destination = await outputDestination(outputPath);
+  throwIfSchema9Aborted(signal, "Schema-9 ledger publication");
   const bytes = canonicalJsonBytes(artifact);
   assertSchema9CorpusLedgerByteLength(bytes);
   verifySchema9CorpusLedgerReconstruction(bytes, artifact);
-  await publishAtomicNoClobber(destination, bytes);
-  return writtenIdentity(artifact, bytes);
+  throwIfSchema9Aborted(signal, "Schema-9 ledger publication");
+  const published = await publishSchema9BytesAtomicNoClobber(
+    outputPath,
+    bytes,
+    SCHEMA9_CORPUS_LEDGER_MAX_BYTES,
+    "Schema-9 ledger",
+    signal,
+  );
+  return writtenIdentity(artifact, bytes, published.publicationIdentity);
 }
 
-function statSignature(value: BigIntStats): readonly bigint[] {
-  return [
-    value.dev,
-    value.ino,
-    value.size,
-    value.mtimeNs,
-    value.ctimeNs,
-  ];
+export async function publishOrAuthenticateSchema9CorpusLedgerArtifactAtomic(
+  outputPath: string,
+  artifact: Schema9CorpusLedger,
+  signal?: AbortSignal,
+): Promise<PublishedOrAuthenticatedSchema9CorpusLedger> {
+  try {
+    const written = await publishSchema9CorpusLedgerArtifactAtomic(
+      outputPath,
+      artifact,
+      signal,
+    );
+    return Object.freeze({ ...written, created: true });
+  } catch (error: unknown) {
+    if (!isNodeError(error, "EEXIST")) {
+      throw error;
+    }
+    const destination = await schema9PublicationDestination(
+      outputPath,
+      "Schema-9 ledger",
+    );
+    const existing = await readSchema9StableFileBytes(
+      destination,
+      SCHEMA9_CORPUS_LEDGER_MAX_BYTES,
+      "Schema-9 ledger",
+      signal,
+    );
+    const expected = canonicalJsonBytes(artifact);
+    if (!existing.bytes.equals(expected)) {
+      throw new TypeError("Existing Schema-9 ledger is inconsistent.", {
+        cause: error,
+      });
+    }
+    verifySchema9CorpusLedgerReconstruction(existing.bytes, artifact);
+    return Object.freeze({
+      ...writtenIdentity(artifact, expected, existing.identity),
+      created: false,
+    });
+  }
 }
 
-async function readStableLedger(path: string): Promise<Buffer> {
-  const linkInfo = await lstat(path, { bigint: true });
-  if (linkInfo.isSymbolicLink() || !linkInfo.isFile()) {
-    throw new TypeError("Schema-9 ledger must be a regular non-symlink file.");
-  }
-  if (
-    linkInfo.size <= 0n
-    || linkInfo.size > BigInt(SCHEMA9_CORPUS_LEDGER_MAX_BYTES)
-  ) {
-    throw new RangeError("Schema-9 ledger byte length is invalid.");
-  }
-  const resolved = await realpath(path);
-  const before = await stat(resolved, { bigint: true });
-  const bytes = await readFile(resolved);
+function isNodeError(error: unknown, code: string): boolean {
+  return error instanceof Error
+    && "code" in error
+    && error.code === code;
+}
+
+async function readStableLedger(
+  path: string,
+  signal?: AbortSignal,
+): Promise<Buffer> {
+  const { bytes } = await readSchema9StableFileBytes(
+    path,
+    SCHEMA9_CORPUS_LEDGER_MAX_BYTES,
+    "Schema-9 ledger",
+    signal,
+  );
   assertSchema9CorpusLedgerByteLength(bytes);
-  const after = await stat(resolved, { bigint: true });
-  if (
-    statSignature(before).some(
-      (value, index) => value !== statSignature(after)[index],
-    )
-  ) {
-    throw new Error("Schema-9 ledger changed while it was being read.");
-  }
   return bytes;
 }
 
@@ -754,12 +838,34 @@ export async function loadAndReauthenticateSchema9CorpusLedger(
   ledgerPath: string,
   options: Schema9CorpusLedgerOptions,
 ): Promise<Schema9CorpusLedger> {
-  const existingBytes = await readStableLedger(ledgerPath);
+  return (await loadAndReauthenticateSchema9CorpusLedgerWithIdentity(
+    ledgerPath,
+    options,
+  )).artifact;
+}
+
+/**
+ * Reauthenticate a ledger and return the exact bytes that were parsed and
+ * compared. Callers must bind outer receipts to this captured digest instead
+ * of reopening the pathname.
+ */
+export async function loadAndReauthenticateSchema9CorpusLedgerWithIdentity(
+  ledgerPath: string,
+  options: Schema9CorpusLedgerOptions,
+): Promise<ReauthenticatedSchema9CorpusLedger> {
+  const existingBytes = await readStableLedger(ledgerPath, options.signal);
+  throwIfSchema9Aborted(options.signal, "Schema-9 ledger authentication");
   const reconstructed = await createSchema9CorpusLedger(options);
-  return verifySchema9CorpusLedgerReconstruction(
+  throwIfSchema9Aborted(options.signal, "Schema-9 ledger authentication");
+  const artifact = verifySchema9CorpusLedgerReconstruction(
     existingBytes,
     reconstructed,
   );
+  return Object.freeze({
+    artifact,
+    bytes: Buffer.from(existingBytes),
+    sha256: createHash("sha256").update(existingBytes).digest("hex"),
+  });
 }
 
 export function verifySchema9CorpusLedgerReconstruction(
@@ -780,8 +886,11 @@ export function verifySchema9CorpusLedgerReconstruction(
  */
 export async function schema9CorpusLedgerFileSha256(
   ledgerPath: string,
+  signal?: AbortSignal,
 ): Promise<string> {
-  const bytes = await readStableLedger(ledgerPath);
+  const bytes = await readStableLedger(ledgerPath, signal);
+  throwIfSchema9Aborted(signal, "Schema-9 ledger authentication");
   parsedCanonicalLedger(bytes);
+  throwIfSchema9Aborted(signal, "Schema-9 ledger authentication");
   return createHash("sha256").update(bytes).digest("hex");
 }

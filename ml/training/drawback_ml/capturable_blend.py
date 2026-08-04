@@ -334,22 +334,33 @@ def _repository_anchor(
         "--get-all",
         "remote.origin.url",
     ).stdout.splitlines()
-    local_redirections = git(
+    configured_redirections = git(
         "config",
-        "--local",
         "--no-includes",
+        "--show-scope",
         "--name-only",
         "--get-regexp",
         _LOCAL_CONFIG_REDIRECTION_PATTERN,
         check=False,
     )
-    if local_redirections.returncode not in (0, 1):
+    if configured_redirections.returncode not in (0, 1):
         raise subprocess.CalledProcessError(
-            local_redirections.returncode,
-            local_redirections.args,
-            output=local_redirections.stdout,
-            stderr=local_redirections.stderr,
+            configured_redirections.returncode,
+            configured_redirections.args,
+            output=configured_redirections.stdout,
+            stderr=configured_redirections.stderr,
         )
+    unsafe_redirections = [
+        line
+        for line in configured_redirections.stdout.splitlines()
+        if line.startswith("local\t") or line.startswith("worktree\t")
+    ]
+    local_redirections = subprocess.CompletedProcess(
+        configured_redirections.args,
+        0 if unsafe_redirections else 1,
+        "\n".join(unsafe_redirections),
+        configured_redirections.stderr,
+    )
     return top_level_matches, origin_urls, local_redirections
 
 
@@ -384,6 +395,16 @@ def _authenticated_execution_identity(
         measured_protocol_sha256 = hashlib.sha256(
             protocol_path.read_bytes()
         ).hexdigest()
+        # `git status` can launch repository-configured clean/process filters.
+        # Reject every command-bearing local/worktree redirection before status.
+        top_level_matches, origin_urls, local_redirections = _repository_anchor(
+            git=git,
+            repository=repository,
+        )
+        if local_redirections.stdout:
+            raise CapturableDatasetError(
+                f"{operation} repository identity is not the pushed release"
+            )
         status = git(
             "status",
             "--porcelain=v1",
@@ -395,10 +416,6 @@ def _authenticated_execution_identity(
             raise CapturableDatasetError(
                 f"{operation} revision does not contain the protocol"
             )
-        top_level_matches, origin_urls, local_redirections = _repository_anchor(
-            git=git,
-            repository=repository,
-        )
         ancestor = git(
             "merge-base",
             "--is-ancestor",
@@ -417,6 +434,8 @@ def _authenticated_execution_identity(
             "--format=%an%x00%ae%x00%cn%x00%ce",
             revision,
         ).stdout.rstrip("\n").split("\x00")
+    except CapturableDatasetError:
+        raise
     except (
         OSError,
         subprocess.CalledProcessError,
@@ -446,7 +465,6 @@ def _authenticated_execution_identity(
         or hashlib.sha256(committed_protocol).hexdigest()
         != protocol_sha256
         or origin_urls != [_CANONICAL_REPOSITORY_URL]
-        or local_redirections.stdout
         or remote_revision_fields
         != [revision, "refs/heads/main"]
         or tuple(commit_identity) != _CANONICAL_COMMIT_IDENTITY

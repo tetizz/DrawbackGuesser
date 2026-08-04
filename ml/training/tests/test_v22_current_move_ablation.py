@@ -424,6 +424,19 @@ class V22TrainerIntegrationTests(unittest.TestCase):
             output = Path(temporary) / "in-memory"
             train_baseline(examples, output, config)
             self._assert_artifacts(output, config)
+            before = {
+                path.relative_to(output): path.read_bytes()
+                for path in output.rglob("*")
+                if path.is_file()
+            }
+            with self.assertRaisesRegex(FileExistsError, "already exists"):
+                train_baseline(examples, output, config)
+            after = {
+                path.relative_to(output): path.read_bytes()
+                for path in output.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(after, before)
 
     def test_streaming_trainer_emits_masked_a1_contract(self) -> None:
         examples = _examples()

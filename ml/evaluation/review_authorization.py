@@ -1,4 +1,4 @@
-"""Two-reviewer authorization for a future one-shot sealed-test opener.
+"""Two-reviewer authorization for a locally guarded sealed-test opener.
 
 This module authenticates release evidence and a precommitted test plan.  It
 has no argument for a sealed manifest or dataset path and never resolves the
@@ -8,14 +8,23 @@ three sealed input bindings recorded in the approval.
 from __future__ import annotations
 
 import argparse
+import ctypes
+from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path, PurePath
+from pathlib import Path
 import re
+import stat
 import subprocess
 import tempfile
 from typing import Any, Mapping, Sequence
+
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable_exact
+from ml.training.drawback_ml.path_validation import (
+    is_portable_safe_basename,
+    portable_basename_key,
+)
 
 from .ensemble_calibration import ContentAddressedFile
 from .validation_reproduction import (
@@ -42,10 +51,228 @@ _CANDIDATE_KEYS = frozenset(
 )
 _TEST_INPUT_KEYS = frozenset({"public_root", "private_test", "dataset"})
 _TEST_OUTPUT_KEYS = frozenset({"report", "decision"})
+_AUTHENTICATED_REPRODUCTION_ENVIRONMENT_KEYS = frozenset(
+    {
+        "source_revision",
+        "pnpm_lock_sha256",
+        "python_requirements_sha256",
+        "python_project_sha256",
+        "git_executable_path_sha256",
+        "git_executable_sha256",
+        "git_version",
+        "python_executable_path_sha256",
+        "python_executable_sha256",
+        "python_version",
+        "python_import_roots_sha256",
+        "python_distributions_sha256",
+        "python_runtime",
+    }
+)
 
 
 class ReviewAuthorizationError(ValueError):
     """Raised before authorization when review evidence is not exact."""
+
+
+@dataclass(frozen=True)
+class _ExecutableIdentity:
+    """A fixed system executable measured through one stable file handle."""
+
+    path: Path
+    sha256: str
+    metadata: tuple[int, int, int, int]
+
+
+def _is_link_or_reparse_point(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ReviewAuthorizationError(
+            f"cannot authenticate system executable: {path}"
+        ) from error
+    return path.is_symlink() or (
+        os.name == "nt"
+        and bool(
+            getattr(metadata, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+        )
+    )
+
+
+def _executable_identity(path: Path, label: str) -> _ExecutableIdentity:
+    """Resolve and hash an executable while rejecting path substitution."""
+
+    if not path.is_absolute():
+        raise ReviewAuthorizationError(f"{label} path must be absolute")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise ReviewAuthorizationError(f"{label} is unavailable") from error
+    if _is_link_or_reparse_point(resolved):
+        raise ReviewAuthorizationError(f"{label} cannot be a link")
+    digest = hashlib.sha256()
+    try:
+        with resolved.open("rb") as source:
+            before = os.fstat(source.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ReviewAuthorizationError(
+                    f"{label} must be a regular file"
+                )
+            if os.name != "nt" and (
+                before.st_uid != 0
+                or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            ):
+                raise ReviewAuthorizationError(
+                    f"{label} is not owned by the trusted system boundary"
+                )
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+            after = os.fstat(source.fileno())
+    except OSError as error:
+        raise ReviewAuthorizationError(f"cannot read {label}") from error
+    before_metadata = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    after_metadata = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    if before_metadata != after_metadata:
+        raise ReviewAuthorizationError(f"{label} changed while authenticated")
+    return _ExecutableIdentity(
+        path=resolved,
+        sha256=digest.hexdigest(),
+        metadata=before_metadata,
+    )
+
+
+def _assert_executable_unchanged(
+    expected: _ExecutableIdentity,
+    label: str,
+) -> None:
+    if _executable_identity(expected.path, label) != expected:
+        raise ReviewAuthorizationError(f"{label} changed during execution")
+
+
+def _windows_known_directory(kind: str) -> Path:
+    if os.name != "nt":
+        raise ReviewAuthorizationError(
+            "Windows known-directory lookup is unavailable"
+        )
+    buffer = ctypes.create_unicode_buffer(32_768)
+    if kind in {"program-data", "program-files"}:
+        result = ctypes.windll.shell32.SHGetFolderPathW(
+            None,
+            0x0023 if kind == "program-data" else 0x0026,
+            None,
+            0,
+            buffer,
+        )
+        if result != 0:
+            raise ReviewAuthorizationError(
+                f"trusted Windows {kind} directory is unavailable"
+            )
+        length = len(buffer.value)
+    else:
+        function_name = {
+            "system": "GetSystemDirectoryW",
+            "windows": "GetSystemWindowsDirectoryW",
+        }.get(kind)
+        if function_name is None:
+            raise ReviewAuthorizationError("Windows directory role is invalid")
+        length = getattr(ctypes.windll.kernel32, function_name)(
+            buffer,
+            len(buffer),
+        )
+    if length <= 0 or length >= len(buffer):
+        raise ReviewAuthorizationError(
+            f"trusted Windows {kind} directory is unavailable"
+        )
+    try:
+        directory = Path(buffer.value).resolve(strict=True)
+    except OSError as error:
+        raise ReviewAuthorizationError(
+            f"trusted Windows {kind} directory is unavailable"
+        ) from error
+    if not directory.is_dir() or _is_link_or_reparse_point(directory):
+        raise ReviewAuthorizationError(
+            f"trusted Windows {kind} directory is invalid"
+        )
+    return directory
+
+
+def _trusted_ssh_keygen() -> _ExecutableIdentity:
+    """Resolve OpenSSH only from an operating-system-owned location."""
+
+    if os.name == "nt":
+        candidate = (
+            _windows_known_directory("system")
+            / "OpenSSH"
+            / "ssh-keygen.exe"
+        )
+    else:
+        candidates = {
+            item.resolve(strict=True)
+            for item in (Path("/usr/bin/ssh-keygen"), Path("/bin/ssh-keygen"))
+            if item.is_file()
+        }
+        if len(candidates) != 1:
+            raise ReviewAuthorizationError(
+                "trusted system ssh-keygen is unavailable"
+            )
+        candidate = candidates.pop()
+    return _executable_identity(candidate, "trusted system ssh-keygen")
+
+
+def _sanitized_system_tool_environment(
+    executable: Path,
+) -> dict[str, str]:
+    """Return the minimum noninteractive environment for a system tool."""
+
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() in {"TEMP", "TMP"}
+    }
+    if os.name == "nt":
+        system_directory = _windows_known_directory("system")
+        windows_directory = _windows_known_directory("windows")
+        program_data = _windows_known_directory("program-data")
+        shell = system_directory / "cmd.exe"
+        if not shell.is_file() or _is_link_or_reparse_point(shell):
+            raise ReviewAuthorizationError(
+                "trusted Windows command shell is unavailable"
+            )
+        environment.update(
+            {
+                "ComSpec": str(shell.resolve(strict=True)),
+                "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+                "ProgramData": str(program_data),
+                "PATH": os.pathsep.join(
+                    (
+                        str(executable.parent),
+                        str(system_directory),
+                        str(windows_directory),
+                    )
+                ),
+                "SystemRoot": str(windows_directory),
+                "WINDIR": str(windows_directory),
+            }
+        )
+    else:
+        environment["PATH"] = os.pathsep.join(("/usr/bin", "/bin"))
+    environment.update(
+        {
+            "LC_ALL": "C",
+            "SSH_ASKPASS_REQUIRE": "never",
+        }
+    )
+    return environment
 
 
 def _pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -114,14 +341,7 @@ def _sha(value: object, label: str) -> str:
 
 def _basename(value: object, label: str) -> str:
     result = _string(value, label)
-    path = PurePath(result)
-    if (
-        path.name != result
-        or result in {".", ".."}
-        or "/" in result
-        or "\\" in result
-        or "\x00" in result
-    ):
+    if not is_portable_safe_basename(result):
         raise ReviewAuthorizationError(f"{label} must be a safe basename")
     return result
 
@@ -351,6 +571,11 @@ def _verify_reproduction(
 
     dependencies = _object(approval["dependencies"], "approval.dependencies")
     environment = _object(value.get("environment"), "reproduction environment")
+    _exact(
+        environment,
+        _AUTHENTICATED_REPRODUCTION_ENVIRONMENT_KEYS,
+        "reproduction environment",
+    )
     if (
         environment.get("source_revision") != dependencies["source_revision"]
         or environment.get("pnpm_lock_sha256")
@@ -389,6 +614,18 @@ def _verify_reproduction(
     _sha(
         environment.get("python_executable_sha256"),
         "reproduction environment.python_executable_sha256",
+    )
+    for key in (
+        "git_executable_path_sha256",
+        "git_executable_sha256",
+        "python_executable_path_sha256",
+        "python_import_roots_sha256",
+        "python_distributions_sha256",
+    ):
+        _sha(environment.get(key), f"reproduction environment.{key}")
+    _string(
+        environment.get("git_version"),
+        "reproduction environment.git_version",
     )
     _string(
         environment.get("python_version"),
@@ -525,7 +762,8 @@ def _verify_test_plan(value: object) -> Mapping[str, Any]:
         _binding(inputs[name], f"test_plan.inputs.{name}")[0]
         for name in sorted(_TEST_INPUT_KEYS)
     ]
-    if len(set(input_names)) != len(input_names):
+    input_keys = {portable_basename_key(name) for name in input_names}
+    if len(input_keys) != len(input_names):
         raise ReviewAuthorizationError("test input basenames must be distinct")
     outputs = _object(plan["output_basenames"], "test_plan.output_basenames")
     _exact(outputs, _TEST_OUTPUT_KEYS, "test_plan.output_basenames")
@@ -533,9 +771,10 @@ def _verify_test_plan(value: object) -> Mapping[str, Any]:
         _basename(outputs[name], f"test_plan.output_basenames.{name}")
         for name in sorted(_TEST_OUTPUT_KEYS)
     ]
-    if len(set(output_names)) != len(output_names):
+    output_keys = {portable_basename_key(name) for name in output_names}
+    if len(output_keys) != len(output_names):
         raise ReviewAuthorizationError("test output basenames must be distinct")
-    if set(input_names).intersection(output_names):
+    if input_keys.intersection(output_keys):
         raise ReviewAuthorizationError(
             "test input and output basenames must not overlap"
         )
@@ -720,10 +959,12 @@ def _verify_signature(
         or "\r" in identity
     ):
         raise ReviewAuthorizationError("reviewer identity is invalid")
+    verifier = _trusted_ssh_keygen()
+    environment = _sanitized_system_tool_environment(verifier.path)
     try:
         process = subprocess.run(
             (
-                "ssh-keygen",
+                str(verifier.path),
                 "-Y",
                 "verify",
                 "-f",
@@ -739,9 +980,13 @@ def _verify_signature(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
+            cwd=allowed_signers.parent,
+            env=environment,
+            timeout=30,
         )
-    except OSError as error:
+    except (OSError, subprocess.TimeoutExpired) as error:
         raise ReviewAuthorizationError("cannot execute ssh-keygen") from error
+    _assert_executable_unchanged(verifier, "trusted system ssh-keygen")
     if process.returncode != 0:
         raise ReviewAuthorizationError(
             f"OpenSSH signature verification failed for {identity}"
@@ -758,23 +1003,16 @@ def _verify_signature(
 def _write_atomic_no_clobber(path: Path, payload: bytes) -> None:
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "wb") as target:
-            target.write(payload)
-            target.flush()
-            os.fsync(target.fileno())
-        try:
-            os.link(temporary, path)
-        except FileExistsError as error:
-            raise ReviewAuthorizationError(
-                f"refusing to overwrite authorization receipt: {path}"
-            ) from error
-    finally:
-        temporary.unlink(missing_ok=True)
+        publish_bytes_durable_exact(
+            path,
+            payload,
+            label="authorization receipt",
+        )
+    except ValueError as error:
+        raise ReviewAuthorizationError(
+            f"refusing to overwrite authorization receipt: {path}"
+        ) from error
 
 
 def authorize_review(

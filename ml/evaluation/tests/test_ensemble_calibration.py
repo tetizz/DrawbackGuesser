@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -157,6 +158,100 @@ def fusion_reference(
 
 
 class EnsembleCalibrationTests(unittest.TestCase):
+    def test_abort_never_deletes_a_replacement_pathname(self) -> None:
+        class ReplaceOnClose:
+            def __init__(self, stream: object, path: Path) -> None:
+                self.stream = stream
+                self.path = path
+
+            def fileno(self) -> int:
+                return self.stream.fileno()  # type: ignore[attr-defined]
+
+            def close(self) -> None:
+                self.stream.close()  # type: ignore[attr-defined]
+                self.path.unlink(missing_ok=True)
+                self.path.write_bytes(b"replacement\n")
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            _, _, published, _, _ = self.build_inputs(root)
+            identity = load_ensemble_calibration_sidecar(published).identity
+            stream = EnsembleCalibrationSidecarStream(
+                root / "aborted.ndjson",
+                identity,
+            )
+            temporary = stream._temporary
+            stream._file = ReplaceOnClose(stream._file, temporary)  # type: ignore[assignment]
+            if os.name == "nt":
+                with self.assertRaisesRegex(OSError, "retained replacement"):
+                    stream.abort()
+            else:
+                stream.abort()
+
+            self.assertTrue(stream._closed)
+            self.assertEqual(temporary.read_bytes(), b"replacement\n")
+
+    def test_sidecar_writer_preserves_primary_when_abort_fails(self) -> None:
+        primary = ValueError("observation failed")
+
+        class FailingStream:
+            def __init__(self, output: Path, identity: object) -> None:
+                del output, identity
+
+            @staticmethod
+            def add(observation: object) -> None:
+                del observation
+                raise primary
+
+            @staticmethod
+            def abort() -> None:
+                raise OSError("sidecar abort failed")
+
+        with patch(
+            "ml.evaluation.ensemble_calibration."
+            "EnsembleCalibrationSidecarStream",
+            FailingStream,
+        ):
+            with self.assertRaisesRegex(ValueError, "observation failed") as raised:
+                write_ensemble_calibration_sidecar(
+                    Path("unused.ndjson"),
+                    object(),  # type: ignore[arg-type]
+                    (object(),),  # type: ignore[arg-type]
+                )
+
+        self.assertIs(raised.exception, primary)
+        self.assertIn(
+            "sidecar abort failed",
+            " ".join(getattr(raised.exception, "__notes__", ())),
+        )
+
+    def test_missing_head_error_survives_abort_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            _, _, published, _, _ = self.build_inputs(root)
+            identity = load_ensemble_calibration_sidecar(published).identity
+            stream = EnsembleCalibrationSidecarStream(
+                root / "incomplete-sidecar.ndjson",
+                identity,
+            )
+            with patch.object(
+                stream,
+                "abort",
+                side_effect=OSError("sidecar abort failed"),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "White and Black",
+                ) as raised:
+                    stream.finalize()
+
+            self.assertIn(
+                "sidecar abort failed",
+                " ".join(getattr(raised.exception, "__notes__", ())),
+            )
+            stream._file.close()
+            stream._temporary.unlink(missing_ok=True)
+
     def build_inputs(
         self, root: Path, *, corpus_set: dict[str, str] | None = None
     ) -> tuple[
@@ -262,10 +357,19 @@ class EnsembleCalibrationTests(unittest.TestCase):
             stream = EnsembleCalibrationSidecarStream(output, identity)
             stream.add(observations()[0])
             self.assertFalse(output.exists())
-            with self.assertRaisesRegex(ValueError, "White and Black"):
+            with self.assertRaisesRegex(ValueError, "White and Black") as raised:
                 stream.finalize()
             self.assertFalse(output.exists())
-            self.assertEqual(list(root.glob(".stream.ndjson.*.tmp")), [])
+            leftovers = list(root.glob(".stream.ndjson.*.tmp"))
+            if os.name == "nt":
+                self.assertEqual(len(leftovers), 1)
+                self.assertIn(
+                    "safe handle-bound unlink is unavailable on Windows",
+                    " ".join(getattr(raised.exception, "__notes__", ())),
+                )
+                leftovers[0].unlink()
+            else:
+                self.assertEqual(leftovers, [])
 
             complete = EnsembleCalibrationSidecarStream(output, identity)
             for observation in observations():

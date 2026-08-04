@@ -1,6 +1,6 @@
 # Schema-9 corpus ledger
 
-The version-2 schema-9 corpus ledger is the fail-closed handoff between deterministic
+The version-3 schema-9 corpus ledger is the fail-closed handoff between deterministic
 Engine generation, Guesser conversion, and the opportunity-ablation
 workflow. It authenticates exactly four caller-supplied splits:
 `train`, `validation-a`, `validation-b`, and `test`.
@@ -54,7 +54,7 @@ For every split, the ledger binds:
 - the exact canonical converted game-ID and simulation-seed arrays and their
   independent set hashes;
 - the path-free typed launch and completion receipt SHA-256 and byte identities;
-- the producer Engine commit; and
+- the producer Engine commit and exact producer runtime-tree identity; and
 - the schedule ID and frozen seed roots.
 
 The source arrays contain every scheduled game. The converted arrays contain
@@ -69,9 +69,10 @@ The four source game-ID sets must be pairwise disjoint. Simulation and
 parameter seed values must be globally unique across every stream and split.
 
 Launch receipts use
-`drawbackengine-player-private-schedule-launch` version 2 and bind the schedule
+`drawbackengine-player-private-schedule-launch` version 3 and bind the schedule
 authority, ledger split, isolated Engine split counts, roots, profile, schedule
-ID, producer commit, and exact `generationConfig`. The generation configuration
+ID, producer commit, producer runtime identity, and exact `generationConfig`.
+The generation configuration
 is recursively exact-key checked and must equal:
 
 ```json
@@ -97,9 +98,10 @@ is recursively exact-key checked and must equal:
 ```
 
 Completion receipts use
-`drawbackengine-player-private-schedule-completion` version 2 and bind the
+`drawbackengine-player-private-schedule-completion` version 3 and bind the
 launch digest, completed state, producer, and exact trace digest, bytes, game
-count, and index bounds. Version-1 receipts, unknown fields, missing fields,
+count, and index bounds. It repeats the exact launch producer runtime identity.
+Earlier receipts, unknown fields, missing fields,
 mutated generation values, unsafe integers, negative zero, overflowing numbers,
 and non-object receipt roots are rejected.
 
@@ -117,6 +119,30 @@ The Guesser commit must pin the declared converter Engine commit at its
 `engine` gitlink. Under `exact/v1`, every producer commit must equal that
 converter commit. Under `converter-ancestor/v1`, the converter commit must be
 an authenticated Git ancestor of every producer commit.
+
+The commit relationship is necessary but insufficient. Both generator receipts
+must contain this exact path-free `producerRuntimeIdentity` contract:
+
+```text
+format: drawbackengine-schema9-producer-runtime
+version: 1
+algorithm: sha256-engine-runtime-tree-v1
+runtime: exact Node version, platform, architecture, and empty execArgv
+coordinator: schema9-coordinator/v1 runtime-tree count, bytes, and SHA-256
+parallelWorker: player-private-parallel-worker/v1 runtime-tree count, bytes,
+  and SHA-256
+aggregateSha256: canonical SHA-256 of every preceding identity field
+```
+
+All object keys are exact; both component counts are positive safe integers;
+digests are lowercase SHA-256 values; and path-like or private values are
+rejected. The deferred parallel worker is a separate required component because
+it is not loaded by importing the coordinator module alone. The ledger verifier
+rebuilds every distinct recorded producer commit in a fresh isolated Engine
+checkout and recomputes this identity. All four splits must reproduce one exact
+identity, every launch must declare it, every completion must repeat it, and the
+ledger stores it both globally and per split. Commit-only or receipt-only claims
+therefore fail closed.
 
 Every source line is parsed and semantically replayed by the executing Engine
 schema-2 parser. The executing converter then regenerates each dataset row, and
@@ -178,8 +204,27 @@ Separate commitments cover game IDs, simulation seeds, and parameter seeds.
 
 Creation writes a mode-`0600` temporary file, flushes it, and publishes with a
 create-only hard link. An existing destination is never overwritten.
+Input path walks reject Node-recognized symbolic links and Windows junctions;
+the Windows regression asserts that `lstat().isSymbolicLink()` identifies the
+junction form used by the CLI. Stable inputs are then held by open handles and
+rechecked against their path, resolved path, object identity, size, and times.
 Creation and verification enforce the same 8 MiB canonical byte limit before
 publication; larger ledgers require a future chunked/Merkle protocol version.
+The caller's optional cancellation signal is checked across repository
+verification, split streaming/replay, stable-file reads, and every temporary
+file suspension point. The final check occurs immediately before the hard-link
+commit. Cancellation before that boundary removes the temporary file and
+publishes neither ledger nor verification receipt; after the link succeeds,
+the publication is committed and only its byte-for-byte durability check runs.
+
+Temporary and rollback cleanup first renames the authenticated object to a
+random quarantine name and rechecks its identity and, for rollback, its exact
+content hash. This blocks every replacement installed before that recheck.
+Node does not provide a portable fd-relative unlink, so the final
+`lstat`-to-`rm` interval cannot exclude a concurrently malicious process running
+as the same OS user with write access to the quarantine directory. Schema-9
+publication directories therefore must not be shared with such a process; this
+is an explicit local-host trust boundary, not a claim of hostile-host safety.
 
 Verification reopens a regular non-symlink ledger, checks canonical bytes and
 the self-hash, re-authenticates all explicitly supplied source files and
@@ -187,7 +232,7 @@ repository identities, reconstructs the complete artifact, and requires
 byte-identical equality.
 
 After that replay, the CLI publishes or authenticates a canonical create-only
-verification receipt named
+verification receipt version 2 named
 `schema9-ledger-verification-<ledger-file-sha256>.json`. It binds the ledger
 file and content hashes, every input identity, repository policy, and the
 content-derived execution manifest. Every Python workflow stage requires and

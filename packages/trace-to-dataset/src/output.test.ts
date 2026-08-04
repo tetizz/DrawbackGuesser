@@ -1,9 +1,18 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFile, readdir, rm, stat } from "node:fs/promises";
+import {
+  lstat,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  publishTrainingDatasetNoClobberForTesting,
   writeTrainingDatasetNdjsonFileAtomic,
 } from "./output.js";
 import { traceFixture } from "./test-fixture.js";
@@ -68,6 +77,71 @@ describe("private training dataset output", () => {
         entry.startsWith(`${basename(path)}.tmp-`)
       ),
     ).toBe(false);
+  });
+
+  it("never deletes a replacement raced into its cleanup quarantine", async () => {
+    const temporary = temporaryDataset("cleanup-race-temporary");
+    const output = temporaryDataset("cleanup-race-output");
+    const original = Buffer.from("authenticated dataset\n", "utf8");
+    const replacement = Buffer.from("attacker replacement\n", "utf8");
+    await writeFile(temporary, original, { flag: "wx", mode: 0o600 });
+    const metadata = await lstat(temporary, { bigint: true });
+    let quarantine = "";
+    let displaced = "";
+
+    await expect(publishTrainingDatasetNoClobberForTesting(
+      temporary,
+      output,
+      Object.freeze({
+        dev: metadata.dev,
+        ino: metadata.ino,
+        birthtimeNs: metadata.birthtimeNs,
+      }),
+      async (candidate) => {
+        quarantine = candidate;
+        displaced = `${candidate}.displaced`;
+        cleanupPaths.push(quarantine, displaced);
+        await rename(candidate, displaced);
+        await writeFile(candidate, replacement, { flag: "wx", mode: 0o600 });
+      },
+    )).rejects.toMatchObject({ committed: true });
+
+    expect(await readFile(output)).toEqual(original);
+    expect(await readFile(quarantine)).toEqual(replacement);
+    expect(await readFile(displaced)).toEqual(original);
+  });
+
+  it("syncs the parent only after the final dataset entry is authenticated", async () => {
+    const temporary = temporaryDataset("directory-sync-temporary");
+    const output = temporaryDataset("directory-sync-output");
+    const original = Buffer.from("authenticated dataset\n", "utf8");
+    await writeFile(temporary, original, { flag: "wx", mode: 0o600 });
+    const metadata = await lstat(temporary, { bigint: true });
+    const events: string[] = [];
+
+    await publishTrainingDatasetNoClobberForTesting(
+      temporary,
+      output,
+      Object.freeze({
+        dev: metadata.dev,
+        ino: metadata.ino,
+        birthtimeNs: metadata.birthtimeNs,
+      }),
+      () => {
+        events.push("quarantined");
+        return Promise.resolve();
+      },
+      async (directory) => {
+        events.push("directory-synced");
+        expect(directory).toBe(dirname(output));
+        await expect(readFile(temporary)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+        await expect(readFile(output)).resolves.toEqual(original);
+      },
+    );
+
+    expect(events).toEqual(["quarantined", "directory-synced"]);
   });
 
   it("accepts async traces and preserves monolithic shard byte identity", async () => {

@@ -1,21 +1,23 @@
-import { createHash, randomUUID } from "node:crypto";
-import {
-  link,
-  open,
-  readFile,
-  rm,
-} from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { createHash } from "node:crypto";
 import {
   assertPathFreeJson,
   canonicalJsonBytes,
   checkedSha256,
+  throwIfSchema9Aborted,
   type Schema9CorpusLedger,
 } from "./schema9-ledger-types.js";
+import {
+  publishSchema9BytesAtomicNoClobber,
+  schema9PublicationDestination,
+} from "./schema9-atomic-publication.js";
+import {
+  readSchema9StableFileBytes,
+  type Schema9StableFileIdentity,
+} from "./schema9-stable-file.js";
 
 export const SCHEMA9_LEDGER_VERIFICATION_RECEIPT_FORMAT =
   "drawbackguesser-schema9-ledger-verification" as const;
-export const SCHEMA9_LEDGER_VERIFICATION_RECEIPT_VERSION = 1 as const;
+export const SCHEMA9_LEDGER_VERIFICATION_RECEIPT_VERSION = 2 as const;
 const MAX_VERIFICATION_RECEIPT_BYTES = 1024 * 1024;
 
 export interface Schema9LedgerVerificationReceipt {
@@ -35,6 +37,17 @@ export interface Schema9LedgerVerificationReceipt {
   readonly contentSha256: string;
 }
 
+export interface WrittenSchema9LedgerVerificationReceipt {
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly publicationIdentity: Schema9StableFileIdentity;
+}
+
+export interface PublishedOrAuthenticatedSchema9LedgerVerificationReceipt
+  extends WrittenSchema9LedgerVerificationReceipt {
+  readonly created: boolean;
+}
+
 function sha256(value: Buffer): string {
   return createHash("sha256").update(value).digest("hex");
 }
@@ -49,6 +62,7 @@ function inputSet(ledger: Schema9CorpusLedger): unknown {
     scheduleId: split.scheduleId,
     seedRoots: split.seedRoots,
     producerEngineCommit: split.producerEngineCommit,
+    producerRuntimeIdentity: split.producerRuntimeIdentity,
     generatorReceipts: split.generatorReceipts,
     sourceTrace: {
       sha256: split.sourceTrace.sha256,
@@ -107,7 +121,9 @@ export function schema9LedgerVerificationReceiptSha256(
 export async function writeSchema9LedgerVerificationReceiptAtomic(
   outputPath: string,
   receipt: Schema9LedgerVerificationReceipt,
-): Promise<{ readonly bytes: number; readonly sha256: string }> {
+  signal?: AbortSignal,
+): Promise<WrittenSchema9LedgerVerificationReceipt> {
+  throwIfSchema9Aborted(signal, "Schema-9 verification receipt publication");
   const payload = canonicalJsonBytes(receipt);
   if (
     payload.byteLength <= 0
@@ -115,27 +131,59 @@ export async function writeSchema9LedgerVerificationReceiptAtomic(
   ) {
     throw new RangeError("Schema-9 verification receipt byte length is invalid.");
   }
-  const temporary = join(
-    dirname(outputPath),
-    `${basename(outputPath)}.tmp-${String(process.pid)}-${randomUUID()}`,
+  return publishSchema9BytesAtomicNoClobber(
+    outputPath,
+    payload,
+    MAX_VERIFICATION_RECEIPT_BYTES,
+    "Schema-9 verification receipt",
+    signal,
   );
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
+}
+
+export async function publishOrAuthenticateSchema9LedgerVerificationReceipt(
+  outputPath: string,
+  receipt: Schema9LedgerVerificationReceipt,
+  signal?: AbortSignal,
+): Promise<PublishedOrAuthenticatedSchema9LedgerVerificationReceipt> {
+  const expected = canonicalJsonBytes(receipt);
   try {
-    handle = await open(temporary, "wx", 0o600);
-    await handle.writeFile(payload);
-    await handle.sync();
-    await handle.close();
-    handle = undefined;
-    await link(temporary, outputPath);
-    if (!(await readFile(outputPath)).equals(payload)) {
-      throw new Error("Published schema-9 verification receipt changed.");
+    const written = await writeSchema9LedgerVerificationReceiptAtomic(
+      outputPath,
+      receipt,
+      signal,
+    );
+    return Object.freeze({ ...written, created: true });
+  } catch (error: unknown) {
+    if (!isNodeError(error, "EEXIST")) {
+      throw error;
     }
-  } finally {
-    await handle?.close().catch(() => undefined);
-    await rm(temporary, { force: true }).catch(() => undefined);
+    const destination = await schema9PublicationDestination(
+      outputPath,
+      "Schema-9 verification receipt",
+    );
+    const existing = await readSchema9StableFileBytes(
+      destination,
+      MAX_VERIFICATION_RECEIPT_BYTES,
+      "Schema-9 verification receipt",
+      signal,
+    );
+    if (!existing.bytes.equals(expected)) {
+      throw new TypeError(
+        "Existing Schema-9 verification receipt is inconsistent.",
+        { cause: error },
+      );
+    }
+    return Object.freeze({
+      bytes: existing.bytes.byteLength,
+      sha256: sha256(existing.bytes),
+      publicationIdentity: existing.identity,
+      created: false,
+    });
   }
-  return Object.freeze({
-    bytes: payload.byteLength,
-    sha256: sha256(payload),
-  });
+}
+
+function isNodeError(error: unknown, code: string): boolean {
+  return error instanceof Error
+    && "code" in error
+    && error.code === code;
 }

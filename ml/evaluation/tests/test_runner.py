@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+import hashlib
 import io
 import json
 import tempfile
@@ -9,12 +10,17 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from ml.evaluation.cli import (
+    _abort_sidecar_preserving_failure,
+    _evaluate,
+    _finalize_sidecar_preserving_failure,
     _json_value,
     _require_checkpoint_corpus_provenance,
     _split_manifest_mapping,
     _write_report_atomic_no_clobber,
     main as evaluation_main,
 )
+from ml.evaluation.calibration import CalibrationExample
+from ml.evaluation.calibration_release import CalibrationObservation
 from ml.evaluation.runner import (
     EvaluationDataError,
     decode_predicted_parameter,
@@ -26,6 +32,7 @@ from ml.evaluation.runner import (
 from ml.evaluation.splits import SplitManifest
 from ml.training.drawback_ml.features import MOVE_VOCABULARY_SIZE, encode_move
 from ml.training.drawback_ml.inference import InferenceOutput
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable_exact
 
 
 def row(
@@ -83,6 +90,41 @@ class FakePredictor:
 
 
 class HeldOutRunnerTests(unittest.TestCase):
+    def test_sidecar_abort_cannot_mask_the_primary_evaluation_failure(self) -> None:
+        primary = ValueError("evaluation failed")
+
+        class FailingStream:
+            @staticmethod
+            def abort() -> None:
+                raise OSError("sidecar cleanup failed")
+
+        _abort_sidecar_preserving_failure(FailingStream(), primary)
+        self.assertEqual(str(primary), "evaluation failed")
+        self.assertIn(
+            "sidecar cleanup failed",
+            " ".join(getattr(primary, "__notes__", ())),
+        )
+
+    def test_sidecar_finalize_failure_remains_primary_when_abort_fails(self) -> None:
+        class FailingStream:
+            @staticmethod
+            def finalize(*, recover_exact: bool = False) -> None:
+                if not recover_exact:
+                    raise AssertionError("exact recovery was not requested")
+                raise OSError("sidecar fsync failed")
+
+            @staticmethod
+            def abort() -> None:
+                raise OSError("sidecar abort failed")
+
+        with self.assertRaisesRegex(OSError, "sidecar fsync failed") as raised:
+            _finalize_sidecar_preserving_failure(FailingStream())
+
+        self.assertIn(
+            "sidecar abort failed",
+            " ".join(getattr(raised.exception, "__notes__", ())),
+        )
+
     def test_public_parameter_decoders_apply_supervision_contract(self) -> None:
         decoded, unknown = decode_true_parameter(
             '{"rank":3,"seed":99}',
@@ -297,6 +339,169 @@ class HeldOutRunnerTests(unittest.TestCase):
                 _write_report_atomic_no_clobber(path, '{"ok":false}\n')
             self.assertEqual(path.read_text(encoding="utf-8"), '{"ok":true}\n')
             self.assertEqual(list(path.parent.glob("*.tmp")), [])
+            recovered = Path(temporary) / "nested" / "report.json"
+            _write_report_atomic_no_clobber(
+                recovered,
+                '{"ok":true}\n',
+                recover_exact=True,
+            )
+            _write_report_atomic_no_clobber(
+                recovered,
+                '{"ok":true}\n',
+                recover_exact=True,
+            )
+            self.assertEqual(
+                recovered.read_text(encoding="utf-8"),
+                '{"ok":true}\n',
+            )
+
+    def test_calibration_evaluation_recovers_after_third_publication_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = root / "model.pt"
+            checkpoint.write_bytes(b"checkpoint")
+            checkpoint_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+            selection = root / "selection.json"
+            selection.write_bytes(b"{}\n")
+            selection_sha256 = hashlib.sha256(selection.read_bytes()).hexdigest()
+            training_run = root / "training-run.json"
+            training_run.write_bytes(b"{}\n")
+            training_run_sha256 = hashlib.sha256(
+                training_run.read_bytes()
+            ).hexdigest()
+            report = root / "report.json"
+            sidecar = root / "sidecar.ndjson"
+            receipt = root / "receipt.json"
+            audited = SimpleNamespace(
+                manifest_sha256="1" * 64,
+                dataset_sha256="2" * 64,
+                release_root_sha256="3" * 64,
+                corpus_run_id="run-1",
+                provenance=lambda: {"manifest_sha256": "1" * 64},
+            )
+            validation_context = SimpleNamespace(
+                metadata={
+                    "identity": "drawbacktrainer-validation-partition-v1",
+                    "name": "calibration-fit",
+                    "seedSha256": "4" * 64,
+                },
+                game_assignments={},
+            )
+            selected = SimpleNamespace(
+                selected_checkpoint_sha256=checkpoint_sha256,
+                provenance=SimpleNamespace(
+                    release_root_sha256=audited.release_root_sha256,
+                    corpus_run_id=audited.corpus_run_id,
+                    private_validation_manifest_sha256=audited.manifest_sha256,
+                    validation_dataset_sha256=audited.dataset_sha256,
+                ),
+            )
+            predictor = SimpleNamespace(
+                drawback_vocabulary=("A", "B"),
+                drawback_loss_objective="legacy",
+                checkpoint_seed=7,
+                checkpoint_epoch=2,
+                training_run_id="run-1",
+            )
+            arguments = SimpleNamespace(
+                batch_size=8,
+                validation_partition="calibration-fit",
+                calibration_sidecar_output=sidecar,
+                selection_artifact=selection,
+                selection_sha256=selection_sha256,
+                training_run=training_run,
+                training_run_sha256=training_run_sha256,
+                calibration_receipt_output=receipt,
+                output=report,
+                catalog=[],
+                checkpoint=checkpoint,
+                device="cpu",
+                dataset=root / "validation.ndjson",
+                split="validation",
+            )
+            example = CalibrationExample(
+                (2.0, 0.0),
+                0,
+                (False, False),
+            )
+
+            def evaluate(_rows: object, **kwargs: object) -> dict[str, int]:
+                sink = kwargs["calibration_sink"]
+                sink(CalibrationObservation("white", example))
+                sink(CalibrationObservation("black", example))
+                return {"move_examples": 2}
+
+            receipt_attempts = 0
+
+            def publish_receipt(
+                output: Path,
+                _inputs: object,
+                *,
+                recover_exact: bool = False,
+            ) -> None:
+                nonlocal receipt_attempts
+                receipt_attempts += 1
+                self.assertTrue(recover_exact)
+                if receipt_attempts == 1:
+                    raise OSError("injected receipt publication failure")
+                publish_bytes_durable_exact(
+                    output,
+                    b"receipt\n",
+                    label="calibration receipt",
+                )
+
+            with (
+                patch(
+                    "ml.evaluation.cli._release_evaluation_inputs",
+                    return_value=(
+                        audited,
+                        {"maxPlies": 80},
+                        SplitManifest(train=(), validation=(101,), test=()),
+                        lambda: audited,
+                    ),
+                ),
+                patch(
+                    "ml.evaluation.cli._validation_evaluation_context",
+                    return_value=validation_context,
+                ),
+                patch(
+                    "ml.evaluation.cli.load_checkpoint_predictor",
+                    return_value=predictor,
+                ),
+                patch("ml.evaluation.cli._require_checkpoint_corpus_provenance"),
+                patch("ml.evaluation.cli.SYMBOLIC_RULE_IDS", ("A", "B")),
+                patch(
+                    "ml.evaluation.cli.verify_release_selection_bundle",
+                    return_value=SimpleNamespace(artifact=selected),
+                ),
+                patch("ml.evaluation.cli.read_ndjson", return_value=[]),
+                patch(
+                    "ml.evaluation.cli._filter_validation_partition_rows",
+                    return_value=[],
+                ),
+                patch(
+                    "ml.evaluation.cli.load_rule_families",
+                    return_value={"A": "one", "B": "two"},
+                ),
+                patch(
+                    "ml.evaluation.cli.evaluate_held_out",
+                    side_effect=evaluate,
+                ),
+                patch(
+                    "ml.evaluation.cli.write_calibration_receipt",
+                    side_effect=publish_receipt,
+                ),
+            ):
+                with self.assertRaisesRegex(OSError, "injected receipt"):
+                    _evaluate(arguments, None)
+                self.assertTrue(sidecar.is_file())
+                self.assertTrue(report.is_file())
+                self.assertFalse(receipt.exists())
+                self.assertEqual(_evaluate(arguments, None), 0)
+
+            self.assertEqual(receipt.read_bytes(), b"receipt\n")
 
     def test_non_finite_metrics_use_strict_json_null(self) -> None:
         value = _json_value(

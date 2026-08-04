@@ -13,16 +13,19 @@ from dataclasses import dataclass, fields, is_dataclass
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
 import random
 import re
-import tempfile
 from types import MappingProxyType
 from typing import Callable, Iterable, Mapping, Sequence
 
 from ml.training.drawback_ml.corpus_contract import (
     open_audited_private_corpus_split,
+)
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable_exact
+from ml.training.drawback_ml.path_validation import (
+    is_portable_safe_basename,
+    portable_basename_key,
 )
 from ml.training.drawback_ml.symbolic_schema import SYMBOLIC_RULE_IDS
 
@@ -166,21 +169,7 @@ def _json_value(value: object) -> object:
 
 def _write_atomic_no_clobber(path: Path, payload: bytes, label: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as output:
-            output.write(payload)
-            output.flush()
-            os.fsync(output.fileno())
-        try:
-            os.link(temporary, path)
-        except FileExistsError as error:
-            raise ValueError(f"refusing to overwrite {label}: {path}") from error
-    finally:
-        temporary.unlink(missing_ok=True)
+    publish_bytes_durable_exact(path, payload, label=label)
 
 
 class _GateCollector:
@@ -1206,10 +1195,20 @@ def publish_validation_gate(
 ) -> tuple[ContentAddressedFile, ContentAddressedFile, ValidationGateDecision]:
     """Publish immutable evidence and its exhaustive decision."""
 
-    if report_output.parent.resolve() != decision_output.parent.resolve():
+    if not is_portable_safe_basename(report_output.name) or not (
+        is_portable_safe_basename(decision_output.name)
+    ):
+        raise ValueError("validation output file must be a safe basename")
+    resolved_report = report_output.resolve()
+    resolved_decision = decision_output.resolve()
+    if resolved_report == resolved_decision or (
+        resolved_report.parent == resolved_decision.parent
+        and portable_basename_key(report_output.name)
+        == portable_basename_key(decision_output.name)
+    ):
+        raise ValueError("validation report and decision must be distinct")
+    if resolved_report.parent != resolved_decision.parent:
         raise ValueError("validation report and decision must be siblings")
-    if report_output.exists() or decision_output.exists():
-        raise ValueError("validation report and decision outputs must not exist")
     decision = decide_validation_gate(report)
     report_value = {
         "format": REPORT_FORMAT,

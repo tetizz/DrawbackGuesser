@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import ctypes
+from ctypes import wintypes
 from dataclasses import dataclass
 import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import shlex
 import shutil
 import stat
@@ -53,6 +56,10 @@ from .durable_publish import publish_bytes_durable
 
 AUDIT_TOOL_ID = "capturable-fixed-confirmation-audit/v1"
 CONVERSION_ID = "player-private-trace-to-schema8/v1"
+PROCESS_TERMINATION_GRACE_SECONDS = 5.0
+CREATE_SUSPENDED = 0x00000004
+JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 GENERATOR_DIRECTORY = "engine-generator-74eb6fc"
 GENERATOR_ENGINE_COMMIT = (
     "74eb6fc95571994bd96b7a351278f3f74f0972e3"
@@ -1097,6 +1104,309 @@ def _isolated_package_environment(
     return environment, owner
 
 
+class _JobObjectBasicLimitInformation(ctypes.Structure):
+    _fields_ = (
+        ("per_process_user_time_limit", ctypes.c_int64),
+        ("per_job_user_time_limit", ctypes.c_int64),
+        ("limit_flags", wintypes.DWORD),
+        ("minimum_working_set_size", ctypes.c_size_t),
+        ("maximum_working_set_size", ctypes.c_size_t),
+        ("active_process_limit", wintypes.DWORD),
+        ("affinity", ctypes.c_size_t),
+        ("priority_class", wintypes.DWORD),
+        ("scheduling_class", wintypes.DWORD),
+    )
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = tuple(
+        (name, ctypes.c_uint64)
+        for name in (
+            "read_operation_count",
+            "write_operation_count",
+            "other_operation_count",
+            "read_transfer_count",
+            "write_transfer_count",
+            "other_transfer_count",
+        )
+    )
+
+
+class _JobObjectExtendedLimitInformation(ctypes.Structure):
+    _fields_ = (
+        ("basic_limit_information", _JobObjectBasicLimitInformation),
+        ("io_info", _IoCounters),
+        ("process_memory_limit", ctypes.c_size_t),
+        ("job_memory_limit", ctypes.c_size_t),
+        ("peak_process_memory_used", ctypes.c_size_t),
+        ("peak_job_memory_used", ctypes.c_size_t),
+    )
+
+
+class _WindowsJob:
+    def __init__(self) -> None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_job = kernel32.CreateJobObjectW
+        create_job.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+        create_job.restype = wintypes.HANDLE
+        handle = create_job(None, None)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        self._handle: wintypes.HANDLE | None = handle
+        information = _JobObjectExtendedLimitInformation()
+        information.basic_limit_information.limit_flags = (
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        )
+        set_information = kernel32.SetInformationJobObject
+        set_information.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        )
+        set_information.restype = wintypes.BOOL
+        if not set_information(
+            handle,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            error = ctypes.WinError(ctypes.get_last_error())
+            self.close()
+            raise error
+
+    def assign_and_resume(self, process: subprocess.Popen[str]) -> None:
+        if self._handle is None:
+            raise OSError("process containment is already closed")
+        raw_process_handle = getattr(process, "_handle", None)
+        if raw_process_handle is None:
+            raise OSError("spawned process handle is unavailable")
+        process_handle = wintypes.HANDLE(int(raw_process_handle))
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        assign = kernel32.AssignProcessToJobObject
+        assign.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        assign.restype = wintypes.BOOL
+        if not assign(self._handle, process_handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        ntdll = ctypes.WinDLL("ntdll")
+        resume = ntdll.NtResumeProcess
+        resume.argtypes = (wintypes.HANDLE,)
+        resume.restype = ctypes.c_long
+        status = int(resume(process_handle))
+        if status < 0:
+            raise OSError(
+                "cannot resume contained process: "
+                f"NTSTATUS 0x{status & 0xFFFF_FFFF:08x}"
+            )
+
+    def close(self) -> None:
+        handle = self._handle
+        if handle is None:
+            return
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+        if not close_handle(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        self._handle = None
+
+
+def _popen_contained(
+    arguments: Sequence[str],
+    **options: object,
+) -> tuple[subprocess.Popen[str], _WindowsJob | None]:
+    if os.name != "nt":
+        options["start_new_session"] = True
+        return subprocess.Popen(list(arguments), **options), None
+    job = _WindowsJob()
+    options["creationflags"] = int(options.get("creationflags", 0)) | getattr(
+        subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+    ) | CREATE_SUSPENDED
+    try:
+        process: subprocess.Popen[str] = subprocess.Popen(
+            list(arguments), **options
+        )
+    except BaseException:
+        job.close()
+        raise
+    try:
+        job.assign_and_resume(process)
+    except BaseException as error:
+        try:
+            job.close()
+        except BaseException as cleanup_error:
+            error.add_note(f"job cleanup also failed: {cleanup_error!r}")
+        try:
+            process.kill()
+            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        _close_process_streams(process)
+        raise
+    return process, job
+
+
+def _close_process_streams(process: subprocess.Popen[str]) -> None:
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def _windows_taskkill(process_id: int) -> None:
+    system_directory = _windows_known_directory("system")
+    windows_directory = _windows_known_directory("windows")
+    command_processor = (system_directory / "cmd.exe").resolve(strict=True)
+    if command_processor.parent != system_directory:
+        raise OSError("command processor resolved outside the Windows system directory")
+    taskkill = (system_directory / "taskkill.exe").resolve(strict=True)
+    if taskkill.parent != system_directory:
+        raise OSError("taskkill resolved outside the Windows system directory")
+    taskkill_status = taskkill.stat()
+    taskkill_identity = (
+        taskkill_status.st_dev,
+        taskkill_status.st_ino,
+        taskkill_status.st_size,
+        taskkill_status.st_mtime_ns,
+        taskkill_status.st_ctime_ns,
+    )
+    completed = subprocess.run(
+        [str(taskkill), "/PID", str(process_id), "/T", "/F"],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=PROCESS_TERMINATION_GRACE_SECONDS,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        env={
+            "SystemRoot": str(windows_directory),
+            "WINDIR": str(windows_directory),
+            "ComSpec": str(command_processor),
+            "PATH": str(system_directory),
+            "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+        },
+    )
+    taskkill_status = taskkill.stat()
+    if (
+        taskkill_status.st_dev,
+        taskkill_status.st_ino,
+        taskkill_status.st_size,
+        taskkill_status.st_mtime_ns,
+        taskkill_status.st_ctime_ns,
+    ) != taskkill_identity:
+        raise OSError("taskkill identity changed during process-tree cleanup")
+    if completed.returncode != 0:
+        raise OSError(
+            f"taskkill failed with exit code {completed.returncode}"
+        )
+
+
+def _terminate_process_tree(
+    process: subprocess.Popen[str],
+    containment: _WindowsJob | None,
+) -> None:
+    cleanup_error: BaseException | None = None
+    if os.name == "nt":
+        try:
+            if containment is None:
+                _windows_taskkill(process.pid)
+            else:
+                containment.close()
+        except (
+            OSError,
+            subprocess.SubprocessError,
+            CapturableDatasetError,
+        ) as error:
+            cleanup_error = error
+            try:
+                process.kill()
+            except OSError:
+                pass
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+        try:
+            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        # The group leader can settle before a descendant that ignored
+        # SIGTERM. Always force the remaining process group down.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+    finally:
+        _close_process_streams(process)
+    if cleanup_error is not None:
+        raise OSError("Windows process-tree cleanup failed") from cleanup_error
+
+
+def _run_bounded(
+    arguments: Sequence[str],
+    *,
+    cwd: Path,
+    environment: Mapping[str, str],
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    process, containment = _popen_contained(
+        arguments,
+        cwd=cwd,
+        shell=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=dict(environment),
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except BaseException as error:
+        try:
+            _terminate_process_tree(process, containment)
+        except BaseException as cleanup_error:
+            error.add_note(
+                f"process-tree cleanup also failed: {cleanup_error!r}"
+            )
+        raise
+    completed = subprocess.CompletedProcess(
+        list(arguments), process.returncode, stdout, stderr
+    )
+    try:
+        _terminate_process_tree(process, containment)
+    except BaseException as cleanup_error:
+        if completed.returncode != 0:
+            child_error = subprocess.CalledProcessError(
+                completed.returncode,
+                completed.args,
+                output=completed.stdout,
+                stderr=completed.stderr,
+            )
+            child_error.add_note(
+                f"process-tree cleanup also failed: {cleanup_error!r}"
+            )
+            raise child_error from cleanup_error
+        raise
+    return completed
+
+
 def _capture_output(
     arguments: Sequence[str],
     *,
@@ -1105,19 +1415,18 @@ def _capture_output(
     environment: Mapping[str, str] | None = None,
 ) -> str:
     try:
-        completed = subprocess.run(
-            list(arguments),
+        completed = _run_bounded(
+            arguments,
             cwd=cwd,
-            check=False,
-            capture_output=True,
-            text=True,
-            env=(
+            environment=(
                 dict(environment)
                 if environment is not None
                 else _sanitized_environment()
             ),
             timeout=30,
         )
+    except subprocess.CalledProcessError as error:
+        raise CapturableDatasetError(f"{operation} failed") from error
     except (OSError, subprocess.TimeoutExpired) as error:
         raise CapturableDatasetError(
             f"{operation} could not run"
@@ -1525,19 +1834,22 @@ def _run(
     environment: Mapping[str, str] | None = None,
 ) -> None:
     try:
-        completed = subprocess.run(
-            list(arguments),
+        completed = _run_bounded(
+            arguments,
             cwd=cwd,
-            check=False,
-            capture_output=True,
-            text=True,
-            env=(
+            environment=(
                 dict(environment)
                 if environment is not None
                 else _sanitized_environment()
             ),
             timeout=timeout,
         )
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or "").strip().splitlines()
+        suffix = f": {detail[-1]}" if detail else ""
+        raise CapturableDatasetError(
+            f"{operation} failed{suffix}"
+        ) from error
     except (OSError, subprocess.TimeoutExpired) as error:
         raise CapturableDatasetError(f"{operation} could not run") from error
     if completed.returncode != 0:

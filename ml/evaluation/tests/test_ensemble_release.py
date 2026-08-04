@@ -7,10 +7,12 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from ml.evaluation.ensemble_release import (
     ENSEMBLE_TRAINING_SEEDS,
     EnsembleMember,
+    _write_atomic_no_clobber,
     load_ensemble_release,
     resolve_member_checkpoint,
     verify_ensemble_release,
@@ -29,6 +31,7 @@ from ml.evaluation.validation_partition import VALIDATION_PARTITION_IDENTITY
 from ml.evaluation.tests.training_corpus_set_fixture import (
     training_corpus_set_fixture,
 )
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable_exact
 
 
 def canonical(value: object) -> bytes:
@@ -194,6 +197,31 @@ def rewrite_reference(path: Path, value: object) -> ContentAddressedJson:
 
 
 class EnsembleReleaseTest(unittest.TestCase):
+    def test_publication_retry_accepts_only_exact_committed_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            output = Path(raw) / "ensemble.json"
+            payload = b'{"ensemble":true}\n'
+
+            def fail_after_publication(
+                path: Path,
+                value: bytes,
+                *,
+                label: str,
+            ) -> None:
+                publish_bytes_durable_exact(path, value, label=label)
+                raise OSError("simulated post-publication failure")
+
+            with patch(
+                "ml.evaluation.ensemble_release.publish_bytes_durable_exact",
+                side_effect=fail_after_publication,
+            ):
+                with self.assertRaisesRegex(OSError, "post-publication"):
+                    _write_atomic_no_clobber(output, payload)
+
+            _write_atomic_no_clobber(output, payload)
+            with self.assertRaisesRegex(ValueError, "overwrite"):
+                _write_atomic_no_clobber(output, b"different\n")
+
     def test_create_release_cli_help_documents_fixed_member_order(self) -> None:
         help_text = build_create_ensemble_release_parser().format_help()
         normalized_help = " ".join(help_text.split())
@@ -405,9 +433,15 @@ class EnsembleReleaseTest(unittest.TestCase):
             root = Path(raw)
             output, selections, runs = build_ensemble(root)
             original = output.read_bytes()
+            self.assertEqual(
+                write_ensemble_release(output, selections, runs),
+                output,
+            )
+            self.assertEqual(output.read_bytes(), original)
+            output.write_bytes(b"competitor\n")
             with self.assertRaisesRegex(ValueError, "overwrite"):
                 write_ensemble_release(output, selections, runs)
-            self.assertEqual(output.read_bytes(), original)
+            self.assertEqual(output.read_bytes(), b"competitor\n")
             self.assertEqual(list(root.glob(".ensemble.json.*.tmp")), [])
 
     def test_loader_rejects_duplicate_keys_and_noncanonical_json(self) -> None:

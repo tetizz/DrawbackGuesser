@@ -92,8 +92,12 @@ Checkpoint predictors evaluate bounded batches (256 examples by default);
 predictors without a batch API retain the scalar compatibility path.
 The JSON output is an envelope containing measured metrics plus exact
 checkpoint, manifest, and held-out dataset SHA-256 provenance. Test evaluation
-remains a separate, one-shot promotion action after the frozen validation
-protocol passes.
+remains a separate promotion action after the frozen validation protocol
+passes. The current sealed-test opener records consumption under the trusted
+Git common directory. This prevents accidental or repeated use only within
+worktrees sharing that directory; the marker is user-deletable and is not
+shared with another clone. A global one-shot guarantee requires an external
+append-only authority or signed single-use lease keyed by corpus identity.
 
 After selecting one checkpoint for each fixed training seed, publish the
 authenticated three-member ensemble in seed order (`20260811`, `20260812`,
@@ -249,9 +253,11 @@ separate provisioning and an independently authenticated no-label
 mount/access-domain receipt; Stage B requires separate label-aware
 authorization. Neither the dry-run nor transcript claims that labels were
 unmounted. The sealed test is absent from the workflow schema.
-The sealed-test opener is implemented by `ml.evaluation.sealed_test`; this diagnostic command deliberately rejects
-`--split test`. Its whole-validation report is useful for research and
-debugging but is not by itself a promotion decision.
+The sealed-test opener is implemented by `ml.evaluation.sealed_test`; its
+create-only marker is a local operator safeguard, not an external consumption
+authority. This diagnostic command deliberately rejects `--split test`. Its
+whole-validation report is useful for research and debugging but is not by
+itself a promotion decision.
 
 The identity audit verifies exact bytes, labels, evaluator request facts, and
 catalog coverage. Release-safe private split audits also run the independent
@@ -351,13 +357,21 @@ py -3.11 -m ml.evaluation.validation_reproduction `
 
 The parent requires a clean approved source revision and exact dependency
 locks, pins the authenticated validation split, and launches
-`ml.evaluation.validation_gate` in a separate process with deterministic
-Python settings. Candidate and input hashes plus the inference transcript must
-match exactly; every reproduced metric must be within `1e-6`. The canonical
-no-clobber receipt binds the original and reproduced evidence, validation
-corpus, catalogs, source, locks, Python executable, evaluator identity, and
-exact child command. This command exposes no test partition or private-test
-path and rejects a non-passing original or reproduced decision.
+`ml.evaluation.validation_gate` in a separate `-I -S` process with a closed,
+authenticated import path. Candidate and input hashes plus the inference
+transcript must match exactly; every reproduced metric must be within `1e-6`.
+The canonical no-clobber receipt binds the original and reproduced evidence,
+validation corpus, catalogs, source, locks, Git and Python executable
+identities, required-distribution metadata, the loaded Python module closure,
+evaluator identity, and exact child command. Release authorization rejects the
+legacy receipt shape that lacks those runtime fields. This command exposes no
+test partition or private-test path and rejects a non-passing original or
+reproduced decision.
+
+The module-closure receipt covers Python modules and their origin/cache files.
+Python's module registry does not expose every native DLL loaded by an
+extension or arbitrary non-module data file, so this is reproducible Python
+runtime provenance rather than complete operating-system binary attestation.
 
 ## Production browser parity
 
@@ -444,3 +458,20 @@ The transcript and evidence also bind the SHA-256 of the exact browser
 executable and its reported version. Tracked changes or untracked source under
 `apps`, `packages`, `ml`, or `scripts` invalidate the clean-source attestation;
 ignored release data does not.
+
+## Local publication and recovery boundary
+
+Release artifacts are published create-only. Deterministic workflows accept an
+existing path only after authenticating that its complete, stable bytes match
+the current run; a different existing file is never replaced. If a multi-file
+publication stops after its first artifact, that exact partial publication is
+retained so a retry can converge without deleting a pathname that may have been
+replaced concurrently. A mismatched partial requires operator review and a new
+empty output location.
+
+On Windows, a failure after a streaming writer closes its uniquely named
+scratch file can leave that scratch file in the private run directory. This is
+intentional: portable Python cannot safely unlink a closed authenticated object
+if another process can replace its pathname. Run evaluation in an ACL-private
+directory. Adversarial mutation by another process running as the same OS user
+inside that directory is outside this local attestation boundary.

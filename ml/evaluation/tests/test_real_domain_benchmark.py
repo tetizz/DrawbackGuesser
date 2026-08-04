@@ -3,14 +3,18 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import chess
 
+import ml.evaluation.real_domain_benchmark as real_domain_benchmark
 from ml.evaluation.real_domain_benchmark import (
     ANALYSIS_FORMAT,
     CORPUS_FORMAT,
@@ -136,6 +140,261 @@ class RealDomainBenchmarkTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_artifact_publication_recovers_only_an_exact_prior_copy(self) -> None:
+        output = self.directory / "recoverable-report.json"
+        value = {"format": "test", "version": 1}
+        publish = real_domain_benchmark.publish_bytes_durable_exact
+
+        def fail_after_publication(
+            path: Path,
+            payload: bytes,
+            *,
+            label: str,
+        ) -> None:
+            publish(path, payload, label=label)
+            raise OSError("simulated failure after publication")
+
+        with mock.patch.object(
+            real_domain_benchmark,
+            "publish_bytes_durable_exact",
+            side_effect=fail_after_publication,
+        ):
+            with self.assertRaisesRegex(OSError, "simulated failure"):
+                real_domain_benchmark._publish_no_clobber(output, value)
+
+        expected = canonical(value)
+        self.assertEqual(output.read_bytes(), expected)
+        self.assertEqual(
+            real_domain_benchmark._publish_no_clobber(output, value),
+            expected,
+        )
+        with self.assertRaisesRegex(ValueError, "do not match"):
+            real_domain_benchmark._publish_no_clobber(
+                output,
+                {"format": "different", "version": 1},
+            )
+
+    def trusted_taskkill_fixture(self) -> tuple[Path, Path]:
+        system_directory = self.directory / "trusted-windows" / "System32"
+        system_directory.mkdir(parents=True)
+        taskkill = system_directory / "taskkill.exe"
+        taskkill.write_bytes(b"authenticated taskkill fixture")
+        return system_directory, taskkill
+
+    def test_taskkill_ignores_hostile_environment_and_is_bounded(self) -> None:
+        system_directory, taskkill = self.trusted_taskkill_fixture()
+        hostile_root = self.directory / "hostile-windows"
+        hostile_taskkill = hostile_root / "System32" / "taskkill.exe"
+        hostile_taskkill.parent.mkdir(parents=True)
+        hostile_taskkill.write_bytes(b"hostile")
+        completed = subprocess.CompletedProcess([], 0)
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {
+                    "SystemRoot": str(hostile_root),
+                    "WINDIR": str(hostile_root),
+                    "PATH": str(hostile_taskkill.parent),
+                    "GIT_DIR": str(self.directory / "hostile-git"),
+                },
+                clear=False,
+            ),
+            mock.patch.object(
+                real_domain_benchmark,
+                "_windows_system_directory",
+                return_value=system_directory,
+            ),
+            mock.patch.object(
+                real_domain_benchmark.subprocess,
+                "run",
+                return_value=completed,
+            ) as run,
+        ):
+            real_domain_benchmark._windows_taskkill(12345)
+        arguments = run.call_args.args[0]
+        options = run.call_args.kwargs
+        self.assertEqual(Path(arguments[0]), taskkill)
+        self.assertNotEqual(Path(arguments[0]), hostile_taskkill)
+        self.assertEqual(
+            options["timeout"],
+            real_domain_benchmark.PROCESS_TERMINATION_GRACE_SECONDS,
+        )
+        self.assertEqual(
+            options["env"],
+            {
+                "SystemRoot": str(system_directory.parent),
+                "WINDIR": str(system_directory.parent),
+            },
+        )
+
+    @unittest.skipUnless(os.name == "nt", "Windows-only runtime contract")
+    def test_analyzer_runtime_environment_ignores_hostile_system_root(self) -> None:
+        hostile = str(self.directory / "hostile-windows")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SystemRoot": hostile,
+                "WINDIR": hostile,
+                "PATH": hostile,
+                "PATHEXT": ".EVIL",
+            },
+            clear=False,
+        ):
+            environment = (
+                real_domain_benchmark._trusted_windows_runtime_environment()
+            )
+        system = real_domain_benchmark._windows_system_directory()
+        self.assertEqual(environment["SystemRoot"], str(system.parent))
+        self.assertEqual(environment["WINDIR"], str(system.parent))
+        self.assertEqual(environment["ComSpec"], str(system / "cmd.exe"))
+        self.assertEqual(environment["PATH"], str(system))
+        self.assertEqual(environment["PATHEXT"], ".COM;.EXE;.BAT;.CMD")
+
+    def test_taskkill_nonzero_and_identity_change_fail_closed(self) -> None:
+        system_directory, taskkill = self.trusted_taskkill_fixture()
+        with (
+            mock.patch.object(
+                real_domain_benchmark,
+                "_windows_system_directory",
+                return_value=system_directory,
+            ),
+            mock.patch.object(
+                real_domain_benchmark.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 5),
+            ),
+            self.assertRaisesRegex(OSError, "exit code 5"),
+        ):
+            real_domain_benchmark._windows_taskkill(12345)
+
+        def tamper_taskkill(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            taskkill.write_bytes(b"changed during cleanup")
+            return subprocess.CompletedProcess([], 0)
+
+        with (
+            mock.patch.object(
+                real_domain_benchmark,
+                "_windows_system_directory",
+                return_value=system_directory,
+            ),
+            mock.patch.object(
+                real_domain_benchmark.subprocess,
+                "run",
+                side_effect=tamper_taskkill,
+            ),
+            self.assertRaisesRegex(OSError, "identity changed"),
+        ):
+            real_domain_benchmark._windows_taskkill(12345)
+
+    def test_tree_cleanup_closes_job_before_bounded_wait(self) -> None:
+        events: list[tuple[str, float | None]] = []
+
+        class FakeProcess:
+            pid = 12345
+
+            def poll(self) -> None:
+                return None
+
+            def kill(self) -> None:
+                events.append(("kill", None))
+
+            def wait(self, timeout: float | None = None) -> int:
+                events.append(("wait", timeout))
+                return 1
+
+        class FakeKillJob:
+            def close(self) -> None:
+                events.append(("close-job", None))
+
+        def timed_out_taskkill(process_id: int) -> None:
+            self.assertEqual(process_id, 12345)
+            events.append(("taskkill", None))
+            raise subprocess.TimeoutExpired("taskkill", 5)
+
+        with (
+            mock.patch.object(real_domain_benchmark.os, "name", "nt"),
+            mock.patch.object(
+                real_domain_benchmark,
+                "_windows_taskkill",
+                side_effect=timed_out_taskkill,
+            ),
+            self.assertRaisesRegex(
+                RealDomainBenchmarkError,
+                "process-tree cleanup failed",
+            ),
+        ):
+            real_domain_benchmark._kill_process_tree(  # type: ignore[arg-type]
+                FakeProcess(),
+                FakeKillJob(),  # type: ignore[arg-type]
+            )
+        self.assertEqual(events[0][0], "taskkill")
+        self.assertLess(
+            events.index(("close-job", None)),
+            next(
+                index
+                for index, event in enumerate(events)
+                if event[0] == "wait"
+            ),
+        )
+        waits = [timeout for event, timeout in events if event == "wait"]
+        self.assertTrue(waits)
+        self.assertTrue(all(timeout is not None for timeout in waits))
+
+    def test_cleanup_failure_does_not_mask_primary_failure(self) -> None:
+        primary = RealDomainBenchmarkError(
+            "approved post-game analyzer timed out"
+        )
+        cleanup = OSError("taskkill failed with exit code 5")
+        with self.assertRaisesRegex(
+            RealDomainBenchmarkError,
+            "approved post-game analyzer timed out",
+        ) as raised:
+            real_domain_benchmark._raise_primary_with_cleanup(
+                primary,
+                (cleanup,),
+            )
+        self.assertIs(raised.exception, primary)
+        self.assertIsInstance(raised.exception.__cause__, RealDomainBenchmarkError)
+        self.assertIn("taskkill failed", str(raised.exception.__cause__))
+        self.assertTrue(
+            any("cleanup also failed" in note for note in primary.__notes__)
+        )
+
+        locked_directory = self.directory / "locked-analysis"
+        locked_directory.mkdir()
+        contextual_primary = RealDomainBenchmarkError(
+            "approved analyzer output exceeds its bound"
+        )
+        with (
+            mock.patch.object(
+                real_domain_benchmark.tempfile,
+                "mkdtemp",
+                return_value=str(locked_directory),
+            ),
+            mock.patch.object(
+                real_domain_benchmark.shutil,
+                "rmtree",
+                side_effect=OSError("locked"),
+            ),
+            mock.patch.object(
+                real_domain_benchmark.time,
+                "monotonic",
+                side_effect=(100.0, 106.0),
+            ),
+            self.assertRaisesRegex(
+                RealDomainBenchmarkError,
+                "output exceeds its bound",
+            ) as contextual_raised,
+        ):
+            with real_domain_benchmark._temporary_analysis_directory():
+                raise contextual_primary
+        self.assertIs(contextual_raised.exception, contextual_primary)
+        self.assertIn(
+            "temporary files remained locked",
+            str(contextual_raised.exception.__cause__),
+        )
 
     def runtime_dependencies(self) -> tuple[ContentAddressedJson, ...]:
         paths = (
@@ -827,7 +1086,7 @@ class RealDomainBenchmarkTests(unittest.TestCase):
             load_corpus(changed)[0].semantic_sha256,
         )
 
-    def test_rejects_wrong_analysis_identity_domain_and_no_clobber(self) -> None:
+    def test_rejects_wrong_analysis_identity_and_recovers_exact_report(self) -> None:
         corpus, labels, unused, public, private = self.inputs()
 
         class WrongAnalyzer(FakeAnalyzer):
@@ -855,7 +1114,15 @@ class RealDomainBenchmarkTests(unittest.TestCase):
             bundle_path,
             hashlib.sha256(bundle_path.read_bytes()).hexdigest(),
         )
-        with self.assertRaises(FileExistsError):
+        recovered = publish_real_domain_benchmark_report(
+            prediction_bundle=bundle_reference,
+            revealed_labels=labels,
+            observed_catalog=ContentAddressedJson(CATALOG, CATALOG_SHA),
+            output=self.directory / "report.json",
+        )
+        self.assertEqual(recovered, report)
+        (self.directory / "report.json").write_bytes(b"competitor\n")
+        with self.assertRaisesRegex(ValueError, "do not match"):
             publish_real_domain_benchmark_report(
                 prediction_bundle=bundle_reference,
                 revealed_labels=labels,
@@ -887,7 +1154,7 @@ class RealDomainBenchmarkTests(unittest.TestCase):
                 (
                     "import hashlib, json, os",
                     "from pathlib import Path",
-                    "assert 'PATH' not in os.environ",
+                    "assert Path(os.environ['PATH']).resolve() == Path(os.environ['SYSTEMROOT']) / 'System32'",
                     "root = Path.cwd().resolve()",
                     "assert Path(__file__).resolve().parent == root",
                     "keys = {",

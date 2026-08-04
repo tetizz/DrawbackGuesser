@@ -15,11 +15,13 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
 import re
 import tempfile
 from typing import BinaryIO, Mapping, Sequence
+
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable_exact
+from ml.training.drawback_ml.path_validation import is_portable_safe_basename
 
 from ml.training.drawback_ml.corpus_contract import (
     open_audited_hard_negative_train_corpus,
@@ -397,23 +399,16 @@ def _source_value(
 
 def _write_atomic_no_clobber(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "wb") as output:
-            output.write(payload)
-            output.flush()
-            os.fsync(output.fileno())
-        try:
-            os.link(temporary, path)
-        except FileExistsError as error:
-            raise ValueError(
-                f"refusing to overwrite training-frequency artifact: {path}"
-            ) from error
-    finally:
-        temporary.unlink(missing_ok=True)
+        publish_bytes_durable_exact(
+            path,
+            payload,
+            label="training-frequency artifact",
+        )
+    except ValueError as error:
+        raise ValueError(
+            f"refusing to overwrite training-frequency artifact: {path}"
+        ) from error
 
 
 def write_training_frequency_artifact(
@@ -515,14 +510,8 @@ def _parse_binding(
     expected = {"file", "sha256", "bytes"} if with_bytes else {"file", "sha256"}
     _exact_keys(binding, expected, label)
     filename = binding.get("file")
-    if (
-        not isinstance(filename, str)
-        or not filename
-        or Path(filename).name != filename
-        or "/" in filename
-        or "\\" in filename
-    ):
-        raise ValueError(f"{label}.file must be a basename")
+    if not is_portable_safe_basename(filename):
+        raise ValueError(f"{label}.file must be a safe basename")
     _digest(binding.get("sha256"), f"{label}.sha256")
     if with_bytes:
         _nonnegative_int(binding.get("bytes"), f"{label}.bytes")

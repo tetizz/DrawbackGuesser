@@ -34,7 +34,7 @@ TypeScript verification receipt. Digest strings without both artifacts are
 not sufficient.
 
 The accepted ledger is canonical
-`drawbackguesser-schema9-corpus-ledger` version 2 with:
+`drawbackguesser-schema9-corpus-ledger` version 3 with:
 
 - a valid self-hash over the canonical payload excluding `contentSha256`;
 - exact top-level and nested fields, with unknown fields rejected;
@@ -52,12 +52,15 @@ The accepted ledger is canonical
   player-parameter seed streams across all four source splits, with
   independently recomputed partition commitments; and
 - full Guesser, converter, and producer commit identities;
+- one exact producer runtime-tree identity, repeated by every launch and
+  completion receipt and reproduced from each recorded Engine commit;
 - a content-derived parser/converter/scheduler/verifier execution manifest;
   and
 - exact Engine-scheduler replay of every game index, seed, parameter seed,
   label pair, game ID, profile, and initial position.
 
 Every stage also requires the direct-sibling TypeScript verification receipt
+version 2,
 `schema9-ledger-verification-<ledger-file-sha256>.json`. Python verifies its
 actual file bytes against the caller-supplied receipt SHA-256, then verifies
 its canonical self-hash, ledger file/content binding, complete input-set
@@ -120,12 +123,15 @@ final-report publication fails. Changing a report name, aliasing Stage A,
 serializing a second Stage B, or freezing another otherwise valid pair against
 the same ledger/test cannot create another marker and cannot reopen the test.
 
-The direct-sibling workflow directory is the trusted local consumption
-registry. The one-access guarantee assumes that this registry is not copied,
-deleted, or replaced and that all evaluators use the same filesystem. A
-cross-host or adversarial-copy guarantee requires an external append-only
-registry keyed by sealed-corpus identity; this local workflow does not claim that
-stronger distributed guarantee.
+By default the trusted local consumption registry is
+`<Git common directory>/drawbackguesser/sealed-corpus-consumption-v1`; callers
+may explicitly provide another registry. It prevents accidental or repeated
+use only while trusted evaluators share and preserve that exact directory. A
+repository owner can delete or replace the marker, and another clone has a
+different Git common directory. Global one-shot enforcement requires an
+external append-only authority, or a signed single-use lease issued by that
+authority, keyed by sealed-corpus identity. This local workflow does not claim
+that guarantee.
 
 ## Final report authentication
 

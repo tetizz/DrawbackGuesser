@@ -161,31 +161,45 @@ py -3.11 -B -E -s -m ml.training.drawback_ml.capturable_fixed_blend `
 ```
 
 Promotion additionally requires the frozen 20,000-replicate whole-game paired
-bootstrap and minimum observed Top-1 gain. A failure or exception never
-reopens the consumed test.
+bootstrap and minimum observed Top-1 gain. Within the preserved private
+experiment root, a failure or exception leaves the local consumption marker in
+place. This is a trusted-operator safeguard, not a global one-shot guarantee.
 
 After a treatment wins validation and a new test split has been preregistered,
-evaluate the authenticated control and treatment together:
+evaluate the authenticated control and treatment together. Supply the exact
+SHA-256 recorded when the sealed corpus was preregistered; do not derive or
+replace it after the evaluation has been authorized:
 
 ```powershell
+$freshTestSha256 = '<64-character SHA-256 from the preregistration record>'
 py -m ml.training.drawback_ml.capturable_experiment evaluate-treatment `
   --comparison ..\DrawbackTrainingData\treatment-comparison.json `
   --test ..\DrawbackTrainingData\fresh-test.ndjson `
+  --test-sha256 $freshTestSha256 `
   --output ..\DrawbackTrainingData\paired-sealed-evaluation.json
 ```
 
 The paired evaluator rejects altered comparison/checkpoint identities and
 train/validation overlap, loads the fresh test once, evaluates both frozen
 models without an intervening decision, and publishes one no-clobber report.
+By default its create-only consumption marker lives under this checkout's Git
+common directory. That guard prevents accidental or repeated use only among
+trusted worktrees sharing that same common directory. A repository owner can
+delete the marker, and another clone has a different registry. Global one-shot
+enforcement therefore requires an external append-only authority that issues a
+signed, single-use lease keyed by the sealed-corpus identity; this repository
+does not implement that authority.
 It reports the preregistered primary ranking separately from the release
 decision. Release additionally requires non-regression in Top-1, Top-3, NLL,
 Brier score, calibration error, every declared move horizon, trigger accuracy,
 and forced-move accuracy.
 
 ```powershell
+$capturableTestSha256 = '<64-character SHA-256 from the preregistration record>'
 py -m ml.training.drawback_ml.capturable_experiment evaluate `
   --checkpoint ..\DrawbackTrainingData\capturable-selection-run\model.pt `
   --test ..\DrawbackTrainingData\capturable-test.ndjson `
+  --test-sha256 $capturableTestSha256 `
   --output ..\DrawbackTrainingData\capturable-sealed-evaluation.json
 ```
 
@@ -404,3 +418,19 @@ mask contract; it never receives labels or hidden engine state. Plain
 `v2-gru` checkpoints remain unsupported because they do not provide the hybrid
 legality boundary. Generated artifacts are release outputs and should not be
 committed without an explicit model-release review.
+
+## Checkpoint publication boundary
+
+Checkpoints are streamed to an exclusive same-directory scratch file, hashed
+through the still-open writer, fsynced, and then published create-only. Exact
+retry recovery authenticates the complete prior checkpoint and never replaces
+different bytes. On Windows, a failed or exact-recovery attempt may retain its
+unpredictably named scratch file because deleting a closed pathname cannot be
+made race-free with portable Python. Keep run directories private to the
+current OS user and remove retained scratch files only after authenticating the
+published checkpoint. Generated checkpoints, scratch files, and datasets must
+not be committed.
+
+The legacy in-memory `train` command claims a new output directory before
+training and refuses to reuse it. This prevents a shorter rerun from replacing
+early epochs while silently leaving stale later checkpoints from an older run.

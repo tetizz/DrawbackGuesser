@@ -1,7 +1,5 @@
 import console from "node:console";
-import { delimiter, resolve } from "node:path";
-import { spawnSync } from "node:child_process";
-import process from "node:process";
+import { join, resolve } from "node:path";
 import {
   AUDITED_CAPTURABLE_KING_RULE_IDS,
 } from "../engine/packages/drawback-engine/dist/index.js";
@@ -20,12 +18,22 @@ import {
   CAPTURABLE_SYMBOLIC_FEATURE_VERSION,
   CAPTURABLE_SYMBOLIC_RULE_COUNT,
 } from "../packages/trace-to-dataset/dist/index.js";
+import { runIsolatedPython } from "./isolated-python.mjs";
 
 const repositoryRoot = resolve(import.meta.dirname, "..");
 const pythonPath = resolve(repositoryRoot, "ml", "training");
-const existingPythonPath = process.env["PYTHONPATH"];
+const drawbackPackagePath = join(pythonPath, "drawback_ml");
 const command = [
+  "import importlib.machinery",
   "import json",
+  "import sys",
+  "import types",
+  `_drawback_package_path = ${JSON.stringify(drawbackPackagePath)}`,
+  "_drawback_package = types.ModuleType('drawback_ml')",
+  "_drawback_package.__package__ = 'drawback_ml'",
+  "_drawback_package.__path__ = [_drawback_package_path]",
+  "_drawback_package.__spec__ = importlib.machinery.ModuleSpec('drawback_ml', loader=None, is_package=True)",
+  "sys.modules['drawback_ml'] = _drawback_package",
   "from drawback_ml.capturable_records import (",
   "  CAPTURABLE_OPPORTUNITY_FEATURE_VERSION,",
   "  CAPTURABLE_OPPORTUNITY_FIELDS,",
@@ -43,30 +51,15 @@ const command = [
   "  'opportunityShape': CAPTURABLE_OPPORTUNITY_SHAPE,",
   "}, separators=(',', ':')))",
 ].join("\n");
-const result = spawnSync("python", ["-c", command], {
-  cwd: repositoryRoot,
-  encoding: "utf8",
-  windowsHide: true,
-  env: {
-    ...process.env,
-    PYTHONPATH:
-      existingPythonPath === undefined || existingPythonPath.length === 0
-        ? pythonPath
-        : `${pythonPath}${delimiter}${existingPythonPath}`,
-  },
-});
-if (result.error !== undefined) {
-  throw result.error;
-}
-if (result.status !== 0) {
-  throw new Error(
-    `Python capturable vocabulary inspection failed: ${result.stderr.trim()}`,
-  );
-}
+const pythonOutput = await runIsolatedPython(
+  command,
+  [],
+  repositoryRoot,
+);
 
 let python;
 try {
-  python = JSON.parse(result.stdout);
+  python = JSON.parse(pythonOutput);
 } catch (error) {
   throw new Error("Python capturable vocabulary output is not valid JSON.", {
     cause: error,

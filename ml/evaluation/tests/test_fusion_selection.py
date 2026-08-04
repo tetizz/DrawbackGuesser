@@ -28,6 +28,7 @@ from ml.evaluation.validation_partition import VALIDATION_PARTITION_IDENTITY
 from ml.training.drawback_ml.rank_preserving_fusion import (
     RANK_PRESERVING_FUSION_METHOD,
 )
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable_exact
 
 
 def identity(offset: int = 0) -> FusionSelectionIdentity:
@@ -156,6 +157,38 @@ def canonical(value: object) -> bytes:
 
 
 class FusionSelectionTest(unittest.TestCase):
+    def test_publication_retry_accepts_only_exact_committed_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            output = Path(raw) / "fusion-selection.json"
+            payload = b'{"fusion":true}\n'
+
+            def fail_after_publication(
+                path: Path,
+                value: bytes,
+                *,
+                label: str,
+            ) -> None:
+                publish_bytes_durable_exact(path, value, label=label)
+                raise OSError("simulated post-publication failure")
+
+            with patch.object(
+                fusion_selection,
+                "publish_bytes_durable_exact",
+                side_effect=fail_after_publication,
+            ):
+                with self.assertRaisesRegex(OSError, "post-publication"):
+                    fusion_selection._write_fusion_selection_payload(
+                        output,
+                        payload,
+                    )
+
+            fusion_selection._write_fusion_selection_payload(output, payload)
+            with self.assertRaisesRegex(FusionSelectionError, "overwrite"):
+                fusion_selection._write_fusion_selection_payload(
+                    output,
+                    b"different\n",
+                )
+
     def test_prepares_each_streamed_observation_once_for_all_alphas(
         self,
     ) -> None:
@@ -641,13 +674,21 @@ class FusionSelectionTest(unittest.TestCase):
                     expected_identity=identity(1),
                 )
             original = output.read_bytes()
+            recovered = write_fusion_selection_artifact(
+                output,
+                expected_identity,
+                complete_rows(expected_identity),
+            )
+            self.assertEqual(recovered.sha256, reference.sha256)
+            self.assertEqual(output.read_bytes(), original)
+            output.write_bytes(b"competitor\n")
             with self.assertRaisesRegex(FusionSelectionError, "overwrite"):
                 write_fusion_selection_artifact(
                     output,
                     expected_identity,
                     complete_rows(expected_identity),
                 )
-            self.assertEqual(output.read_bytes(), original)
+            self.assertEqual(output.read_bytes(), b"competitor\n")
 
 
 if __name__ == "__main__":

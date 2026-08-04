@@ -12,10 +12,10 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
-import os
 from pathlib import Path
-import tempfile
 from typing import Iterable, Mapping, Sequence
+
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable_exact
 
 from ml.training.drawback_ml.rank_preserving_fusion import (
     RANK_PRESERVING_FUSION_METHOD,
@@ -301,25 +301,16 @@ def _write_fusion_selection_payload(
     payload: bytes,
 ) -> ContentAddressedJson:
     output.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{output.name}.",
-        suffix=".tmp",
-        dir=output.parent,
-    )
-    temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        try:
-            os.link(temporary, output)
-        except FileExistsError as error:
-            raise FusionSelectionError(
-                f"refusing to overwrite fusion selection artifact: {output}"
-            ) from error
-    finally:
-        temporary.unlink(missing_ok=True)
+        publish_bytes_durable_exact(
+            output,
+            payload,
+            label="fusion selection artifact",
+        )
+    except ValueError as error:
+        raise FusionSelectionError(
+            f"refusing to overwrite fusion selection artifact: {output}"
+        ) from error
     return ContentAddressedJson(
         output,
         hashlib.sha256(payload).hexdigest(),

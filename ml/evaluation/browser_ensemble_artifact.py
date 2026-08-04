@@ -5,9 +5,7 @@ from __future__ import annotations
 from contextlib import ExitStack
 import hashlib
 import json
-import os
 from pathlib import Path
-import tempfile
 from typing import BinaryIO, Mapping
 
 from ml.training.drawback_ml.browser_artifact import (
@@ -17,6 +15,7 @@ from ml.training.drawback_ml.browser_artifact import (
     BrowserArtifactError,
     build_browser_artifact,
 )
+from ml.training.drawback_ml.durable_publish import publish_bytes_durable_exact
 
 from .ensemble_calibration import (
     FUSION_METHOD,
@@ -341,22 +340,13 @@ def _canonical_bytes(value: Mapping[str, object]) -> bytes:
 
 def _write_atomic_no_clobber(output: Path, payload: bytes) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{output.name}.",
-        suffix=".tmp",
-        dir=output.parent,
-    )
-    temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "wb") as target:
-            target.write(payload)
-            target.flush()
-            os.fsync(target.fileno())
-        try:
-            os.link(temporary, output)
-        except FileExistsError as error:
-            raise BrowserArtifactError(
-                f"refusing to overwrite browser ensemble artifact: {output}"
-            ) from error
-    finally:
-        temporary.unlink(missing_ok=True)
+        publish_bytes_durable_exact(
+            output,
+            payload,
+            label="browser ensemble artifact",
+        )
+    except ValueError as error:
+        raise BrowserArtifactError(
+            f"refusing to overwrite browser ensemble artifact: {output}"
+        ) from error
